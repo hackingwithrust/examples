@@ -1,8 +1,8 @@
 # Track code
 
 Working code for the project tracks at [hackingwithrust.com/projects](https://hackingwithrust.com/projects/).
-This repository holds only the example code — the articles themselves live in the site repository at
-[rangoiabby/hackingwithrust](https://github.com/rangoiabby/hackingwithrust).
+This repository holds only the example code — the articles themselves live at
+[hackingwithrust.com](https://hackingwithrust.com/).
 
 ```
 cli-tool/           hit      — a command-line HTTP client
