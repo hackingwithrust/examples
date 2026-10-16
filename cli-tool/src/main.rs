@@ -1,13 +1,18 @@
 use std::error::Error;
 use std::process::ExitCode;
+use std::thread;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::Table;
+use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::{OwoColorize, Stream};
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use thiserror::Error;
+
+/// Requests that answer inside this window never show a spinner.
+const SLOW_AFTER: Duration = Duration::from_millis(200);
 
 #[derive(Parser)]
 #[command(name = "hit", version, about = "A tiny command-line HTTP client")]
@@ -128,7 +133,9 @@ fn run(cli: Cli) -> Result<(), HitError> {
 }
 
 fn send(request: RequestBuilder, url: &str) -> Result<Response, HitError> {
-    request.send().map_err(|error| match error {
+    let spinner = start_spinner(url);
+
+    let result = request.send().map_err(|error| match error {
         e if e.is_timeout() => HitError::Timeout {
             url: url.to_string(),
             source: e,
@@ -138,7 +145,30 @@ fn send(request: RequestBuilder, url: &str) -> Result<Response, HitError> {
             source: e,
         },
         e => HitError::Request(e),
-    })
+    });
+
+    spinner.finish_and_clear();
+    result
+}
+
+fn start_spinner(url: &str) -> ProgressBar {
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+
+    // The request blocks this thread, so a watchdog thread decides whether
+    // the wait is long enough to be worth showing. Nothing is drawn until
+    // the watchdog speaks: a fast request leaves no trace on the terminal.
+    let url = url.to_string();
+    let watchdog_spinner = spinner.clone();
+    thread::spawn(move || {
+        thread::sleep(SLOW_AFTER);
+        if !watchdog_spinner.is_finished() {
+            watchdog_spinner.set_message(format!("waiting for {url}"));
+            watchdog_spinner.enable_steady_tick(Duration::from_millis(100));
+        }
+    });
+
+    spinner
 }
 
 fn print_response(response: Response) -> Result<(), HitError> {
