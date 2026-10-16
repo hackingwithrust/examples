@@ -1,4 +1,8 @@
+use std::collections::BTreeMap;
 use std::error::Error;
+use std::fs;
+use std::io;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
@@ -9,6 +13,7 @@ use comfy_table::Table;
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::{OwoColorize, Stream};
 use reqwest::blocking::{Client, RequestBuilder, Response};
+use serde::Deserialize;
 use thiserror::Error;
 
 /// Requests that answer inside this window never show a spinner.
@@ -50,9 +55,10 @@ enum Command {
 
 #[derive(Debug, Error)]
 enum HitError {
-    #[error("{url} did not answer within 10 seconds")]
+    #[error("{url} did not answer within {timeout:?}")]
     Timeout {
         url: String,
+        timeout: Duration,
         #[source]
         source: reqwest::Error,
     },
@@ -67,8 +73,66 @@ enum HitError {
     #[error("invalid --header {header:?}: expected \"Name: value\"")]
     InvalidHeader { header: String },
 
+    #[error("could not read {path}: {source}")]
+    ConfigRead {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("could not parse {path}")]
+    ConfigParse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+
     #[error(transparent)]
     Request(#[from] reqwest::Error),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Config {
+    /// Request timeout in seconds.
+    timeout: u64,
+
+    /// How responses are printed: "table" (default) or "plain".
+    format: Format,
+
+    /// Headers sent with every request, unless -H overrides them.
+    headers: BTreeMap<String, String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            timeout: 10,
+            format: Format::Table,
+            headers: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Format {
+    #[default]
+    Table,
+    Plain,
+}
+
+fn load_config() -> Result<Config, HitError> {
+    let Some(dirs) = directories::UserDirs::new() else {
+        return Ok(Config::default());
+    };
+    let path = dirs.home_dir().join(".hit.toml");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(e) => return Err(HitError::ConfigRead { path, source: e }),
+    };
+    toml::from_str(&text).map_err(|source| HitError::ConfigParse { path, source })
 }
 
 fn main() -> ExitCode {
@@ -89,9 +153,10 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), HitError> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
+    let config = load_config()?;
+    let timeout = Duration::from_secs(config.timeout);
+
+    let client = Client::builder().timeout(timeout).build()?;
 
     match cli.command {
         Command::Get { url, headers } => {
@@ -102,7 +167,7 @@ fn run(cli: Cli) -> Result<(), HitError> {
                 }
             }
 
-            let mut request = client.get(&url);
+            let mut request = add_default_headers(client.get(&url), &config.headers);
             for header in &headers {
                 let (name, value) = header
                     .split_once(':')
@@ -110,8 +175,8 @@ fn run(cli: Cli) -> Result<(), HitError> {
                 request = request.header(name.trim(), value.trim());
             }
 
-            let response = send(request, &url)?;
-            print_response(response)?;
+            let response = send(request, &url, timeout)?;
+            print_response(response, &config.format)?;
         }
 
         Command::Post { url, body } => {
@@ -119,25 +184,37 @@ fn run(cli: Cli) -> Result<(), HitError> {
                 eprintln!("POST {url}");
             }
 
-            let mut request = client.post(&url);
+            let mut request = add_default_headers(client.post(&url), &config.headers);
             if let Some(body) = body {
                 request = request.body(body);
             }
 
-            let response = send(request, &url)?;
-            print_response(response)?;
+            let response = send(request, &url, timeout)?;
+            print_response(response, &config.format)?;
         }
     }
 
     Ok(())
 }
 
-fn send(request: RequestBuilder, url: &str) -> Result<Response, HitError> {
+fn add_default_headers(
+    request: RequestBuilder,
+    headers: &BTreeMap<String, String>,
+) -> RequestBuilder {
+    let mut request = request;
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    request
+}
+
+fn send(request: RequestBuilder, url: &str, timeout: Duration) -> Result<Response, HitError> {
     let spinner = start_spinner(url);
 
     let result = request.send().map_err(|error| match error {
         e if e.is_timeout() => HitError::Timeout {
             url: url.to_string(),
+            timeout,
             source: e,
         },
         e if e.is_connect() => HitError::Connect {
@@ -171,16 +248,18 @@ fn start_spinner(url: &str) -> ProgressBar {
     spinner
 }
 
-fn print_response(response: Response) -> Result<(), HitError> {
+fn print_response(response: Response, format: &Format) -> Result<(), HitError> {
     println!("{}", paint_status(response.status()));
 
-    let mut table = Table::new();
-    table.load_style(UTF8_FULL);
-    table.set_header(vec!["Header", "Value"]);
-    for (name, value) in response.headers() {
-        table.add_row(vec![name.as_str(), value.to_str().unwrap_or("<binary>")]);
+    if let Format::Table = format {
+        let mut table = Table::new();
+        table.load_style(UTF8_FULL);
+        table.set_header(vec!["Header", "Value"]);
+        for (name, value) in response.headers() {
+            table.add_row(vec![name.as_str(), value.to_str().unwrap_or("<binary>")]);
+        }
+        println!("{table}");
     }
-    println!("{table}");
 
     println!();
     let body = response.text()?;
