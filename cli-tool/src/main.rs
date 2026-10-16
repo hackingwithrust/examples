@@ -3,6 +3,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use comfy_table::presets::UTF8_FULL;
+use comfy_table::Table;
+use owo_colors::{OwoColorize, Stream};
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use thiserror::Error;
 
@@ -139,12 +142,33 @@ fn send(request: RequestBuilder, url: &str) -> Result<Response, HitError> {
 }
 
 fn print_response(response: Response) -> Result<(), HitError> {
-    println!("{}", response.status());
+    println!("{}", paint_status(response.status()));
+
+    let mut table = Table::new();
+    table.load_style(UTF8_FULL);
+    table.set_header(vec!["Header", "Value"]);
     for (name, value) in response.headers() {
-        println!("{name}: {}", value.to_str().unwrap_or("<binary>"));
+        table.add_row(vec![name.as_str(), value.to_str().unwrap_or("<binary>")]);
     }
+    println!("{table}");
+
     println!();
     let body = response.text()?;
     println!("{body}");
     Ok(())
+}
+
+fn paint_status(status: reqwest::StatusCode) -> String {
+    let text = status.to_string();
+    if status.is_success() {
+        text.if_supports_color(Stream::Stdout, |t| t.green()).to_string()
+    } else if status.is_redirection() {
+        text.if_supports_color(Stream::Stdout, |t| t.cyan()).to_string()
+    } else if status.is_client_error() {
+        text.if_supports_color(Stream::Stdout, |t| t.yellow()).to_string()
+    } else if status.is_server_error() {
+        text.if_supports_color(Stream::Stdout, |t| t.red()).to_string()
+    } else {
+        text
+    }
 }

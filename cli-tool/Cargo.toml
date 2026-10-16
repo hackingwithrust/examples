@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+comfy-table = "8.0.1"
+owo-colors = { version = "4.4.0", features = ["supports-colors"] }
 reqwest = { version = "0.13", features = ["blocking"] }
 thiserror = "2"
