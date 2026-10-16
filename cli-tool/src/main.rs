@@ -13,7 +13,7 @@ use comfy_table::Table;
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::{OwoColorize, Stream};
 use reqwest::blocking::{Client, RequestBuilder, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Requests that answer inside this window never show a spinner.
@@ -51,6 +51,25 @@ enum Command {
         #[arg(short, long)]
         body: Option<String>,
     },
+
+    /// Save a GET request to reuse later
+    Save {
+        /// Name to store the request under
+        name: String,
+
+        /// The URL to request
+        url: String,
+
+        /// Send this header, for example -H "Accept: application/json"
+        #[arg(short = 'H', long = "header")]
+        headers: Vec<String>,
+    },
+
+    /// Send a saved request
+    Run {
+        /// The name it was saved under
+        name: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -87,6 +106,43 @@ enum HitError {
         source: toml::de::Error,
     },
 
+    #[error("invalid name {name:?}: use a plain file name, no path separators")]
+    InvalidName { name: String },
+
+    #[error("could not locate a data directory")]
+    NoDataDir,
+
+    #[error("could not write {path}: {source}")]
+    SaveWrite {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("could not encode the request for {name:?}")]
+    SaveEncode {
+        name: String,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("no saved request named {name:?}")]
+    NoSuchRequest { name: String },
+
+    #[error("could not read {path}: {source}")]
+    LoadRead {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("could not parse {path}")]
+    LoadParse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
     #[error(transparent)]
     Request(#[from] reqwest::Error),
 }
@@ -120,6 +176,67 @@ enum Format {
     #[default]
     Table,
     Plain,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedRequest {
+    url: String,
+    headers: Vec<String>,
+}
+
+fn requests_dir() -> Option<PathBuf> {
+    let dirs = directories::BaseDirs::new()?;
+    Some(dirs.data_dir().join("hit"))
+}
+
+fn request_path(name: &str) -> Result<PathBuf, HitError> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return Err(HitError::InvalidName {
+            name: name.to_string(),
+        });
+    }
+    let Some(dir) = requests_dir() else {
+        return Err(HitError::NoDataDir);
+    };
+    Ok(dir.join(format!("{name}.json")))
+}
+
+fn save_request(name: &str, url: &str, headers: &[String]) -> Result<PathBuf, HitError> {
+    let path = request_path(name)?;
+    let saved = SavedRequest {
+        url: url.to_string(),
+        headers: headers.to_vec(),
+    };
+    let text = serde_json::to_string_pretty(&saved).map_err(|source| HitError::SaveEncode {
+        name: name.to_string(),
+        source,
+    })?;
+    let Some(dir) = path.parent() else {
+        return Err(HitError::NoDataDir);
+    };
+    fs::create_dir_all(dir).map_err(|source| HitError::SaveWrite {
+        path: path.clone(),
+        source,
+    })?;
+    fs::write(&path, text).map_err(|source| HitError::SaveWrite {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(path)
+}
+
+fn load_request(name: &str) -> Result<SavedRequest, HitError> {
+    let path = request_path(name)?;
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(HitError::NoSuchRequest {
+                name: name.to_string(),
+            });
+        }
+        Err(e) => return Err(HitError::LoadRead { path, source: e }),
+    };
+    serde_json::from_str(&text).map_err(|source| HitError::LoadParse { path, source })
 }
 
 fn load_config() -> Result<Config, HitError> {
@@ -167,16 +284,7 @@ fn run(cli: Cli) -> Result<(), HitError> {
                 }
             }
 
-            let mut request = add_default_headers(client.get(&url), &config.headers);
-            for header in &headers {
-                let (name, value) = header
-                    .split_once(':')
-                    .ok_or_else(|| HitError::InvalidHeader { header: header.clone() })?;
-                request = request.header(name.trim(), value.trim());
-            }
-
-            let response = send(request, &url, timeout)?;
-            print_response(response, &config.format)?;
+            send_get(&client, &config, timeout, url, headers)?;
         }
 
         Command::Post { url, body } => {
@@ -192,8 +300,45 @@ fn run(cli: Cli) -> Result<(), HitError> {
             let response = send(request, &url, timeout)?;
             print_response(response, &config.format)?;
         }
+
+        Command::Save { name, url, headers } => {
+            let path = save_request(&name, &url, &headers)?;
+            println!("saved {name} to {}", path.display());
+        }
+
+        Command::Run { name } => {
+            let saved = load_request(&name)?;
+            if cli.verbose {
+                eprintln!("GET {}", saved.url);
+                for header in &saved.headers {
+                    eprintln!("  header: {header}");
+                }
+            }
+
+            send_get(&client, &config, timeout, saved.url, saved.headers)?;
+        }
     }
 
+    Ok(())
+}
+
+fn send_get(
+    client: &Client,
+    config: &Config,
+    timeout: Duration,
+    url: String,
+    headers: Vec<String>,
+) -> Result<(), HitError> {
+    let mut request = add_default_headers(client.get(&url), &config.headers);
+    for header in &headers {
+        let (name, value) = header
+            .split_once(':')
+            .ok_or_else(|| HitError::InvalidHeader { header: header.clone() })?;
+        request = request.header(name.trim(), value.trim());
+    }
+
+    let response = send(request, &url, timeout)?;
+    print_response(response, &config.format)?;
     Ok(())
 }
 
