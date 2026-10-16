@@ -5,14 +5,15 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::Table;
+use futures::future::join_all;
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::{OwoColorize, Stream};
-use reqwest::blocking::{Client, RequestBuilder, Response};
+use reqwest::{Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -65,10 +66,10 @@ enum Command {
         headers: Vec<String>,
     },
 
-    /// Send a saved request
+    /// Send saved requests; more than one runs concurrently
     Run {
-        /// The name it was saved under
-        name: String,
+        /// The names they were saved under
+        names: Vec<String>,
     },
 }
 
@@ -252,10 +253,11 @@ fn load_config() -> Result<Config, HitError> {
     toml::from_str(&text).map_err(|source| HitError::ConfigParse { path, source })
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    match run(cli) {
+    match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("hit: {e}");
@@ -269,7 +271,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), HitError> {
+async fn run(cli: Cli) -> Result<(), HitError> {
     let config = load_config()?;
     let timeout = Duration::from_secs(config.timeout);
 
@@ -284,7 +286,7 @@ fn run(cli: Cli) -> Result<(), HitError> {
                 }
             }
 
-            send_get(&client, &config, timeout, url, headers)?;
+            send_get(&client, &config, timeout, url, headers).await?;
         }
 
         Command::Post { url, body } => {
@@ -297,8 +299,8 @@ fn run(cli: Cli) -> Result<(), HitError> {
                 request = request.body(body);
             }
 
-            let response = send(request, &url, timeout)?;
-            print_response(response, &config.format)?;
+            let response = send(request, &url, timeout).await?;
+            print_response(response, &config.format).await?;
         }
 
         Command::Save { name, url, headers } => {
@@ -306,40 +308,135 @@ fn run(cli: Cli) -> Result<(), HitError> {
             println!("saved {name} to {}", path.display());
         }
 
-        Command::Run { name } => {
-            let saved = load_request(&name)?;
-            if cli.verbose {
-                eprintln!("GET {}", saved.url);
-                for header in &saved.headers {
-                    eprintln!("  header: {header}");
+        Command::Run { names } => {
+            if let [name] = names.as_slice() {
+                let saved = load_request(name)?;
+                if cli.verbose {
+                    eprintln!("GET {}", saved.url);
+                    for header in &saved.headers {
+                        eprintln!("  header: {header}");
+                    }
                 }
-            }
 
-            send_get(&client, &config, timeout, saved.url, saved.headers)?;
+                send_get(&client, &config, timeout, saved.url, saved.headers).await?;
+            } else {
+                run_many(&client, &config, timeout, names).await?;
+            }
         }
     }
 
     Ok(())
 }
 
-fn send_get(
+async fn send_get(
     client: &Client,
     config: &Config,
     timeout: Duration,
     url: String,
     headers: Vec<String>,
 ) -> Result<(), HitError> {
-    let mut request = add_default_headers(client.get(&url), &config.headers);
-    for header in &headers {
+    let request = build_request(client, config, &url, &headers)?;
+    let response = send(request, &url, timeout).await?;
+    print_response(response, &config.format).await?;
+    Ok(())
+}
+
+fn build_request(
+    client: &Client,
+    config: &Config,
+    url: &str,
+    headers: &[String],
+) -> Result<RequestBuilder, HitError> {
+    let mut request = add_default_headers(client.get(url), &config.headers);
+    for header in headers {
         let (name, value) = header
             .split_once(':')
             .ok_or_else(|| HitError::InvalidHeader { header: header.clone() })?;
         request = request.header(name.trim(), value.trim());
     }
+    Ok(request)
+}
 
-    let response = send(request, &url, timeout)?;
-    print_response(response, &config.format)?;
-    Ok(())
+async fn run_many(
+    client: &Client,
+    config: &Config,
+    timeout: Duration,
+    names: Vec<String>,
+) -> Result<(), HitError> {
+    let mut jobs = Vec::new();
+    for name in names {
+        let saved = load_request(&name)?;
+        let request = build_request(client, config, &saved.url, &saved.headers)?;
+        jobs.push((name, saved.url, request));
+    }
+
+    // Every request runs at once. Each future measures its own elapsed time
+    // and keeps its error instead of returning early with one.
+    let futures = jobs.into_iter().map(|(name, url, request)| async move {
+        let start = Instant::now();
+        let result = match request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                match response.text().await {
+                    Ok(body) => Ok((status, body.len())),
+                    Err(e) => Err(classify(e, &url, timeout)),
+                }
+            }
+            Err(e) => Err(classify(e, &url, timeout)),
+        };
+        (name, start.elapsed(), result)
+    });
+
+    let mut error = None;
+    for (name, elapsed, result) in join_all(futures).await {
+        match result {
+            Ok((status, bytes)) => println!(
+                "{name:<10} {} · {} · {}",
+                paint_status(status),
+                fmt_bytes(bytes),
+                fmt_elapsed(elapsed),
+            ),
+            Err(e) => error = error.or(Some(e)),
+        }
+    }
+
+    match error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+fn classify(error: reqwest::Error, url: &str, timeout: Duration) -> HitError {
+    if error.is_timeout() {
+        HitError::Timeout {
+            url: url.to_string(),
+            timeout,
+            source: error,
+        }
+    } else if error.is_connect() {
+        HitError::Connect {
+            url: url.to_string(),
+            source: error,
+        }
+    } else {
+        HitError::Request(error)
+    }
+}
+
+fn fmt_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    }
+}
+
+fn fmt_elapsed(elapsed: Duration) -> String {
+    if elapsed.as_secs() > 0 {
+        format!("{:.2} s", elapsed.as_secs_f64())
+    } else {
+        format!("{} ms", elapsed.as_millis())
+    }
 }
 
 fn add_default_headers(
@@ -353,21 +450,13 @@ fn add_default_headers(
     request
 }
 
-fn send(request: RequestBuilder, url: &str, timeout: Duration) -> Result<Response, HitError> {
+async fn send(request: RequestBuilder, url: &str, timeout: Duration) -> Result<Response, HitError> {
     let spinner = start_spinner(url);
 
-    let result = request.send().map_err(|error| match error {
-        e if e.is_timeout() => HitError::Timeout {
-            url: url.to_string(),
-            timeout,
-            source: e,
-        },
-        e if e.is_connect() => HitError::Connect {
-            url: url.to_string(),
-            source: e,
-        },
-        e => HitError::Request(e),
-    });
+    let result = request
+        .send()
+        .await
+        .map_err(|error| classify(error, url, timeout));
 
     spinner.finish_and_clear();
     result
@@ -377,9 +466,10 @@ fn start_spinner(url: &str) -> ProgressBar {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
 
-    // The request blocks this thread, so a watchdog thread decides whether
-    // the wait is long enough to be worth showing. Nothing is drawn until
-    // the watchdog speaks: a fast request leaves no trace on the terminal.
+    // The request no longer blocks a thread, but the spinner still gets its
+    // own plain thread: indicatif knows nothing about async, and it does not
+    // need to. Nothing is drawn until the watchdog speaks: a fast request
+    // leaves no trace on the terminal.
     let url = url.to_string();
     let watchdog_spinner = spinner.clone();
     thread::spawn(move || {
@@ -393,7 +483,7 @@ fn start_spinner(url: &str) -> ProgressBar {
     spinner
 }
 
-fn print_response(response: Response, format: &Format) -> Result<(), HitError> {
+async fn print_response(response: Response, format: &Format) -> Result<(), HitError> {
     println!("{}", paint_status(response.status()));
 
     if let Format::Table = format {
@@ -407,7 +497,7 @@ fn print_response(response: Response, format: &Format) -> Result<(), HitError> {
     }
 
     println!();
-    let body = response.text()?;
+    let body = response.text().await?;
     println!("{body}");
     Ok(())
 }
