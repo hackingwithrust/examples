@@ -1,4 +1,8 @@
+use std::time::Duration;
+
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use reqwest::blocking::{Client, Response};
 
 #[derive(Parser)]
 #[command(name = "hit", version, about = "A tiny command-line HTTP client")]
@@ -34,8 +38,13 @@ enum Command {
     },
 }
 
-fn main() {
+fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("failed to build the HTTP client")?;
 
     match cli.command {
         Command::Get { url, headers } => {
@@ -45,13 +54,44 @@ fn main() {
                     eprintln!("  header: {header}");
                 }
             }
-            println!("would GET {url}");
+
+            let mut request = client.get(&url);
+            for header in &headers {
+                let (name, value) = header.split_once(':').with_context(|| {
+                    format!("invalid --header {header:?}: expected \"Name: value\"")
+                })?;
+                request = request.header(name.trim(), value.trim());
+            }
+
+            let response = request.send()?;
+            print_response(response)?;
         }
+
         Command::Post { url, body } => {
             if cli.verbose {
                 eprintln!("POST {url}");
             }
-            println!("would POST {url} with body {body:?}");
+
+            let mut request = client.post(&url);
+            if let Some(body) = body {
+                request = request.body(body);
+            }
+
+            let response = request.send()?;
+            print_response(response)?;
         }
     }
+
+    Ok(())
+}
+
+fn print_response(response: Response) -> Result<()> {
+    println!("{}", response.status());
+    for (name, value) in response.headers() {
+        println!("{name}: {}", value.to_str().unwrap_or("<binary>"));
+    }
+    println!();
+    let body = response.text()?;
+    println!("{body}");
+    Ok(())
 }
