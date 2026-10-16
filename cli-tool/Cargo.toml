@@ -7,3 +7,4 @@ edition = "2024"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.13", features = ["blocking"] }
+thiserror = "2"
