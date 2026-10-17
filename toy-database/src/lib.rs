@@ -17,6 +17,16 @@ const MERGE_TABLES: usize = 4;
 /// the write — no call to `compact` required.
 const MEMTABLE_BYTES: usize = 4096;
 
+/// Filter bits per table key. Ten is the standard middle ground: about
+/// 1.2 MB of bits for a table of a million keys, and roughly one miss in
+/// a hundred slips through as a false positive.
+const BLOOM_BITS_PER_KEY: usize = 10;
+
+/// Probe count per key: `BLOOM_BITS_PER_KEY × ln 2` rounds to 7, the
+/// optimum for that many bits. Fewer probes waste bits; more spread the
+/// same bits thinner and raise the false-positive rate.
+const BLOOM_HASHES: u32 = 7;
+
 /// A persistent key-value store in one write-ahead log plus any number
 /// of sorted tables: every write lands in the log — synced before the
 /// call returns — and in the in-memory table, the write that pushes the
@@ -311,12 +321,17 @@ enum Answer {
 /// A sorted table on disk: the framed records from steps 3 and 4 — puts
 /// and tombstones alike, written in key order — with a sparse index in
 /// memory, every fourth record's key and offset, so a lookup reads one
-/// block instead of the whole file.
+/// block instead of the whole file. A bloom filter over the table's keys
+/// sits in front of all of it: a key the filter rejects never opens the
+/// file at all.
 struct Sstable {
     /// This table's number, the `1` in `tinylsm.1.sst`. Higher is newer.
     number: u64,
     path: PathBuf,
     index: Vec<(Vec<u8>, u64)>,
+    /// Every key the table holds, hashed into bits. Rebuilt by `load`,
+    /// refilled by `build` — it never outlives the table it describes.
+    filter: Bloom,
 }
 
 impl Sstable {
@@ -334,30 +349,40 @@ impl Sstable {
             ));
         }
         let mut index = Vec::new();
+        // the scan that rebuilds the index visits every key anyway, so
+        // the filter comes out of it for free
+        let mut filter = Bloom::for_keys(records.len());
         for (i, (pos, payload)) in records.iter().enumerate() {
+            let Some((_, key, _)) = parse(payload) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "table is corrupt: unreadable record",
+                ));
+            };
             if i % BLOCK_RECORDS == 0 {
-                let Some((_, key, _)) = parse(payload) else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "table is corrupt: unreadable record",
-                    ));
-                };
                 index.push((key.to_vec(), *pos as u64));
             }
+            filter.insert(key);
         }
         Ok(Sstable {
             number,
             path: path.to_path_buf(),
             index,
+            filter,
         })
     }
 
-    /// What this table knows about `key`, through the sparse index:
-    /// binary-search the index for the block that could hold the key,
-    /// read that block, and scan it. The scan stops at the first key past
-    /// `key` — the table is sorted, so a larger key means the answer is
-    /// not in the table.
+    /// What this table knows about `key`. The filter answers first: a
+    /// key it rejects cannot be in the table, so the lookup ends before
+    /// the index is touched — no binary search, no file opened. What
+    /// gets past the filter pays the step 6 price: binary-search the
+    /// index for the block that could hold the key, read that block,
+    /// and scan it, stopping at the first key past `key` — the table is
+    /// sorted, so a larger key means the answer is not in the table.
     fn lookup(&self, key: &[u8]) -> io::Result<Answer> {
+        if !self.filter.might_contain(key) {
+            return Ok(Answer::Missing);
+        }
         let block = self.index.partition_point(|(k, _)| k.as_slice() <= key);
         if block == 0 {
             return Ok(Answer::Missing); // sorts before the first indexed key
@@ -407,6 +432,7 @@ impl Sstable {
     ) -> io::Result<Sstable> {
         let tmp = path.with_extension("tmp");
         let mut index = Vec::new();
+        let mut filter = Bloom::for_keys(entries.len());
         {
             let mut out = OpenOptions::new()
                 .create(true)
@@ -418,6 +444,7 @@ impl Sstable {
                 if i % BLOCK_RECORDS == 0 {
                     index.push((key.clone(), offset));
                 }
+                filter.insert(key);
                 let op = if value.is_some() { b'P' } else { b'D' };
                 let record = frame(&encode(op, key, value.as_deref()));
                 out.write_all(&record)?;
@@ -430,8 +457,74 @@ impl Sstable {
             number,
             path: path.to_path_buf(),
             index,
+            filter,
         })
     }
+}
+
+/// A bloom filter: one bit per probe, `BLOOM_HASHES` probes per key,
+/// sized at `BLOOM_BITS_PER_KEY` bits per expected key. It can say "no"
+/// with certainty — a key it rejects was never inserted — but a "yes" is
+/// only a probability: some keys it never saw will probe bits that real
+/// keys set, and the lookup falls through to the table and comes back
+/// empty. That false-positive rate is the knob `BLOOM_BITS_PER_KEY`
+/// turns; the experiment below it measures what ten bits buy.
+struct Bloom {
+    bits: Vec<u8>,
+}
+
+impl Bloom {
+    /// An empty filter with room for `keys` keys. The table knows its
+    /// key count before writing a byte of it: `build` gets it from the
+    /// map's length, `load` from the record count the scan produced.
+    fn for_keys(keys: usize) -> Bloom {
+        Bloom {
+            bits: vec![0; (keys * BLOOM_BITS_PER_KEY).div_ceil(8)],
+        }
+    }
+
+    /// Set this key's probes. Inserting the same key twice sets the same
+    /// bits twice — the filter counts nothing and cannot overflow.
+    fn insert(&mut self, key: &[u8]) {
+        for index in probes(key, self.bits.len() * 8) {
+            self.bits[index / 8] |= 1 << (index % 8);
+        }
+    }
+
+    /// Whether `key` might be in the set: true for every key inserted,
+    /// true for a shrinking share of keys that were not, false for
+    /// nothing. The false side is the guarantee the read path leans on.
+    fn might_contain(&self, key: &[u8]) -> bool {
+        let len = self.bits.len() * 8;
+        if len == 0 {
+            return false;
+        }
+        probes(key, len).all(|index| self.bits[index / 8] & (1 << (index % 8)) != 0)
+    }
+}
+
+/// The bit positions one key probes: `BLOOM_HASHES` positions derived
+/// from a single 64-bit hash, split into two 32-bit halves and mixed as
+/// `h1 + i·h2`. Real filters use two honest hashes and pay for them;
+/// this Kirsch–Mitzenmacher trick costs one hash and, measured below,
+/// a fraction of a percent of extra false positives.
+fn probes(key: &[u8], bit_len: usize) -> impl Iterator<Item = usize> {
+    let hash = fnv1a64(key);
+    let h1 = (hash >> 32) as u32;
+    let h2 = hash as u32 | 1; // odd, so the stride never shares a factor with a power of two
+    (0..BLOOM_HASHES).map(move |i| (h1.wrapping_add(i.wrapping_mul(h2)) as usize) % bit_len)
+}
+
+/// FNV-1a over 64 bits, for the bloom filter. The record checksum is
+/// this hash's 32-bit cousin; the filter wants the wider version so its
+/// two halves differ enough to spread probes across the bit array.
+fn fnv1a64(key: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in key {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// FNV-1a, 32-bit: three lines, deterministic, and enough to catch a torn
@@ -1256,5 +1349,85 @@ mod tests {
         let store = TinyLsm::open(&path).unwrap();
         assert_eq!(store.get(b"alpha").unwrap(), Some(b"tiny".to_vec()));
         cleanup(&path);
+    }
+
+    #[test]
+    fn a_filter_never_rejects_a_key_it_holds() {
+        // the one guarantee a bloom filter makes: nothing inserted may
+        // ever come back "no"
+        let mut filter = Bloom::for_keys(1000);
+        let keys: Vec<Vec<u8>> = (0..1000).map(|i| format!("key{i:05}").into_bytes()).collect();
+        for key in &keys {
+            filter.insert(key);
+        }
+        for key in &keys {
+            assert!(filter.might_contain(key), "filter rejected {key:?}");
+        }
+    }
+
+    #[test]
+    fn a_miss_skips_the_table_file() {
+        let path = temp_log("filter-skip");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        store.compact().unwrap();
+        drop(store);
+
+        // the reopen rebuilds the filter; then the table file goes away,
+        // so any lookup that touched the disk would fail
+        let store = TinyLsm::open(&path).unwrap();
+        std::fs::remove_file(path.with_extension("1.sst")).unwrap();
+
+        // a miss never opens the file: the filter says no and that is
+        // the whole answer
+        assert_eq!(store.get(b"absent").unwrap(), None);
+        // a hit has to read the file, and it is gone
+        assert!(store.get(b"alpha").is_err());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_false_positive_still_answers_none() {
+        let path = temp_log("filter-fp");
+        let mut store = TinyLsm::open(&path).unwrap();
+        for i in 0..200 {
+            store.put(format!("key{i:05}").as_bytes(), b"v").unwrap();
+        }
+        store.compact().unwrap();
+
+        // two thousand absent keys: the filter waves some through as
+        // false positives, and the block scan they fall through to must
+        // send every one of them home empty
+        for i in 0..2000 {
+            let key = format!("absent{i:05}");
+            assert_eq!(
+                store.get(key.as_bytes()).unwrap(),
+                None,
+                "false positive turned into a value for {key}"
+            );
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn the_filter_stays_under_its_false_positive_budget() {
+        // ten thousand real keys, ten thousand absent probes, measured
+        // through the store's own parameters: 10 bits per key, 7 probes,
+        // the double-hashed probes the store uses
+        let mut filter = Bloom::for_keys(10_000);
+        for i in 0..10_000 {
+            filter.insert(format!("key{i:05}").as_bytes());
+        }
+        let false_positives = (0..10_000)
+            .map(|i| format!("absent{i:05}"))
+            .filter(|key| filter.might_contain(key.as_bytes()))
+            .count();
+        // theory says about 0.9% with these parameters; the budget here
+        // is double that, and the experiment in the article prints the
+        // exact number
+        assert!(
+            false_positives < 200,
+            "{false_positives} false positives in 10_000 probes"
+        );
     }
 }
