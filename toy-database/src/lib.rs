@@ -1,22 +1,38 @@
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::{self, Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// A persistent key-value store: an append-only log on disk, indexed in
-/// memory by a `BTreeMap`.
+/// How often the sparse index records a key: every fourth record in the
+/// table starts a block, and a lookup reads only the one block it needs.
+const BLOCK_RECORDS: usize = 4;
+
+/// A persistent key-value store in two files: an append-only log that
+/// absorbs writes, and a sorted table on disk that answers reads — plus
+/// the in-memory table of what the log holds that the disk table does not
+/// yet know about.
 pub struct TinyLsm {
-    map: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Newest writes. `Some(value)` is a live key; `None` is a tombstone
+    /// that shadows an older copy of the key in the on-disk table.
+    mem: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// Path of the append-only log, the store's write path.
     path: PathBuf,
+    /// The sorted table on disk, present once the first compaction has run.
+    table: Option<Sstable>,
 }
 
 impl TinyLsm {
-    /// Open the log at `path` and replay it: every whole record with a
-    /// valid checksum rebuilds the index, and the file is cut back to the
-    /// last whole record. A record that is complete but fails its checksum
-    /// stops the open with an error instead of being dropped.
+    /// Open the store at `path`: load the sorted table's sparse index, if a
+    /// table exists, then replay the log on top of it. The log is newer
+    /// than the table by construction — compaction empties the log the
+    /// moment it folds its records into the table — so replaying it after
+    /// loading the table restores the true state. A torn tail in the log is
+    /// cut; a whole record that fails its checksum stops the open with an
+    /// error instead of being dropped.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let table = Sstable::load(&table_path(&path))?;
         let mut log = OpenOptions::new()
             .create(true)
             .read(true)
@@ -24,10 +40,10 @@ impl TinyLsm {
             .open(&path)?;
         let mut bytes = Vec::new();
         log.read_to_end(&mut bytes)?;
-        let mut map = BTreeMap::new();
-        let valid = replay(&bytes, &mut map)?;
+        let mut mem = BTreeMap::new();
+        let valid = replay(&bytes, &mut mem)?;
         log.set_len(valid as u64)?;
-        Ok(TinyLsm { map, path })
+        Ok(TinyLsm { mem, path, table })
     }
 
     /// Insert or overwrite `key`. The write hits the log before the map.
@@ -36,53 +52,199 @@ impl TinyLsm {
         let value = value.into();
         let payload = encode(b'P', &key, Some(&value));
         append(&self.path, &payload)?;
-        self.map.insert(key, value);
+        self.mem.insert(key, Some(value));
         Ok(())
     }
 
-    /// Return the newest value for `key`, borrowed from the in-memory index.
-    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        self.map.get(key).map(Vec::as_slice)
+    /// Return the newest value for `key`. The in-memory table wins over the
+    /// on-disk one, and a tombstone in memory shadows the table's older
+    /// copy. Reading the table touches the disk and can fail, so the answer
+    /// comes back in a `Result` — and owned, because it may have been read
+    /// out of a file rather than borrowed from memory.
+    pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        match self.mem.get(key) {
+            Some(Some(value)) => return Ok(Some(value.clone())),
+            Some(None) => return Ok(None),
+            None => {}
+        }
+        match &self.table {
+            Some(table) => table.lookup(key),
+            None => Ok(None),
+        }
     }
 
-    /// Remove `key`, appending a tombstone when it existed. Returns whether
-    /// it did — a delete of a missing key writes nothing to the log.
+    /// Remove `key`, appending a tombstone when the key exists — in memory
+    /// or in the on-disk table. Returns whether it did. The tombstone is
+    /// what keeps the table's older copy shadowed until the next compaction
+    /// drops it, so a delete of a table-only key still writes to the log.
     pub fn delete(&mut self, key: &[u8]) -> io::Result<bool> {
-        if self.map.get(key).is_none() {
+        let live = match self.mem.get(key) {
+            Some(live) => live.is_some(),
+            None => match &self.table {
+                Some(table) => table.lookup(key)?.is_some(),
+                None => false,
+            },
+        };
+        if !live {
             return Ok(false);
         }
         let payload = encode(b'D', key, None);
         append(&self.path, &payload)?;
-        self.map.remove(key);
+        self.mem.insert(key.to_vec(), None);
         Ok(true)
     }
 
-    /// Rewrite the log down to what the map holds: one put record per live
-    /// key, in key order, with no tombstones and no superseded values. The
-    /// rewrite lands in a temporary file next to the log and is renamed
-    /// over it, so a crash part way through leaves the old log intact.
+    /// Fold the log and the old table into a new table — one put record per
+    /// live key, in key order, tombstones gone — then empty the log. The new
+    /// table lands through a temporary file and a rename, so a crash part
+    /// way through leaves the old table and the log exactly as they were.
     pub fn compact(&mut self) -> io::Result<()> {
-        let tmp = self.path.with_extension("log.tmp");
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        if let Some(table) = &self.table {
+            // Compaction is the one reader allowed to walk the whole table:
+            // it is about to rewrite all of it anyway.
+            let bytes = std::fs::read(&table.path)?;
+            for (_, payload) in walk(&bytes)? {
+                if let Some((b'P', key, value)) = parse(payload) {
+                    merged.insert(key.to_vec(), value.to_vec());
+                }
+            }
+        }
+        for (key, value) in &self.mem {
+            match value {
+                Some(value) => {
+                    merged.insert(key.clone(), value.clone());
+                }
+                None => {
+                    // a tombstone erases the table's older copy
+                    merged.remove(key);
+                }
+            }
+        }
+        self.table = Some(Sstable::build(&table_path(&self.path), &merged)?);
+        File::create(&self.path)?; // the table has absorbed the log: empty it
+        self.mem.clear();
+        Ok(())
+    }
+}
+
+/// The sorted table that belongs to a log at `log`: `store.log` keeps its
+/// records in `store.sst`.
+fn table_path(log: &Path) -> PathBuf {
+    log.with_extension("sst")
+}
+
+/// A sorted table on disk: the framed records from steps 3 and 4, written
+/// in key order, with a sparse index in memory — every fourth record's key
+/// and offset — so a lookup reads one block instead of the whole file.
+struct Sstable {
+    path: PathBuf,
+    index: Vec<(Vec<u8>, u64)>,
+}
+
+impl Sstable {
+    /// Load the sparse index for the table at `path`, or `None` when no
+    /// table exists yet. The index is rebuilt by one sequential scan that
+    /// verifies every checksum on the way; a real store writes the index
+    /// into a footer at the end of the file to skip exactly this scan.
+    fn load(path: &Path) -> io::Result<Option<Sstable>> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let records = walk(&bytes)?;
+        if valid_end(&records) != bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "table is corrupt: records stop short of the end of the file",
+            ));
+        }
+        let mut index = Vec::new();
+        for (i, (pos, payload)) in records.iter().enumerate() {
+            if i % BLOCK_RECORDS == 0 {
+                let Some((_, key, _)) = parse(payload) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "table is corrupt: unreadable record",
+                    ));
+                };
+                index.push((key.to_vec(), *pos as u64));
+            }
+        }
+        Ok(Some(Sstable {
+            path: path.to_path_buf(),
+            index,
+        }))
+    }
+
+    /// Value for `key`, through the sparse index: binary-search the index
+    /// for the block that could hold the key, read that block, and scan it.
+    /// The scan stops at the first key past `key` — the table is sorted, so
+    /// a larger key means the answer is not in the table.
+    fn lookup(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        let block = self.index.partition_point(|(k, _)| k.as_slice() <= key);
+        if block == 0 {
+            return Ok(None); // sorts before the first indexed key
+        }
+        let (_, start) = self.index[block - 1];
+        let end = self.index.get(block).map_or(u64::MAX, |&(_, off)| off);
+        let mut file = File::open(&self.path)?;
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.take(end - start).read_to_end(&mut bytes)?;
+        for (_, payload) in walk(&bytes)? {
+            let Some((_, found, value)) = parse(payload) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "table is corrupt: unreadable record",
+                ));
+            };
+            match found.cmp(key) {
+                Ordering::Equal => return Ok(Some(value.to_vec())),
+                Ordering::Greater => return Ok(None),
+                Ordering::Less => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// Write `entries` as a new table at `path`, atomically: the records go
+    /// to a temporary file that is fsynced and renamed over `path` once the
+    /// last one lands. The map is written in its own iteration order, which
+    /// is key order — sorting is the table's whole point, and it costs
+    /// nothing coming out of a `BTreeMap`. Returns the table with its index.
+    fn build(path: &Path, entries: &BTreeMap<Vec<u8>, Vec<u8>>) -> io::Result<Sstable> {
+        let tmp = path.with_extension("sst.tmp");
+        let mut index = Vec::new();
         {
             let mut out = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
                 .open(&tmp)?;
-            for (key, value) in &self.map {
-                let payload = encode(b'P', key, Some(value));
-                out.write_all(&frame(&payload))?;
+            let mut offset = 0u64;
+            for (i, (key, value)) in entries.iter().enumerate() {
+                if i % BLOCK_RECORDS == 0 {
+                    index.push((key.clone(), offset));
+                }
+                let record = frame(&encode(b'P', key, Some(value)));
+                out.write_all(&record)?;
+                offset += record.len() as u64;
             }
             out.sync_all()?;
         }
-        std::fs::rename(&tmp, &self.path)
+        std::fs::rename(&tmp, path)?;
+        Ok(Sstable {
+            path: path.to_path_buf(),
+            index,
+        })
     }
 }
 
 /// Frame one payload as a record and append it to the log at `path`. The
 /// handle is opened per call: one extra `open` per write is noise next to
-/// the flush, and it keeps no handle alive that the rename in `compact`
-/// could orphan.
+/// the flush, and it keeps no handle alive that a rename could orphan.
 fn append(path: &Path, payload: &[u8]) -> io::Result<()> {
     let mut log = OpenOptions::new().append(true).open(path)?;
     log.write_all(&frame(payload))?;
@@ -122,11 +284,12 @@ fn frame(payload: &[u8]) -> Vec<u8> {
     record
 }
 
-/// Walk the log byte by byte, applying each whole record to `map`, and
-/// return the offset where the valid prefix ends. Everything after that
-/// offset is a torn tail — a record a crash cut short — and the caller
-/// truncates the file back to it.
-fn replay(bytes: &[u8], map: &mut BTreeMap<Vec<u8>, Vec<u8>>) -> io::Result<usize> {
+/// Walk the framed records in `bytes`, returning each one's offset and
+/// payload. The walk stops at a torn tail — a record a crash cut short —
+/// and a whole record whose checksum fails is an error, not a record to
+/// drop. Both the log and the table are read through this.
+fn walk(bytes: &[u8]) -> io::Result<Vec<(usize, &[u8])>> {
+    let mut records = Vec::new();
     let mut rest = bytes;
     let mut pos = 0;
     while rest.len() >= 8 {
@@ -139,55 +302,74 @@ fn replay(bytes: &[u8], map: &mut BTreeMap<Vec<u8>, Vec<u8>>) -> io::Result<usiz
         if checksum(payload) != sum {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "log is corrupt: record checksum mismatch",
+                "corrupt record: checksum mismatch",
             ));
         }
-        apply(payload, map)?;
+        records.push((pos, payload));
         rest = tail;
         pos += 8 + len;
     }
-    Ok(pos)
+    Ok(records)
 }
 
-/// Apply one record payload to the map: op byte, key, value. `Err` when the
-/// payload is not shaped like an operation — with the checksum already
-/// verified, that is a bug in the writer, not a damaged file.
-fn apply(payload: &[u8], map: &mut BTreeMap<Vec<u8>, Vec<u8>>) -> io::Result<()> {
-    let bad = |what: &str| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("log is corrupt: {what}"),
-        )
-    };
-    let Some((&op, rest)) = payload.split_first() else {
-        return Err(bad("empty payload"));
-    };
-    let Some((klen, rest)) = read_u32(rest) else {
-        return Err(bad("no key length"));
-    };
-    let Some((key, rest)) = take(klen as usize, rest) else {
-        return Err(bad("key runs past the payload"));
-    };
-    let Some((vlen, rest)) = read_u32(rest) else {
-        return Err(bad("no value length"));
-    };
-    let Some((value, rest)) = take(vlen as usize, rest) else {
-        return Err(bad("value runs past the payload"));
-    };
-    if !rest.is_empty() {
-        return Err(bad("trailing bytes after the value"));
+/// Offset just past the last walked record: the end of the valid prefix.
+fn valid_end(records: &[(usize, &[u8])]) -> usize {
+    records
+        .last()
+        .map_or(0, |(pos, payload)| pos + 8 + payload.len())
+}
+
+/// Replay the log's records into `mem` and return the offset where the
+/// valid prefix ends — everything after that, the caller cuts.
+fn replay(bytes: &[u8], mem: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> io::Result<usize> {
+    let records = walk(bytes)?;
+    let end = valid_end(&records);
+    for (_, payload) in &records {
+        apply(payload, mem)?;
     }
+    Ok(end)
+}
+
+/// Apply one record payload to `mem`: a put stores its value, a delete
+/// stores a tombstone. `Err` when the payload is not shaped like a record —
+/// with the checksum already verified, that is a bug in the writer, not a
+/// damaged file.
+fn apply(payload: &[u8], mem: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> io::Result<()> {
+    let Some((op, key, value)) = parse(payload) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "corrupt record: malformed payload",
+        ));
+    };
     match op {
         b'P' => {
-            map.insert(key.to_vec(), value.to_vec());
+            mem.insert(key.to_vec(), Some(value.to_vec()));
             Ok(())
         }
         b'D' => {
-            map.remove(key);
+            mem.insert(key.to_vec(), None);
             Ok(())
         }
-        _ => Err(bad("unknown operation")),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "corrupt record: unknown operation",
+        )),
     }
+}
+
+/// Parse one payload into `(op, key, value)`: an op byte, then the key and
+/// value, each length-prefixed. `None` when the payload is not shaped like
+/// a record.
+fn parse(payload: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&op, rest) = payload.split_first()?;
+    let (klen, rest) = read_u32(rest)?;
+    let (key, rest) = take(klen as usize, rest)?;
+    let (vlen, rest) = read_u32(rest)?;
+    let (value, rest) = take(vlen as usize, rest)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some((op, key, value))
 }
 
 /// Pop a little-endian `u32` off the front of `bytes`.
@@ -218,8 +400,12 @@ mod tests {
         path
     }
 
+    /// A store now lives in up to three files: the log, the sorted table
+    /// beside it, and the table's temporary file mid-compaction.
     fn cleanup(path: &Path) {
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("sst"));
+        let _ = std::fs::remove_file(path.with_extension("sst.tmp"));
     }
 
     #[test]
@@ -227,7 +413,7 @@ mod tests {
         let path = temp_log("put-get");
         let mut store = TinyLsm::open(&path).unwrap();
         store.put(b"alpha", b"one").unwrap();
-        assert_eq!(store.get(b"alpha"), Some(&b"one"[..]));
+        assert_eq!(store.get(b"alpha").unwrap(), Some(b"one".to_vec()));
         cleanup(&path);
     }
 
@@ -235,7 +421,7 @@ mod tests {
     fn get_missing_is_none() {
         let path = temp_log("missing");
         let store = TinyLsm::open(&path).unwrap();
-        assert_eq!(store.get(b"nope"), None);
+        assert_eq!(store.get(b"nope").unwrap(), None);
         cleanup(&path);
     }
 
@@ -245,7 +431,7 @@ mod tests {
         let mut store = TinyLsm::open(&path).unwrap();
         store.put(b"alpha", b"one").unwrap();
         store.put(b"alpha", b"two").unwrap();
-        assert_eq!(store.get(b"alpha"), Some(&b"two"[..]));
+        assert_eq!(store.get(b"alpha").unwrap(), Some(b"two".to_vec()));
         cleanup(&path);
     }
 
@@ -255,7 +441,7 @@ mod tests {
         let mut store = TinyLsm::open(&path).unwrap();
         store.put(b"alpha", b"one").unwrap();
         assert!(store.delete(b"alpha").unwrap());
-        assert_eq!(store.get(b"alpha"), None);
+        assert_eq!(store.get(b"alpha").unwrap(), None);
         assert!(!store.delete(b"alpha").unwrap());
         cleanup(&path);
     }
@@ -266,9 +452,9 @@ mod tests {
         let mut store = TinyLsm::open(&path).unwrap();
         store.put(b"alpha", b"one").unwrap();
         store.put(b"beta", b"two").unwrap();
-        assert_eq!(store.get(b"beta"), Some(&b"two"[..]));
+        assert_eq!(store.get(b"beta").unwrap(), Some(b"two".to_vec()));
         store.delete(b"alpha").unwrap();
-        assert_eq!(store.get(b"beta"), Some(&b"two"[..]));
+        assert_eq!(store.get(b"beta").unwrap(), Some(b"two".to_vec()));
         cleanup(&path);
     }
 
@@ -322,8 +508,8 @@ mod tests {
             store.put(b"beta", b"two").unwrap();
         }
         let store = TinyLsm::open(&path).unwrap();
-        assert_eq!(store.get(b"alpha"), Some(&b"one"[..]));
-        assert_eq!(store.get(b"beta"), Some(&b"two"[..]));
+        assert_eq!(store.get(b"alpha").unwrap(), Some(b"one".to_vec()));
+        assert_eq!(store.get(b"beta").unwrap(), Some(b"two".to_vec()));
         cleanup(&path);
     }
 
@@ -336,7 +522,7 @@ mod tests {
             store.put(b"alpha", b"two").unwrap();
         }
         let store = TinyLsm::open(&path).unwrap();
-        assert_eq!(store.get(b"alpha"), Some(&b"two"[..]));
+        assert_eq!(store.get(b"alpha").unwrap(), Some(b"two".to_vec()));
         cleanup(&path);
     }
 
@@ -350,8 +536,8 @@ mod tests {
             store.delete(b"alpha").unwrap();
         }
         let store = TinyLsm::open(&path).unwrap();
-        assert_eq!(store.get(b"alpha"), None);
-        assert_eq!(store.get(b"beta"), Some(&b"two"[..]));
+        assert_eq!(store.get(b"alpha").unwrap(), None);
+        assert_eq!(store.get(b"beta").unwrap(), Some(b"two".to_vec()));
         cleanup(&path);
     }
 
@@ -359,7 +545,7 @@ mod tests {
     fn open_a_missing_file_starts_empty() {
         let path = temp_log("fresh");
         let store = TinyLsm::open(&path).unwrap();
-        assert_eq!(store.get(b"alpha"), None);
+        assert_eq!(store.get(b"alpha").unwrap(), None);
         assert_eq!(std::fs::read(&path).unwrap().len(), 0);
         cleanup(&path);
     }
@@ -384,8 +570,8 @@ mod tests {
         torn_tail(&path);
 
         let store = TinyLsm::open(&path).unwrap();
-        assert_eq!(store.get(b"alpha"), Some(&b"one"[..]));
-        assert_eq!(store.get(b"beta"), None);
+        assert_eq!(store.get(b"alpha").unwrap(), Some(b"one".to_vec()));
+        assert_eq!(store.get(b"beta").unwrap(), None);
         drop(store);
         // the tail is gone, and the file ends after the last whole record
         assert_eq!(std::fs::read(&path).unwrap().len(), 25);
@@ -410,7 +596,7 @@ mod tests {
         // no half record between them
         assert_eq!(bytes.len(), 25 + 24);
         let store = TinyLsm::open(&path).unwrap();
-        assert_eq!(store.get(b"beta"), Some(&b"two"[..]));
+        assert_eq!(store.get(b"beta").unwrap(), Some(b"two".to_vec()));
         cleanup(&path);
     }
 
@@ -434,6 +620,26 @@ mod tests {
     }
 
     #[test]
+    fn compact_empties_the_log_and_fills_the_table() {
+        let path = temp_log("compact-drains");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        store.put(b"beta", b"two").unwrap();
+        store.compact().unwrap();
+
+        // the log is drained; the table beside it holds both records,
+        // 25 + 24 bytes in the step 3 format
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+        let table = std::fs::read(path.with_extension("sst")).unwrap();
+        assert_eq!(table.len(), 25 + 24);
+
+        let store = TinyLsm::open(&path).unwrap();
+        assert_eq!(store.get(b"alpha").unwrap(), Some(b"one".to_vec()));
+        assert_eq!(store.get(b"beta").unwrap(), Some(b"two".to_vec()));
+        cleanup(&path);
+    }
+
+    #[test]
     fn compact_drops_tombstones_and_superseded_values() {
         let path = temp_log("compact-shrinks");
         let mut store = TinyLsm::open(&path).unwrap();
@@ -441,17 +647,14 @@ mod tests {
         store.put(b"alpha", b"two").unwrap();
         store.put(b"beta", b"two").unwrap();
         store.delete(b"alpha").unwrap();
-        let before = std::fs::read(&path).unwrap().len();
-
         store.compact().unwrap();
-        let after = std::fs::read(&path).unwrap().len();
 
-        assert!(after < before);
         // one record survives: beta's put, 8-byte header + 16-byte payload
-        assert_eq!(after, 24);
+        let table = std::fs::read(path.with_extension("sst")).unwrap();
+        assert_eq!(table.len(), 24);
         let store = TinyLsm::open(&path).unwrap();
-        assert_eq!(store.get(b"alpha"), None);
-        assert_eq!(store.get(b"beta"), Some(&b"two"[..]));
+        assert_eq!(store.get(b"alpha").unwrap(), None);
+        assert_eq!(store.get(b"beta").unwrap(), Some(b"two".to_vec()));
         cleanup(&path);
     }
 
@@ -464,14 +667,62 @@ mod tests {
         store.put(b"mid", b"three").unwrap();
         store.compact().unwrap();
 
-        // the first record in the rewritten file carries the first key in
-        // the map's order, which is sorted
-        let bytes = std::fs::read(&path).unwrap();
-        let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-        let payload = &bytes[8..8 + len];
+        // the first record in the table carries the first key in the map's
+        // order, which is sorted
+        let table = std::fs::read(path.with_extension("sst")).unwrap();
+        let len = u32::from_le_bytes(table[..4].try_into().unwrap()) as usize;
+        let payload = &table[8..8 + len];
         assert_eq!(payload[0], b'P');
         let klen = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
         assert_eq!(&payload[5..5 + klen], b"alpha");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_tombstone_in_memory_shadows_the_table() {
+        let path = temp_log("shadow");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        store.compact().unwrap(); // alpha now lives only in the table
+
+        assert!(store.delete(b"alpha").unwrap());
+        // the tombstone in memory keeps the table's older copy hidden
+        assert_eq!(store.get(b"alpha").unwrap(), None);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_tombstone_survives_a_reopen() {
+        let path = temp_log("shadow-reopen");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        store.compact().unwrap();
+        store.delete(b"alpha").unwrap();
+        drop(store);
+
+        // the log replays the tombstone over the table's older copy
+        let store = TinyLsm::open(&path).unwrap();
+        assert_eq!(store.get(b"alpha").unwrap(), None);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compaction_erases_what_a_tombstone_points_at() {
+        let path = temp_log("compact-erase");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        store.put(b"beta", b"two").unwrap();
+        store.compact().unwrap();
+        store.delete(b"alpha").unwrap();
+        store.compact().unwrap();
+
+        // the tombstone removes alpha from the merged table: beta's put,
+        // 24 bytes, and nothing else
+        let table = std::fs::read(path.with_extension("sst")).unwrap();
+        assert_eq!(table.len(), 24);
+        let store = TinyLsm::open(&path).unwrap();
+        assert_eq!(store.get(b"alpha").unwrap(), None);
+        assert_eq!(store.get(b"beta").unwrap(), Some(b"two".to_vec()));
         cleanup(&path);
     }
 
@@ -482,23 +733,24 @@ mod tests {
         store.put(b"alpha", b"one").unwrap();
         store.delete(b"alpha").unwrap();
         store.compact().unwrap();
-        // writes after the rewrite land on the new file, not the old one
+        // writes after the rewrite land in the log and shadow the table
         store.put(b"beta", b"two").unwrap();
         store.put(b"alpha", b"three").unwrap();
         drop(store);
 
         let store = TinyLsm::open(&path).unwrap();
-        assert_eq!(store.get(b"alpha"), Some(&b"three"[..]));
-        assert_eq!(store.get(b"beta"), Some(&b"two"[..]));
+        assert_eq!(store.get(b"alpha").unwrap(), Some(b"three".to_vec()));
+        assert_eq!(store.get(b"beta").unwrap(), Some(b"two".to_vec()));
         cleanup(&path);
     }
 
     #[test]
-    fn compacting_an_empty_store_writes_nothing() {
+    fn compacting_an_empty_store_writes_an_empty_table() {
         let path = temp_log("compact-empty");
         let mut store = TinyLsm::open(&path).unwrap();
         store.compact().unwrap();
         assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+        assert_eq!(std::fs::read(path.with_extension("sst")).unwrap().len(), 0);
         cleanup(&path);
     }
 
@@ -509,7 +761,7 @@ mod tests {
         store.put(b"alpha", b"one").unwrap();
         store.compact().unwrap();
 
-        let tmp = path.with_extension("log.tmp");
+        let tmp = path.with_extension("sst.tmp");
         assert!(!tmp.exists());
         cleanup(&path);
     }
@@ -521,13 +773,13 @@ mod tests {
         store.put(b"alpha", b"one").unwrap();
         // a crash mid-compaction leaves a half-written temp file behind;
         // the next compaction truncates it and carries on
-        let tmp = path.with_extension("log.tmp");
+        let tmp = path.with_extension("sst.tmp");
         std::fs::write(&tmp, b"garbage bytes").unwrap();
 
         store.compact().unwrap();
         assert!(!tmp.exists());
         let store = TinyLsm::open(&path).unwrap();
-        assert_eq!(store.get(b"alpha"), Some(&b"one"[..]));
+        assert_eq!(store.get(b"alpha").unwrap(), Some(b"one".to_vec()));
         cleanup(&path);
     }
 
@@ -543,8 +795,66 @@ mod tests {
             store.compact().unwrap();
         }
         let store = TinyLsm::open(&path).unwrap();
-        assert_eq!(store.get(b"alpha"), Some(&b"three"[..]));
-        assert_eq!(store.get(b"beta"), None);
+        assert_eq!(store.get(b"alpha").unwrap(), Some(b"three".to_vec()));
+        assert_eq!(store.get(b"beta").unwrap(), None);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_lookup_after_a_reopen_uses_the_rebuilt_index() {
+        let path = temp_log("index-rebuilt");
+        {
+            let mut store = TinyLsm::open(&path).unwrap();
+            for (key, value) in [
+                ("alpha", "one"),
+                ("beta", "two"),
+                ("gamma", "three"),
+                ("delta", "four"),
+                ("echo", "five"),
+                ("fox", "six"),
+            ] {
+                store.put(key, value).unwrap();
+            }
+            store.compact().unwrap();
+        }
+        // the index is gone with the process; the reopen rebuilds it from
+        // the table, and every lookup through it lands on the right record
+        let store = TinyLsm::open(&path).unwrap();
+        for (key, value) in [
+            ("alpha", "one"),
+            ("beta", "two"),
+            ("gamma", "three"),
+            ("delta", "four"),
+            ("echo", "five"),
+            ("fox", "six"),
+        ] {
+            assert_eq!(
+                store.get(key.as_bytes()).unwrap(),
+                Some(value.as_bytes().to_vec()),
+                "wrong value for {key}"
+            );
+        }
+        assert_eq!(store.get(b"goose").unwrap(), None);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reopen_refuses_a_truncated_table() {
+        let path = temp_log("table-torn");
+        {
+            let mut store = TinyLsm::open(&path).unwrap();
+            store.put(b"alpha", b"one").unwrap();
+            store.compact().unwrap();
+        }
+        // the table is installed by an atomic rename, so a short table is
+        // not a torn write to recover from — it is damage, and it is refused
+        let table = path.with_extension("sst");
+        let mut bytes = std::fs::read(&table).unwrap();
+        bytes.truncate(bytes.len() - 4);
+        std::fs::write(&table, &bytes).unwrap();
+
+        let err = TinyLsm::open(&path).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         cleanup(&path);
     }
 }
