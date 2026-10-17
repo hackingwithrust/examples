@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A persistent key-value store: an append-only log on disk, indexed in
 /// memory by a `BTreeMap`.
 pub struct TinyLsm {
     map: BTreeMap<Vec<u8>, Vec<u8>>,
-    log: std::fs::File,
+    path: PathBuf,
 }
 
 impl TinyLsm {
@@ -16,17 +16,18 @@ impl TinyLsm {
     /// last whole record. A record that is complete but fails its checksum
     /// stops the open with an error instead of being dropped.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
         let mut log = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
-            .open(path)?;
+            .open(&path)?;
         let mut bytes = Vec::new();
         log.read_to_end(&mut bytes)?;
         let mut map = BTreeMap::new();
         let valid = replay(&bytes, &mut map)?;
         log.set_len(valid as u64)?;
-        Ok(TinyLsm { map, log })
+        Ok(TinyLsm { map, path })
     }
 
     /// Insert or overwrite `key`. The write hits the log before the map.
@@ -34,7 +35,7 @@ impl TinyLsm {
         let key = key.into();
         let value = value.into();
         let payload = encode(b'P', &key, Some(&value));
-        self.append(&payload)?;
+        append(&self.path, &payload)?;
         self.map.insert(key, value);
         Ok(())
     }
@@ -51,17 +52,41 @@ impl TinyLsm {
             return Ok(false);
         }
         let payload = encode(b'D', key, None);
-        self.append(&payload)?;
+        append(&self.path, &payload)?;
         self.map.remove(key);
         Ok(true)
     }
 
-    /// Frame one payload as a record and append it to the log.
-    fn append(&mut self, payload: &[u8]) -> io::Result<()> {
-        let record = frame(payload);
-        self.log.write_all(&record)?;
-        self.log.flush()
+    /// Rewrite the log down to what the map holds: one put record per live
+    /// key, in key order, with no tombstones and no superseded values. The
+    /// rewrite lands in a temporary file next to the log and is renamed
+    /// over it, so a crash part way through leaves the old log intact.
+    pub fn compact(&mut self) -> io::Result<()> {
+        let tmp = self.path.with_extension("log.tmp");
+        {
+            let mut out = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            for (key, value) in &self.map {
+                let payload = encode(b'P', key, Some(value));
+                out.write_all(&frame(&payload))?;
+            }
+            out.sync_all()?;
+        }
+        std::fs::rename(&tmp, &self.path)
     }
+}
+
+/// Frame one payload as a record and append it to the log at `path`. The
+/// handle is opened per call: one extra `open` per write is noise next to
+/// the flush, and it keeps no handle alive that the rename in `compact`
+/// could orphan.
+fn append(path: &Path, payload: &[u8]) -> io::Result<()> {
+    let mut log = OpenOptions::new().append(true).open(path)?;
+    log.write_all(&frame(payload))?;
+    log.flush()
 }
 
 /// FNV-1a, 32-bit: three lines, deterministic, and enough to catch a torn
@@ -405,6 +430,121 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // the file is left alone — nothing is silently discarded
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_drops_tombstones_and_superseded_values() {
+        let path = temp_log("compact-shrinks");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        store.put(b"alpha", b"two").unwrap();
+        store.put(b"beta", b"two").unwrap();
+        store.delete(b"alpha").unwrap();
+        let before = std::fs::read(&path).unwrap().len();
+
+        store.compact().unwrap();
+        let after = std::fs::read(&path).unwrap().len();
+
+        assert!(after < before);
+        // one record survives: beta's put, 8-byte header + 16-byte payload
+        assert_eq!(after, 24);
+        let store = TinyLsm::open(&path).unwrap();
+        assert_eq!(store.get(b"alpha"), None);
+        assert_eq!(store.get(b"beta"), Some(&b"two"[..]));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_writes_keys_in_sorted_order() {
+        let path = temp_log("compact-sorted");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"zeta", b"one").unwrap();
+        store.put(b"alpha", b"two").unwrap();
+        store.put(b"mid", b"three").unwrap();
+        store.compact().unwrap();
+
+        // the first record in the rewritten file carries the first key in
+        // the map's order, which is sorted
+        let bytes = std::fs::read(&path).unwrap();
+        let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let payload = &bytes[8..8 + len];
+        assert_eq!(payload[0], b'P');
+        let klen = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
+        assert_eq!(&payload[5..5 + klen], b"alpha");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_store_keeps_working_after_compaction() {
+        let path = temp_log("compact-continue");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        store.delete(b"alpha").unwrap();
+        store.compact().unwrap();
+        // writes after the rewrite land on the new file, not the old one
+        store.put(b"beta", b"two").unwrap();
+        store.put(b"alpha", b"three").unwrap();
+        drop(store);
+
+        let store = TinyLsm::open(&path).unwrap();
+        assert_eq!(store.get(b"alpha"), Some(&b"three"[..]));
+        assert_eq!(store.get(b"beta"), Some(&b"two"[..]));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compacting_an_empty_store_writes_nothing() {
+        let path = temp_log("compact-empty");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.compact().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_leaves_no_temporary_file_behind() {
+        let path = temp_log("compact-tmp");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        store.compact().unwrap();
+
+        let tmp = path.with_extension("log.tmp");
+        assert!(!tmp.exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_temporary_file_left_by_a_crash_is_replaced() {
+        let path = temp_log("compact-stale-tmp");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        // a crash mid-compaction leaves a half-written temp file behind;
+        // the next compaction truncates it and carries on
+        let tmp = path.with_extension("log.tmp");
+        std::fs::write(&tmp, b"garbage bytes").unwrap();
+
+        store.compact().unwrap();
+        assert!(!tmp.exists());
+        let store = TinyLsm::open(&path).unwrap();
+        assert_eq!(store.get(b"alpha"), Some(&b"one"[..]));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compaction_round_trips_through_a_reopen() {
+        let path = temp_log("compact-roundtrip");
+        {
+            let mut store = TinyLsm::open(&path).unwrap();
+            store.put(b"alpha", b"one").unwrap();
+            store.put(b"beta", b"two").unwrap();
+            store.put(b"alpha", b"three").unwrap();
+            store.delete(b"beta").unwrap();
+            store.compact().unwrap();
+        }
+        let store = TinyLsm::open(&path).unwrap();
+        assert_eq!(store.get(b"alpha"), Some(&b"three"[..]));
+        assert_eq!(store.get(b"beta"), None);
         cleanup(&path);
     }
 }
