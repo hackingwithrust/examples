@@ -8,31 +8,40 @@ use std::path::{Path, PathBuf};
 /// table starts a block, and a lookup reads only the one block it needs.
 const BLOCK_RECORDS: usize = 4;
 
-/// A persistent key-value store in two files: an append-only log that
-/// absorbs writes, and a sorted table on disk that answers reads — plus
-/// the in-memory table of what the log holds that the disk table does not
-/// yet know about.
+/// How many sorted tables may pile up before compaction merges all of
+/// them back into one. Below that, a compaction only flushes the log.
+const MERGE_TABLES: usize = 4;
+
+/// A persistent key-value store in one log plus any number of sorted
+/// tables: the append-only log absorbs writes, compaction flushes it into
+/// a new numbered table — cheap, because it writes only what the log
+/// holds — and once `MERGE_TABLES` tables have piled up, a merge folds
+/// all of them back into one. Lookups walk the tables newest first, and
+/// the in-memory table sits in front of all of them.
 pub struct TinyLsm {
     /// Newest writes. `Some(value)` is a live key; `None` is a tombstone
-    /// that shadows an older copy of the key in the on-disk table.
+    /// that shadows any older copy of the key in the on-disk tables.
     mem: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     /// Path of the append-only log, the store's write path.
     path: PathBuf,
-    /// The sorted table on disk, present once the first compaction has run.
-    table: Option<Sstable>,
+    /// The sorted tables on disk, newest first. Each flush adds one; a
+    /// merge replaces the whole list with a single table.
+    tables: Vec<Sstable>,
 }
 
 impl TinyLsm {
-    /// Open the store at `path`: load the sorted table's sparse index, if a
-    /// table exists, then replay the log on top of it. The log is newer
-    /// than the table by construction — compaction empties the log the
-    /// moment it folds its records into the table — so replaying it after
-    /// loading the table restores the true state. A torn tail in the log is
-    /// cut; a whole record that fails its checksum stops the open with an
-    /// error instead of being dropped.
+    /// Open the store at `path`: scan the directory for the store's
+    /// numbered tables and load their sparse indexes, then replay the log
+    /// on top. The log is newer than every table by construction — a
+    /// flush empties the log the moment it folds its records into a
+    /// table — so replaying it after loading the tables restores the true
+    /// state. A torn tail in the log is cut; a whole record that fails
+    /// its checksum stops the open with an error instead of being
+    /// dropped.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let table = Sstable::load(&table_path(&path))?;
+        let mut tables = load_tables(&path)?;
+        tables.sort_by(|a, b| b.number.cmp(&a.number));
         let mut log = OpenOptions::new()
             .create(true)
             .read(true)
@@ -43,7 +52,7 @@ impl TinyLsm {
         let mut mem = BTreeMap::new();
         let valid = replay(&bytes, &mut mem)?;
         log.set_len(valid as u64)?;
-        Ok(TinyLsm { mem, path, table })
+        Ok(TinyLsm { mem, path, tables })
     }
 
     /// Insert or overwrite `key`. The write hits the log before the map.
@@ -56,34 +65,49 @@ impl TinyLsm {
         Ok(())
     }
 
-    /// Return the newest value for `key`. The in-memory table wins over the
-    /// on-disk one, and a tombstone in memory shadows the table's older
-    /// copy. Reading the table touches the disk and can fail, so the answer
-    /// comes back in a `Result` — and owned, because it may have been read
-    /// out of a file rather than borrowed from memory.
+    /// Return the newest value for `key`. The in-memory table wins over
+    /// every on-disk one, and a tombstone anywhere in front of the answer
+    /// shadows the older copies behind it. Reading the tables touches the
+    /// disk and can fail, so the answer comes back in a `Result` — and
+    /// owned, because it may have been read out of a file rather than
+    /// borrowed from memory.
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
         match self.mem.get(key) {
             Some(Some(value)) => return Ok(Some(value.clone())),
             Some(None) => return Ok(None),
             None => {}
         }
-        match &self.table {
-            Some(table) => table.lookup(key),
-            None => Ok(None),
+        for table in &self.tables {
+            match table.lookup(key)? {
+                Answer::Value(value) => return Ok(Some(value)),
+                Answer::Tombstone => return Ok(None),
+                Answer::Missing => {}
+            }
         }
+        Ok(None)
     }
 
-    /// Remove `key`, appending a tombstone when the key exists — in memory
-    /// or in the on-disk table. Returns whether it did. The tombstone is
-    /// what keeps the table's older copy shadowed until the next compaction
-    /// drops it, so a delete of a table-only key still writes to the log.
+    /// Remove `key`, appending a tombstone when the key exists — in
+    /// memory, in a table, or both. Returns whether it did. A tombstone
+    /// found on disk counts as "already deleted", not as a live key, so
+    /// deleting twice writes one tombstone, not two.
     pub fn delete(&mut self, key: &[u8]) -> io::Result<bool> {
         let live = match self.mem.get(key) {
             Some(live) => live.is_some(),
-            None => match &self.table {
-                Some(table) => table.lookup(key)?.is_some(),
-                None => false,
-            },
+            None => {
+                let mut live = false;
+                for table in &self.tables {
+                    match table.lookup(key)? {
+                        Answer::Value(_) => {
+                            live = true;
+                            break;
+                        }
+                        Answer::Tombstone => break,
+                        Answer::Missing => {}
+                    }
+                }
+                live
+            }
         };
         if !live {
             return Ok(false);
@@ -94,65 +118,145 @@ impl TinyLsm {
         Ok(true)
     }
 
-    /// Fold the log and the old table into a new table — one put record per
-    /// live key, in key order, tombstones gone — then empty the log. The new
-    /// table lands through a temporary file and a rename, so a crash part
-    /// way through leaves the old table and the log exactly as they were.
+    /// Make the log small again, in two moves. First a flush: write the
+    /// memory table — live keys and tombstones alike — into a new numbered
+    /// table, then empty the log. This is the cheap part, and it is all a
+    /// compaction does until `MERGE_TABLES` tables have piled up. Then a
+    /// merge: fold every table into one new one, oldest first, so each
+    /// newer copy of a key overwrites the older. The merged table lands
+    /// through a temporary file and a rename; the old files are removed
+    /// only after the rename, so a crash part way through leaves the
+    /// store correct either way.
     pub fn compact(&mut self) -> io::Result<()> {
-        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-        if let Some(table) = &self.table {
-            // Compaction is the one reader allowed to walk the whole table:
-            // it is about to rewrite all of it anyway.
+        if !self.mem.is_empty() {
+            let number = self.next_table_number();
+            let table = Sstable::build(&table_path(&self.path, number), number, &self.mem)?;
+            self.tables.insert(0, table);
+            File::create(&self.path)?; // the table has absorbed the log: empty it
+            self.mem.clear();
+        }
+        if self.tables.len() >= MERGE_TABLES {
+            self.merge_tables()?;
+        }
+        Ok(())
+    }
+
+    /// The number for the next table this store writes. Tables are kept
+    /// newest first, so the newest table's number, plus one, is a number
+    /// no file on disk is using.
+    fn next_table_number(&self) -> u64 {
+        self.tables.first().map_or(1, |t| t.number + 1)
+    }
+
+    /// Fold every table into one new one and remove the old files. The
+    /// walk goes oldest first, so a newer put overwrites an older copy of
+    /// its key, and a tombstone lands in the merged map over whatever the
+    /// older tables held. Tombstones come out the other side alive: the
+    /// scan in `load_tables` cannot tell an obsolete file from a live
+    /// one, so no merge in this store may drop them.
+    fn merge_tables(&mut self) -> io::Result<()> {
+        let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+        for table in self.tables.iter().rev() {
+            // A merge is the one reader allowed to walk whole tables:
+            // it is about to rewrite all of them anyway.
             let bytes = std::fs::read(&table.path)?;
             for (_, payload) in walk(&bytes)? {
-                if let Some((b'P', key, value)) = parse(payload) {
-                    merged.insert(key.to_vec(), value.to_vec());
+                match parse(payload) {
+                    Some((b'P', key, value)) => {
+                        merged.insert(key.to_vec(), Some(value.to_vec()));
+                    }
+                    Some((b'D', key, _)) => {
+                        merged.insert(key.to_vec(), None);
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "table is corrupt: unreadable record",
+                        ));
+                    }
                 }
             }
         }
-        for (key, value) in &self.mem {
-            match value {
-                Some(value) => {
-                    merged.insert(key.clone(), value.clone());
-                }
-                None => {
-                    // a tombstone erases the table's older copy
-                    merged.remove(key);
-                }
-            }
+        let number = self.next_table_number();
+        let table = Sstable::build(&table_path(&self.path, number), number, &merged)?;
+        let old: Vec<PathBuf> = self.tables.iter().map(|t| t.path.clone()).collect();
+        self.tables.clear();
+        self.tables.push(table);
+        for path in old {
+            std::fs::remove_file(path)?;
         }
-        self.table = Some(Sstable::build(&table_path(&self.path), &merged)?);
-        File::create(&self.path)?; // the table has absorbed the log: empty it
-        self.mem.clear();
         Ok(())
     }
 }
 
-/// The sorted table that belongs to a log at `log`: `store.log` keeps its
-/// records in `store.sst`.
-fn table_path(log: &Path) -> PathBuf {
-    log.with_extension("sst")
+/// Path of table number `n` for a log at `log`: `store.log` keeps its
+/// tables in `store.1.sst`, `store.2.sst`, and so on — the `.log`
+/// extension is replaced, not appended to.
+fn table_path(log: &Path, n: u64) -> PathBuf {
+    log.with_extension(format!("{n}.sst"))
 }
 
-/// A sorted table on disk: the framed records from steps 3 and 4, written
-/// in key order, with a sparse index in memory — every fourth record's key
-/// and offset — so a lookup reads one block instead of the whole file.
+/// Find every table belonging to the log at `log` — files beside it named
+/// `<stem>.<number>.sst` — and load their sparse indexes. The scan is the
+/// store's whole notion of which files are live; a table a crashed merge
+/// failed to delete looks exactly like a live one, which is why tombstones
+/// survive merges. A temporary file mid-write ends in `.tmp` and is
+/// skipped.
+fn load_tables(log: &Path) -> io::Result<Vec<Sstable>> {
+    let dir = log.parent().unwrap_or(Path::new("."));
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let prefix = format!("{}.", log.file_stem().unwrap_or_default().to_string_lossy());
+    let mut tables = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(number) = rest.strip_suffix(".sst") else {
+            continue;
+        };
+        let Ok(number) = number.parse::<u64>() else {
+            continue;
+        };
+        tables.push(Sstable::load(&entry.path(), number)?);
+    }
+    Ok(tables)
+}
+
+/// What one table knows about a key. Three answers, not two: a live
+/// value, a delete that is newer than anything an older table might
+/// hold, and nothing at all. The distinction is what makes deletes work
+/// across several tables — a tombstone found in a newer table must stop
+/// the walk, or an older table's copy of the key would resurface.
+enum Answer {
+    Value(Vec<u8>),
+    Tombstone,
+    Missing,
+}
+
+/// A sorted table on disk: the framed records from steps 3 and 4 — puts
+/// and tombstones alike, written in key order — with a sparse index in
+/// memory, every fourth record's key and offset, so a lookup reads one
+/// block instead of the whole file.
 struct Sstable {
+    /// This table's number, the `1` in `tinylsm.1.sst`. Higher is newer.
+    number: u64,
     path: PathBuf,
     index: Vec<(Vec<u8>, u64)>,
 }
 
 impl Sstable {
-    /// Load the sparse index for the table at `path`, or `None` when no
-    /// table exists yet. The index is rebuilt by one sequential scan that
-    /// verifies every checksum on the way; a real store writes the index
-    /// into a footer at the end of the file to skip exactly this scan.
-    fn load(path: &Path) -> io::Result<Option<Sstable>> {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
+    /// Load the sparse index for the table at `path`. The index is
+    /// rebuilt by one sequential scan that verifies every checksum on the
+    /// way; a real store writes the index into a footer at the end of the
+    /// file to skip exactly this scan.
+    fn load(path: &Path, number: u64) -> io::Result<Sstable> {
+        let bytes = std::fs::read(path)?;
         let records = walk(&bytes)?;
         if valid_end(&records) != bytes.len() {
             return Err(io::Error::new(
@@ -172,20 +276,22 @@ impl Sstable {
                 index.push((key.to_vec(), *pos as u64));
             }
         }
-        Ok(Some(Sstable {
+        Ok(Sstable {
+            number,
             path: path.to_path_buf(),
             index,
-        }))
+        })
     }
 
-    /// Value for `key`, through the sparse index: binary-search the index
-    /// for the block that could hold the key, read that block, and scan it.
-    /// The scan stops at the first key past `key` — the table is sorted, so
-    /// a larger key means the answer is not in the table.
-    fn lookup(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    /// What this table knows about `key`, through the sparse index:
+    /// binary-search the index for the block that could hold the key,
+    /// read that block, and scan it. The scan stops at the first key past
+    /// `key` — the table is sorted, so a larger key means the answer is
+    /// not in the table.
+    fn lookup(&self, key: &[u8]) -> io::Result<Answer> {
         let block = self.index.partition_point(|(k, _)| k.as_slice() <= key);
         if block == 0 {
-            return Ok(None); // sorts before the first indexed key
+            return Ok(Answer::Missing); // sorts before the first indexed key
         }
         let (_, start) = self.index[block - 1];
         let end = self.index.get(block).map_or(u64::MAX, |&(_, off)| off);
@@ -194,28 +300,43 @@ impl Sstable {
         let mut bytes = Vec::new();
         file.take(end - start).read_to_end(&mut bytes)?;
         for (_, payload) in walk(&bytes)? {
-            let Some((_, found, value)) = parse(payload) else {
+            let Some((op, found, value)) = parse(payload) else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "table is corrupt: unreadable record",
                 ));
             };
             match found.cmp(key) {
-                Ordering::Equal => return Ok(Some(value.to_vec())),
-                Ordering::Greater => return Ok(None),
+                Ordering::Equal => match op {
+                    b'P' => return Ok(Answer::Value(value.to_vec())),
+                    b'D' => return Ok(Answer::Tombstone),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "table is corrupt: unknown operation",
+                        ));
+                    }
+                },
+                Ordering::Greater => return Ok(Answer::Missing),
                 Ordering::Less => {}
             }
         }
-        Ok(None)
+        Ok(Answer::Missing)
     }
 
-    /// Write `entries` as a new table at `path`, atomically: the records go
-    /// to a temporary file that is fsynced and renamed over `path` once the
-    /// last one lands. The map is written in its own iteration order, which
-    /// is key order — sorting is the table's whole point, and it costs
-    /// nothing coming out of a `BTreeMap`. Returns the table with its index.
-    fn build(path: &Path, entries: &BTreeMap<Vec<u8>, Vec<u8>>) -> io::Result<Sstable> {
-        let tmp = path.with_extension("sst.tmp");
+    /// Write `entries` as a new table at `path`, atomically: the records
+    /// go to a temporary file that is fsynced and renamed into place once
+    /// the last one lands. Live keys are written as puts, tombstones as
+    /// deletes. The map is written in its own iteration order, which is
+    /// key order — sorting is the table's whole point, and it costs
+    /// nothing coming out of a `BTreeMap`. Returns the table with its
+    /// index.
+    fn build(
+        path: &Path,
+        number: u64,
+        entries: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    ) -> io::Result<Sstable> {
+        let tmp = path.with_extension("tmp");
         let mut index = Vec::new();
         {
             let mut out = OpenOptions::new()
@@ -228,7 +349,8 @@ impl Sstable {
                 if i % BLOCK_RECORDS == 0 {
                     index.push((key.clone(), offset));
                 }
-                let record = frame(&encode(b'P', key, Some(value)));
+                let op = if value.is_some() { b'P' } else { b'D' };
+                let record = frame(&encode(op, key, value.as_deref()));
                 out.write_all(&record)?;
                 offset += record.len() as u64;
             }
@@ -236,6 +358,7 @@ impl Sstable {
         }
         std::fs::rename(&tmp, path)?;
         Ok(Sstable {
+            number,
             path: path.to_path_buf(),
             index,
         })
@@ -287,7 +410,7 @@ fn frame(payload: &[u8]) -> Vec<u8> {
 /// Walk the framed records in `bytes`, returning each one's offset and
 /// payload. The walk stops at a torn tail — a record a crash cut short —
 /// and a whole record whose checksum fails is an error, not a record to
-/// drop. Both the log and the table are read through this.
+/// drop. Both the log and the tables are read through this.
 fn walk(bytes: &[u8]) -> io::Result<Vec<(usize, &[u8])>> {
     let mut records = Vec::new();
     let mut rest = bytes;
@@ -392,20 +515,42 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// A unique scratch path per test: the tests in this module run in
-    /// parallel, and a shared path would have them overwriting each other.
+    /// A unique scratch directory per test, with the store's log inside
+    /// it. The tests in this module run in parallel, and a shared
+    /// directory would have them overwriting each other; a directory of
+    /// their own also means cleanup can take the tables with it.
     fn temp_log(name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!("tinylsm-{}-{}.log", name, std::process::id()));
-        path
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("tinylsm-{}-{}", name, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("tinylsm.log")
     }
 
-    /// A store now lives in up to three files: the log, the sorted table
-    /// beside it, and the table's temporary file mid-compaction.
-    fn cleanup(path: &Path) {
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(path.with_extension("sst"));
-        let _ = std::fs::remove_file(path.with_extension("sst.tmp"));
+    /// The store lives in up to four kinds of file: the log, the numbered
+    /// tables beside it, and a table's temporary file mid-write. Removing
+    /// the directory takes all of them.
+    fn cleanup(log: &Path) {
+        if let Some(dir) = log.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// The table files beside `log`, sorted by name — which, for the
+    /// single-digit numbers this suite produces, is numeric order too.
+    fn sst_files(log: &Path) -> Vec<PathBuf> {
+        let dir = log.parent().unwrap();
+        let prefix = format!("{}.", log.file_stem().unwrap().to_string_lossy());
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with(&prefix) && name.ends_with(".sst")
+            })
+            .map(|e| e.path())
+            .collect();
+        found.sort();
+        found
     }
 
     #[test]
@@ -620,18 +765,20 @@ mod tests {
     }
 
     #[test]
-    fn compact_empties_the_log_and_fills_the_table() {
+    fn compact_flushes_the_log_into_a_numbered_table() {
         let path = temp_log("compact-drains");
         let mut store = TinyLsm::open(&path).unwrap();
         store.put(b"alpha", b"one").unwrap();
         store.put(b"beta", b"two").unwrap();
         store.compact().unwrap();
 
-        // the log is drained; the table beside it holds both records,
-        // 25 + 24 bytes in the step 3 format
+        // the log is drained; the first table beside it holds both
+        // records, 25 + 24 bytes in the step 3 format
         assert_eq!(std::fs::read(&path).unwrap().len(), 0);
-        let table = std::fs::read(path.with_extension("sst")).unwrap();
-        assert_eq!(table.len(), 25 + 24);
+        let tables = sst_files(&path);
+        assert_eq!(tables.len(), 1);
+        assert!(tables[0].ends_with("tinylsm.1.sst"));
+        assert_eq!(std::fs::read(&tables[0]).unwrap().len(), 25 + 24);
 
         let store = TinyLsm::open(&path).unwrap();
         assert_eq!(store.get(b"alpha").unwrap(), Some(b"one".to_vec()));
@@ -640,8 +787,8 @@ mod tests {
     }
 
     #[test]
-    fn compact_drops_tombstones_and_superseded_values() {
-        let path = temp_log("compact-shrinks");
+    fn a_flush_writes_its_tombstones() {
+        let path = temp_log("flush-tombstone");
         let mut store = TinyLsm::open(&path).unwrap();
         store.put(b"alpha", b"one").unwrap();
         store.put(b"alpha", b"two").unwrap();
@@ -649,9 +796,12 @@ mod tests {
         store.delete(b"alpha").unwrap();
         store.compact().unwrap();
 
-        // one record survives: beta's put, 8-byte header + 16-byte payload
-        let table = std::fs::read(path.with_extension("sst")).unwrap();
-        assert_eq!(table.len(), 24);
+        // the flush collapses superseded values, but the tombstone goes
+        // into the table as a delete record and stays there: alpha's
+        // delete (22 bytes) plus beta's put (24 bytes)
+        let tables = sst_files(&path);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(std::fs::read(&tables[0]).unwrap().len(), 22 + 24);
         let store = TinyLsm::open(&path).unwrap();
         assert_eq!(store.get(b"alpha").unwrap(), None);
         assert_eq!(store.get(b"beta").unwrap(), Some(b"two".to_vec()));
@@ -669,7 +819,8 @@ mod tests {
 
         // the first record in the table carries the first key in the map's
         // order, which is sorted
-        let table = std::fs::read(path.with_extension("sst")).unwrap();
+        let tables = sst_files(&path);
+        let table = std::fs::read(&tables[0]).unwrap();
         let len = u32::from_le_bytes(table[..4].try_into().unwrap()) as usize;
         let payload = &table[8..8 + len];
         assert_eq!(payload[0], b'P');
@@ -679,11 +830,11 @@ mod tests {
     }
 
     #[test]
-    fn a_tombstone_in_memory_shadows_the_table() {
+    fn a_tombstone_in_memory_shadows_the_tables() {
         let path = temp_log("shadow");
         let mut store = TinyLsm::open(&path).unwrap();
         store.put(b"alpha", b"one").unwrap();
-        store.compact().unwrap(); // alpha now lives only in the table
+        store.compact().unwrap(); // alpha now lives only in a table
 
         assert!(store.delete(b"alpha").unwrap());
         // the tombstone in memory keeps the table's older copy hidden
@@ -707,19 +858,146 @@ mod tests {
     }
 
     #[test]
-    fn compaction_erases_what_a_tombstone_points_at() {
-        let path = temp_log("compact-erase");
+    fn a_tombstone_in_a_newer_table_shadows_an_older_one() {
+        let path = temp_log("shadow-tables");
         let mut store = TinyLsm::open(&path).unwrap();
         store.put(b"alpha", b"one").unwrap();
-        store.put(b"beta", b"two").unwrap();
-        store.compact().unwrap();
+        store.compact().unwrap(); // table 1: alpha's put
+        store.put(b"alpha", b"two").unwrap();
+        store.compact().unwrap(); // table 2: alpha's newer put
         store.delete(b"alpha").unwrap();
+        store.compact().unwrap(); // table 3: alpha's tombstone
+
+        // three tables, and the tombstone in the newest one wins
+        assert_eq!(sst_files(&path).len(), 3);
+        assert_eq!(store.get(b"alpha").unwrap(), None);
+        drop(store);
+        let store = TinyLsm::open(&path).unwrap();
+        assert_eq!(store.get(b"alpha").unwrap(), None);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_lookup_walks_the_tables_newest_first() {
+        let path = temp_log("newest-first");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        store.compact().unwrap();
+        store.put(b"alpha", b"two").unwrap();
         store.compact().unwrap();
 
-        // the tombstone removes alpha from the merged table: beta's put,
-        // 24 bytes, and nothing else
-        let table = std::fs::read(path.with_extension("sst")).unwrap();
-        assert_eq!(table.len(), 24);
+        // both tables hold alpha; the newer one must answer
+        assert_eq!(sst_files(&path).len(), 2);
+        assert_eq!(store.get(b"alpha").unwrap(), Some(b"two".to_vec()));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_second_delete_after_a_flush_writes_nothing() {
+        let path = temp_log("delete-twice");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        store.delete(b"alpha").unwrap();
+        store.compact().unwrap(); // the tombstone now lives in table 1
+
+        // the tombstone on disk says "already deleted": no second record
+        assert!(!store.delete(b"alpha").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compaction_piles_up_tables_then_merges_them() {
+        let path = temp_log("merge");
+        let mut store = TinyLsm::open(&path).unwrap();
+        for (key, value) in [("alpha", "one"), ("beta", "two")] {
+            store.put(key, value).unwrap();
+        }
+        store.compact().unwrap();
+        for (key, value) in [("gamma", "three"), ("delta", "four")] {
+            store.put(key, value).unwrap();
+        }
+        store.compact().unwrap();
+        for (key, value) in [("echo", "five"), ("fox", "six")] {
+            store.put(key, value).unwrap();
+        }
+        store.compact().unwrap();
+
+        // three flushes, three tables: below MERGE_TABLES nothing merges
+        assert_eq!(sst_files(&path).len(), 3);
+
+        store.put(b"goose", b"seven").unwrap();
+        store.compact().unwrap();
+
+        // the fourth table trips the threshold, and all four fold into one
+        let tables = sst_files(&path);
+        assert_eq!(tables.len(), 1);
+        let store = TinyLsm::open(&path).unwrap();
+        for (key, value) in [
+            ("alpha", "one"),
+            ("beta", "two"),
+            ("gamma", "three"),
+            ("delta", "four"),
+            ("echo", "five"),
+            ("fox", "six"),
+            ("goose", "seven"),
+        ] {
+            assert_eq!(
+                store.get(key.as_bytes()).unwrap(),
+                Some(value.as_bytes().to_vec()),
+                "wrong value for {key}"
+            );
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_merge_keeps_tombstones() {
+        let path = temp_log("merge-tombstone");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        store.compact().unwrap(); // table 1: alpha's put
+        store.delete(b"alpha").unwrap();
+        store.compact().unwrap(); // table 2: alpha's tombstone
+        store.put(b"beta", b"two").unwrap();
+        store.compact().unwrap(); // table 3
+        store.put(b"gamma", b"three").unwrap();
+        store.compact().unwrap(); // table 4: the threshold trips
+
+        // the merged table carries alpha's tombstone with it: the delete
+        // (22 bytes) plus beta's put (24) and gamma's put (27 — "three"
+        // is a byte longer than "two")
+        let tables = sst_files(&path);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(std::fs::read(&tables[0]).unwrap().len(), 22 + 24 + 27);
+        let store = TinyLsm::open(&path).unwrap();
+        assert_eq!(store.get(b"alpha").unwrap(), None);
+        assert_eq!(store.get(b"beta").unwrap(), Some(b"two".to_vec()));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_leftover_table_cannot_resurrect_a_deleted_key() {
+        let path = temp_log("leftover");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        store.compact().unwrap();
+        // keep a copy of table 1, as if a crashed merge had failed to
+        // delete it
+        let leftover = std::fs::read(path.with_extension("1.sst")).unwrap();
+
+        store.delete(b"alpha").unwrap();
+        store.compact().unwrap(); // table 2: alpha's tombstone
+        store.put(b"beta", b"two").unwrap();
+        store.compact().unwrap(); // table 3
+        store.put(b"gamma", b"three").unwrap();
+        store.compact().unwrap(); // table 4: merge; table 2's tombstone rides along
+
+        // the merge removed tables 1 to 4; put the "leftover" back
+        std::fs::write(path.with_extension("1.sst"), leftover).unwrap();
+
+        // the merged table's tombstone shadows the leftover's old put —
+        // this is exactly the read a dropped tombstone would resurrect
         let store = TinyLsm::open(&path).unwrap();
         assert_eq!(store.get(b"alpha").unwrap(), None);
         assert_eq!(store.get(b"beta").unwrap(), Some(b"two".to_vec()));
@@ -733,7 +1011,7 @@ mod tests {
         store.put(b"alpha", b"one").unwrap();
         store.delete(b"alpha").unwrap();
         store.compact().unwrap();
-        // writes after the rewrite land in the log and shadow the table
+        // writes after the flush land in the log and shadow the table
         store.put(b"beta", b"two").unwrap();
         store.put(b"alpha", b"three").unwrap();
         drop(store);
@@ -745,12 +1023,13 @@ mod tests {
     }
 
     #[test]
-    fn compacting_an_empty_store_writes_an_empty_table() {
+    fn compacting_an_empty_store_writes_nothing() {
         let path = temp_log("compact-empty");
         let mut store = TinyLsm::open(&path).unwrap();
         store.compact().unwrap();
+        // nothing in memory, nothing to flush: no table, no log bytes
+        assert_eq!(sst_files(&path).len(), 0);
         assert_eq!(std::fs::read(&path).unwrap().len(), 0);
-        assert_eq!(std::fs::read(path.with_extension("sst")).unwrap().len(), 0);
         cleanup(&path);
     }
 
@@ -761,8 +1040,13 @@ mod tests {
         store.put(b"alpha", b"one").unwrap();
         store.compact().unwrap();
 
-        let tmp = path.with_extension("sst.tmp");
-        assert!(!tmp.exists());
+        let dir = path.parent().unwrap();
+        let tmps: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(tmps.is_empty());
         cleanup(&path);
     }
 
@@ -771,9 +1055,11 @@ mod tests {
         let path = temp_log("compact-stale-tmp");
         let mut store = TinyLsm::open(&path).unwrap();
         store.put(b"alpha", b"one").unwrap();
-        // a crash mid-compaction leaves a half-written temp file behind;
-        // the next compaction truncates it and carries on
-        let tmp = path.with_extension("sst.tmp");
+        // a crash mid-flush leaves a half-written temp file behind; the
+        // next flush truncates it and carries on. The temp file for
+        // table 1 is `tinylsm.1.tmp` — the `.sst` is replaced, not
+        // extended
+        let tmp = path.with_extension("1.tmp");
         std::fs::write(&tmp, b"garbage bytes").unwrap();
 
         store.compact().unwrap();
@@ -848,7 +1134,7 @@ mod tests {
         }
         // the table is installed by an atomic rename, so a short table is
         // not a torn write to recover from — it is damage, and it is refused
-        let table = path.with_extension("sst");
+        let table = path.with_extension("1.sst");
         let mut bytes = std::fs::read(&table).unwrap();
         bytes.truncate(bytes.len() - 4);
         std::fs::write(&table, &bytes).unwrap();
