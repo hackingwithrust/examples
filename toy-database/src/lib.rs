@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 /// How often the sparse index records a key: every fourth record in the
@@ -34,7 +35,8 @@ const BLOOM_HASHES: u32 = 7;
 /// cheap, because it writes only what the memory table holds — and once
 /// `MERGE_TABLES` tables have piled up, a merge folds all of them back
 /// into one. Lookups walk the tables newest first, and the in-memory
-/// table sits in front of all of them.
+/// table sits in front of all of them; a range scan walks the same
+/// sources side by side, in key order.
 pub struct TinyLsm {
     /// Newest writes. `Some(value)` is a live key; `None` is a tombstone
     /// that shadows any older copy of the key in the on-disk tables.
@@ -163,6 +165,73 @@ impl TinyLsm {
         Ok(true)
     }
 
+    /// Iterate the live keys and values from `from` (inclusive) to `to`
+    /// (exclusive), in key order — `None` leaves a side unbounded, so
+    /// `scan(None, None)` walks the whole store. Each key appears once,
+    /// with the newest value; a key deleted anywhere in front of its
+    /// oldest copy is absent. The merge itself is lazy — `take(10)`
+    /// walks ten steps, not the whole range — but each source's records
+    /// are read and checked when `scan` is called, because
+    /// `Iterator::next` cannot fail and reading a table can: an error
+    /// surfaces as an `Err` here, never in the middle of a scan.
+    pub fn scan(&self, from: Option<&[u8]>, to: Option<&[u8]>) -> io::Result<RangeIter> {
+        // an empty or reversed range holds nothing; without this check
+        // the map's own `range` would panic on the reversed ones
+        if let (Some(from), Some(to)) = (from, to) {
+            if from >= to {
+                return Ok(RangeIter { sources: Vec::new() });
+            }
+        }
+
+        let lo = from.map_or(Bound::Unbounded, Bound::Included);
+        let hi = to.map_or(Bound::Unbounded, Bound::Excluded);
+
+        // The memory table is already in memory and in key order, so
+        // its source is a copy of the map's slice of the range.
+        let mem: Vec<_> = self
+            .mem
+            .range::<[u8], _>((lo, hi))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let mut sources = vec![Source {
+            records: mem.into_iter(),
+        }];
+
+        // One source per table, newest first — the order lookups walk.
+        // A table's records are sorted on disk, so the walk keeps that
+        // order; records outside the range are parsed and dropped.
+        for table in &self.tables {
+            let bytes = std::fs::read(&table.path)?;
+            let mut records = Vec::new();
+            for (_, payload) in walk(&bytes)? {
+                let Some((op, key, value)) = parse(payload) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "table is corrupt: unreadable record",
+                    ));
+                };
+                let value = match op {
+                    b'P' => Some(value.to_vec()),
+                    b'D' => None,
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "table is corrupt: unknown operation",
+                        ));
+                    }
+                };
+                if in_range(key, &lo, &hi) {
+                    records.push((key.to_vec(), value));
+                }
+            }
+            sources.push(Source {
+                records: records.into_iter(),
+            });
+        }
+
+        Ok(RangeIter { sources })
+    }
+
     /// Flush the memory table into a new numbered table and empty the
     /// log, then merge every table back into one once `MERGE_TABLES`
     /// have piled up. The write path runs the same two moves on its own
@@ -243,6 +312,90 @@ impl TinyLsm {
         }
         Ok(())
     }
+}
+
+/// The iterator `scan` hands back: every live key-value pair in the
+/// requested range, in key order, each key appearing once. The items
+/// are owned pairs — the values may have been read out of a table file,
+/// and an iterator that borrowed from the store would pin it for the
+/// whole scan.
+pub struct RangeIter {
+    /// The store's sources, newest first: the memory table, then each
+    /// on-disk table in the order lookups walk them.
+    sources: Vec<Source>,
+}
+
+/// One source of records for the merge: its in-range records in key
+/// order, plus the cursor an `IntoIter` carries. Corruption was checked
+/// when the source was built, so stepping through it cannot fail.
+struct Source {
+    records: std::vec::IntoIter<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
+impl Source {
+    /// The record the cursor is parked on, if any.
+    fn head(&self) -> Option<&(Vec<u8>, Option<Vec<u8>>)> {
+        self.records.as_slice().first()
+    }
+}
+
+impl Iterator for RangeIter {
+    type Item = (Vec<u8>, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // The smallest key any source is parked on. No source is
+            // parked: the range is exhausted and the scan is over.
+            let key = self
+                .sources
+                .iter()
+                .filter_map(Source::head)
+                .map(|(key, _)| key.clone())
+                .min()?;
+
+            // Every source parked on that key steps past it, and the
+            // newest one's answer is the store's: a value, or a
+            // tombstone that hides the key from the scan. `answer` is
+            // `Option<Option<..>>` on purpose — the outer layer records
+            // whether any source answered, the inner one whether the
+            // answer was live; assigning the bare value would erase the
+            // difference between "answered: nothing" and "not asked".
+            let mut answer: Option<Option<Vec<u8>>> = None;
+            for source in &mut self.sources {
+                if matches!(source.head(), Some((k, _)) if k == &key) {
+                    let (_, value) = source.records.next().unwrap();
+                    if answer.is_none() {
+                        answer = Some(value);
+                    }
+                }
+            }
+
+            // The outer `Some` says a source answered; the inner one
+            // says the answer was live. A tombstone won this key —
+            // drop it and keep looking.
+            if let Some(Some(value)) = answer {
+                return Some((key, value));
+            }
+        }
+    }
+}
+
+/// Whether `key` falls inside a scan's bounds. The memory table applies
+/// the same bounds through `BTreeMap::range`; the table records need
+/// this spelled out. `scan` builds `lo` as included and `hi` as
+/// excluded, and the other two arms are here for exhaustiveness.
+fn in_range(key: &[u8], lo: &Bound<&[u8]>, hi: &Bound<&[u8]>) -> bool {
+    let above = match lo {
+        Bound::Included(start) => key >= *start,
+        Bound::Excluded(start) => key > *start,
+        Bound::Unbounded => true,
+    };
+    let below = match hi {
+        Bound::Included(end) => key <= *end,
+        Bound::Excluded(end) => key < *end,
+        Bound::Unbounded => true,
+    };
+    above && below
 }
 
 /// The memtable's byte cost: key and value lengths added up over every
@@ -1429,5 +1582,111 @@ mod tests {
             false_positives < 200,
             "{false_positives} false positives in 10_000 probes"
         );
+    }
+
+    #[test]
+    fn a_scan_walks_the_whole_store_in_key_order() {
+        let path = temp_log("scan-order");
+        let mut store = TinyLsm::open(&path).unwrap();
+        // unsorted inserts, split across a flush and the memtable
+        for (key, value) in [("m", "3"), ("a", "1"), ("z", "4"), ("b", "2")] {
+            store.put(key, value).unwrap();
+        }
+        store.compact().unwrap();
+        store.put(b"n", b"5").unwrap(); // stays in the memtable
+
+        let scanned: Vec<(Vec<u8>, Vec<u8>)> = store.scan(None, None).unwrap().collect();
+        let keys: Vec<&[u8]> = scanned.iter().map(|(k, _)| k.as_slice()).collect();
+        assert_eq!(keys, [b"a", b"b", b"m", b"n", b"z"]);
+        let values: Vec<&[u8]> = scanned.iter().map(|(_, v)| v.as_slice()).collect();
+        assert_eq!(values, [b"1", b"2", b"3", b"5", b"4"]);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_scan_answers_within_its_bounds() {
+        let path = temp_log("scan-bounds");
+        let mut store = TinyLsm::open(&path).unwrap();
+        for key in [b"c", b"a", b"e", b"b", b"d"] {
+            store.put(key, b"v").unwrap();
+        }
+        store.compact().unwrap();
+
+        // `to` is exclusive, `from` inclusive — a half-open range
+        let keys: Vec<Vec<u8>> = store
+            .scan(Some(b"b"), Some(b"e"))
+            .unwrap()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, [b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]);
+
+        // an unbounded end runs to the store's last key
+        let keys: Vec<Vec<u8>> = store
+            .scan(Some(b"d"), None)
+            .unwrap()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, [b"d".to_vec(), b"e".to_vec()]);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_scan_hides_deleted_keys() {
+        let path = temp_log("scan-deleted");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        store.put(b"beta", b"two").unwrap();
+        store.compact().unwrap();
+        store.delete(b"alpha").unwrap(); // tombstone in the memtable
+
+        let keys: Vec<Vec<u8>> = store.scan(None, None).unwrap().map(|(k, _)| k).collect();
+        assert_eq!(keys, [b"beta".to_vec()]);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_scan_shows_each_key_once_with_the_newest_value() {
+        let path = temp_log("scan-newest");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        store.compact().unwrap(); // alpha=one is in a table now
+        store.put(b"alpha", b"two").unwrap(); // alpha=two is in the memtable
+
+        // both sources hold alpha; the scan answers once, with the
+        // memtable's copy
+        let scanned: Vec<(Vec<u8>, Vec<u8>)> = store.scan(None, None).unwrap().collect();
+        assert_eq!(scanned, [(b"alpha".to_vec(), b"two".to_vec())]);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_scan_plugs_into_the_standard_adapters() {
+        let path = temp_log("scan-adapters");
+        let mut store = TinyLsm::open(&path).unwrap();
+        for key in [b"a", b"b", b"c", b"d"] {
+            store.put(key, b"v").unwrap();
+        }
+        store.compact().unwrap();
+
+        // implementing Iterator once buys every adapter in the standard
+        // library; take walks two steps and the rest stays unconsumed
+        let mut iter = store.scan(None, None).unwrap();
+        let first_two: Vec<Vec<u8>> = iter.by_ref().take(2).map(|(k, _)| k).collect();
+        assert_eq!(first_two, [b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(iter.count(), 2);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn an_empty_or_reversed_range_scans_nothing() {
+        let path = temp_log("scan-empty");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"m", b"v").unwrap();
+
+        // from == to is an empty half-open range; from > to has nothing
+        // between the ends. Neither panics — unlike the map's own range.
+        assert_eq!(store.scan(Some(b"m"), Some(b"m")).unwrap().count(), 0);
+        assert_eq!(store.scan(Some(b"z"), Some(b"a")).unwrap().count(), 0);
+        cleanup(&path);
     }
 }
