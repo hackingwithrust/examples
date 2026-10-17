@@ -2,6 +2,7 @@
 name = "hit"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/hackingwithrust/examples"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -22,3 +23,11 @@ assert_cmd = "2.2.2"
 predicates = "3.1.4"
 tempfile = "3.27.0"
 wiremock = "0.6.5"
+
+[profile.release]
+strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
