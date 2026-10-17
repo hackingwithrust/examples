@@ -2,9 +2,9 @@
 
 Track: <https://hackingwithrust.com/projects/axum-sqlx-api/>
 
-**Status: not started.** The first commit lands with article 2, *Setting up Axum and your first route*.
+**Status: step 2 of 15 published.**
 
-Tags: `api-ch01` … `api-ch15`.
+Tags: `api-ch02` … `api-ch15`.
 
 Needs a Postgres instance:
 
