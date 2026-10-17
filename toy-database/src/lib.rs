@@ -12,16 +12,31 @@ const BLOCK_RECORDS: usize = 4;
 /// them back into one. Below that, a compaction only flushes the log.
 const MERGE_TABLES: usize = 4;
 
-/// A persistent key-value store in one log plus any number of sorted
-/// tables: the append-only log absorbs writes, compaction flushes it into
-/// a new numbered table — cheap, because it writes only what the log
-/// holds — and once `MERGE_TABLES` tables have piled up, a merge folds
-/// all of them back into one. Lookups walk the tables newest first, and
-/// the in-memory table sits in front of all of them.
+/// The memtable's budget, in key and value bytes. The write that pushes
+/// the memtable past it flushes the memtable into a new table as part of
+/// the write — no call to `compact` required.
+const MEMTABLE_BYTES: usize = 4096;
+
+/// A persistent key-value store in one write-ahead log plus any number
+/// of sorted tables: every write lands in the log — synced before the
+/// call returns — and in the in-memory table, the write that pushes the
+/// memory table past its budget flushes it into a new numbered table —
+/// cheap, because it writes only what the memory table holds — and once
+/// `MERGE_TABLES` tables have piled up, a merge folds all of them back
+/// into one. Lookups walk the tables newest first, and the in-memory
+/// table sits in front of all of them.
 pub struct TinyLsm {
     /// Newest writes. `Some(value)` is a live key; `None` is a tombstone
     /// that shadows any older copy of the key in the on-disk tables.
     mem: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// The memtable's byte cost — key and value lengths added up over
+    /// every entry. Compared against `MEMTABLE_BYTES` after each write.
+    mem_bytes: usize,
+    /// The write-ahead log, kept open for the store's life. The handle
+    /// is safe to keep because the log is never renamed: a flush
+    /// truncates it in place, and only tables — never the log — are
+    /// swapped in and out by rename.
+    log: File,
     /// Path of the append-only log, the store's write path.
     path: PathBuf,
     /// The sorted tables on disk, newest first. Each flush adds one; a
@@ -37,7 +52,8 @@ impl TinyLsm {
     /// table — so replaying it after loading the tables restores the true
     /// state. A torn tail in the log is cut; a whole record that fails
     /// its checksum stops the open with an error instead of being
-    /// dropped.
+    /// dropped. The log's handle stays open for the life of the store:
+    /// every write goes through it.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mut tables = load_tables(&path)?;
@@ -52,16 +68,31 @@ impl TinyLsm {
         let mut mem = BTreeMap::new();
         let valid = replay(&bytes, &mut mem)?;
         log.set_len(valid as u64)?;
-        Ok(TinyLsm { mem, path, tables })
+        let mem_bytes = mem_size(&mem);
+        Ok(TinyLsm {
+            mem,
+            mem_bytes,
+            log,
+            path,
+            tables,
+        })
     }
 
-    /// Insert or overwrite `key`. The write hits the log before the map.
+    /// Insert or overwrite `key`. The record hits the write-ahead log
+    /// first and is synced before the call returns, then the memory
+    /// table. A write that pushes the memory table past its budget
+    /// flushes it, so memory stays bounded without the caller having to
+    /// remember `compact`.
     pub fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> io::Result<()> {
         let key = key.into();
         let value = value.into();
         let payload = encode(b'P', &key, Some(&value));
-        append(&self.path, &payload)?;
-        self.mem.insert(key, Some(value));
+        self.log.write_all(&frame(&payload))?;
+        self.log.sync_all()?;
+        let old = self.mem.insert(key.clone(), Some(value.clone()));
+        self.mem_bytes += entry_size(&key, Some(&value));
+        self.mem_bytes -= replaced_size(&key, &old);
+        self.maybe_flush()?;
         Ok(())
     }
 
@@ -113,30 +144,45 @@ impl TinyLsm {
             return Ok(false);
         }
         let payload = encode(b'D', key, None);
-        append(&self.path, &payload)?;
-        self.mem.insert(key.to_vec(), None);
+        self.log.write_all(&frame(&payload))?;
+        self.log.sync_all()?;
+        let old = self.mem.insert(key.to_vec(), None);
+        self.mem_bytes += entry_size(key, None);
+        self.mem_bytes -= replaced_size(key, &old);
+        self.maybe_flush()?;
         Ok(true)
     }
 
-    /// Make the log small again, in two moves. First a flush: write the
-    /// memory table — live keys and tombstones alike — into a new numbered
-    /// table, then empty the log. This is the cheap part, and it is all a
-    /// compaction does until `MERGE_TABLES` tables have piled up. Then a
-    /// merge: fold every table into one new one, oldest first, so each
-    /// newer copy of a key overwrites the older. The merged table lands
-    /// through a temporary file and a rename; the old files are removed
-    /// only after the rename, so a crash part way through leaves the
-    /// store correct either way.
+    /// Flush the memory table into a new numbered table and empty the
+    /// log, then merge every table back into one once `MERGE_TABLES`
+    /// have piled up. The write path runs the same two moves on its own
+    /// whenever the memory table passes `MEMTABLE_BYTES` — see
+    /// `maybe_flush` — so this is the manual trigger for work that
+    /// otherwise happens inside a write. A crash part way through leaves
+    /// the store correct either way: the flush's table lands through a
+    /// temporary file and a rename, and the log is emptied only after
+    /// the table is in place.
     pub fn compact(&mut self) -> io::Result<()> {
         if !self.mem.is_empty() {
             let number = self.next_table_number();
             let table = Sstable::build(&table_path(&self.path, number), number, &self.mem)?;
             self.tables.insert(0, table);
-            File::create(&self.path)?; // the table has absorbed the log: empty it
+            self.log.set_len(0)?; // the table has absorbed the log: empty it
             self.mem.clear();
+            self.mem_bytes = 0;
         }
         if self.tables.len() >= MERGE_TABLES {
             self.merge_tables()?;
+        }
+        Ok(())
+    }
+
+    /// Flush when the memory table has outgrown its budget. Every write
+    /// ends here; the budget decides when a flush happens, not a call
+    /// the caller has to remember to make.
+    fn maybe_flush(&mut self) -> io::Result<()> {
+        if self.mem_bytes >= MEMTABLE_BYTES {
+            self.compact()?;
         }
         Ok(())
     }
@@ -187,6 +233,29 @@ impl TinyLsm {
         }
         Ok(())
     }
+}
+
+/// The memtable's byte cost: key and value lengths added up over every
+/// entry. Computed once per open, after the replay has rebuilt the map.
+fn mem_size(mem: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> usize {
+    mem.iter()
+        .map(|(key, value)| entry_size(key, value.as_ref()))
+        .sum()
+}
+
+/// The memtable cost of one entry: the key's bytes, plus the value's
+/// when the entry is live. A tombstone costs its key and nothing else.
+fn entry_size(key: &[u8], value: Option<&Vec<u8>>) -> usize {
+    key.len() + value.map_or(0, |v| v.len())
+}
+
+/// The memtable cost of the entry `BTreeMap::insert` displaced. The map
+/// hands back the previous value — `Option<Option<Vec<u8>>>` here,
+/// because the stored value is itself an `Option` — and the outer `None`
+/// means no entry was displaced, which costs nothing.
+fn replaced_size(key: &[u8], old: &Option<Option<Vec<u8>>>) -> usize {
+    old.as_ref()
+        .map_or(0, |entry| entry_size(key, entry.as_ref()))
 }
 
 /// Path of table number `n` for a log at `log`: `store.log` keeps its
@@ -363,15 +432,6 @@ impl Sstable {
             index,
         })
     }
-}
-
-/// Frame one payload as a record and append it to the log at `path`. The
-/// handle is opened per call: one extra `open` per write is noise next to
-/// the flush, and it keeps no handle alive that a rename could orphan.
-fn append(path: &Path, payload: &[u8]) -> io::Result<()> {
-    let mut log = OpenOptions::new().append(true).open(path)?;
-    log.write_all(&frame(payload))?;
-    log.flush()
 }
 
 /// FNV-1a, 32-bit: three lines, deterministic, and enough to catch a torn
@@ -1141,6 +1201,60 @@ mod tests {
 
         let err = TinyLsm::open(&path).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_full_memtable_flushes_on_its_own() {
+        let path = temp_log("auto-flush");
+        let mut store = TinyLsm::open(&path).unwrap();
+        for i in 0..100 {
+            let key = format!("key{i:03}");
+            store.put(key.as_bytes(), vec![b'x'; 64]).unwrap();
+        }
+        // 70 bytes per write: the 59th crosses MEMTABLE_BYTES and flushes
+        // without any call to compact. The 41 writes after it stay in the
+        // log, still under budget.
+        assert_eq!(sst_files(&path).len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap().len(), 41 * 87);
+        let store = TinyLsm::open(&path).unwrap();
+        assert_eq!(store.get(b"key000").unwrap(), Some(vec![b'x'; 64]));
+        assert_eq!(store.get(b"key099").unwrap(), Some(vec![b'x'; 64]));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_flush_truncates_the_log_in_place() {
+        let path = temp_log("truncate");
+        let mut store = TinyLsm::open(&path).unwrap();
+        store.put(b"alpha", b"one").unwrap();
+        store.compact().unwrap();
+        store.put(b"beta", b"two").unwrap();
+        drop(store);
+
+        // the post-flush write starts at offset 0: the log holds exactly
+        // beta's record, not a hole where alpha's record used to be
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(bytes[8], b'P');
+        assert_eq!(&bytes[13..17], b"beta");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn an_overwrite_keeps_the_budget_honest() {
+        let path = temp_log("overwrite-budget");
+        let mut store = TinyLsm::open(&path).unwrap();
+        // 5000 bytes of value: the first put crosses the budget on its own
+        store.put(b"alpha", vec![b'x'; 5000]).unwrap();
+        assert_eq!(sst_files(&path).len(), 1);
+        // the overwrite is 9 bytes in the memtable: no second flush
+        store.put(b"alpha", b"tiny").unwrap();
+        assert_eq!(sst_files(&path).len(), 1);
+        assert_eq!(store.get(b"alpha").unwrap(), Some(b"tiny".to_vec()));
+        drop(store);
+        let store = TinyLsm::open(&path).unwrap();
+        assert_eq!(store.get(b"alpha").unwrap(), Some(b"tiny".to_vec()));
         cleanup(&path);
     }
 }
