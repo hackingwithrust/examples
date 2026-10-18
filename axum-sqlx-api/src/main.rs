@@ -63,7 +63,8 @@ impl<T: Serialize> IntoResponse for ApiResponse<T> {
 }
 
 async fn health(Extension(pool): Extension<PgPool>) -> Result<&'static str, StatusCode> {
-    match sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&pool).await {
+    // query! macros read the schema through DATABASE_URL at compile time.
+    match sqlx::query_scalar!("SELECT 1").fetch_one(&pool).await {
         Ok(_) => Ok("ok"),
         Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
