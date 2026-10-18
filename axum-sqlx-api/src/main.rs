@@ -32,12 +32,6 @@ struct LinkPage {
     links: Vec<Link>,
 }
 
-#[derive(Serialize)]
-struct ResolvedLink {
-    code: String,
-    target: Option<String>,
-}
-
 struct ApiResponse<T> {
     status: StatusCode,
     data: T,
@@ -70,40 +64,75 @@ async fn health(Extension(pool): Extension<PgPool>) -> Result<&'static str, Stat
     }
 }
 
-async fn create_link(Json(input): Json<CreateLink>) -> ApiResponse<Link> {
-    // Nothing is stored yet - step 8 adds the insert, step 9 the code
-    // generation. The stub code keeps the response shape right.
-    ApiResponse::with_status(
+async fn create_link(
+    Extension(pool): Extension<PgPool>,
+    Json(input): Json<CreateLink>,
+) -> Result<ApiResponse<Link>, StatusCode> {
+    // The code is still the stub from step 4 - generating a real one is
+    // step 9. Everything else about the insert is final.
+    let row = sqlx::query!(
+        "INSERT INTO links (code, url) VALUES ('stub', $1) RETURNING id, code, url",
+        input.url
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(ApiResponse::with_status(
         StatusCode::CREATED,
         Link {
-            code: "stub".to_string(),
-            url: input.url,
+            code: row.code,
+            url: row.url,
         },
+    ))
+}
+
+async fn list_links(
+    Extension(pool): Extension<PgPool>,
+    Query(p): Query<Pagination>,
+) -> Result<ApiResponse<LinkPage>, StatusCode> {
+    let page = p.page.unwrap_or(1).max(1) as i64;
+    let limit = p.limit.unwrap_or(20) as i64;
+
+    let rows = sqlx::query!(
+        "SELECT code, url FROM links ORDER BY id LIMIT $1 OFFSET $2",
+        limit,
+        (page - 1) * limit
     )
+    .fetch_all(&pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(ApiResponse::ok(LinkPage {
+        page: page as usize,
+        limit: limit as usize,
+        links: rows
+            .into_iter()
+            .map(|row| Link {
+                code: row.code,
+                url: row.url,
+            })
+            .collect(),
+    }))
 }
 
-async fn list_links(Query(p): Query<Pagination>) -> ApiResponse<LinkPage> {
-    // Still hardcoded - step 8 replaces this with a real query against
-    // the links table.
-    let links = vec![Link {
-        code: "9xK2mQz".to_string(),
-        url: "https://example.com/very/long/path".to_string(),
-    }];
-    ApiResponse::ok(LinkPage {
-        page: p.page.unwrap_or(1),
-        limit: p.limit.unwrap_or(20),
-        links,
-    })
-}
+async fn resolve_link(
+    Path(code): Path<String>,
+    Extension(pool): Extension<PgPool>,
+) -> Result<Response, StatusCode> {
+    let row = sqlx::query!("SELECT url FROM links WHERE code = $1", code)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-async fn resolve_link(Path(code): Path<String>) -> ApiResponse<ResolvedLink> {
-    // Nothing is stored yet, so there is nothing to look the target up
-    // in. The table arrives with step 6's migration, the real lookup
-    // with step 8.
-    ApiResponse::ok(ResolvedLink {
-        code,
-        target: None,
-    })
+    match row {
+        Some(row) => Ok((
+            StatusCode::FOUND,
+            [("Location", row.url.as_str())],
+        )
+            .into_response()),
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 #[tokio::main]
