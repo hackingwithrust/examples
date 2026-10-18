@@ -115,6 +115,8 @@ async fn main() {
         .await
         .expect("failed to connect to DATABASE_URL");
 
+    sqlx::migrate!().run(&pool).await.expect("failed to run migrations");
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/links", get(list_links).post(create_link))
