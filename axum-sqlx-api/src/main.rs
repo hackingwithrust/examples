@@ -608,6 +608,144 @@ async fn resolve_link(
     }
 }
 
+// The tests below talk to a real Postgres. #[sqlx::test] replaces
+// #[tokio::test]: before the body runs, sqlx connects to the server
+// DATABASE_URL points at, creates a database named for this one test,
+// applies the migrations in migrations/ to it, and hands the body a pool
+// connected to it. When the test ends the database is dropped. One test
+// cannot see what another wrote, so each starts from the same empty schema
+// with no setup and no cleanup.
+#[cfg(test)]
+mod api_tests {
+    use super::*;
+    use axum::{body::Body, http::{Method, Request}, response::Response};
+    use serde_json::Value;
+    use tower::ServiceExt as _; // .oneshot: drive the router without a server
+
+    // The tests read as request in, response out, so the two helpers below
+    // keep the plumbing in one place.
+    fn req(method: axum::http::Method, uri: &str, key: Option<&str>, body: Option<String>) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(key) = key {
+            builder = builder.header("authorization", format!("Bearer {key}"));
+        }
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        builder.body(Body::from(body.unwrap_or_default())).unwrap()
+    }
+
+    async fn send(app: Router, request: Request<Body>) -> Response {
+        app.oneshot(request).await.unwrap()
+    }
+
+    async fn body_string(res: Response) -> String {
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).expect("body is utf-8")
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn health_reports_ok(pool: PgPool) {
+        let res = send(app(pool, "test-key"), req(Method::GET, "/health", None, None)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_string(res).await, "ok");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn links_reject_a_missing_api_key(pool: PgPool) {
+        let body = serde_json::to_string(&serde_json::json!({ "url": "https://example.org" })).unwrap();
+        let res = send(
+            app(pool, "test-key"),
+            req(Method::POST, "/links", None, Some(body)),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_created_link_resolves(pool: PgPool) {
+        let router = app(pool, "test-key");
+        let body = serde_json::to_string(&serde_json::json!({ "url": "https://example.org/page" })).unwrap();
+        let res = send(
+            router.clone(),
+            req(Method::POST, "/links", Some("test-key"), Some(body)),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let created: Value = serde_json::from_str(&body_string(res).await).unwrap();
+        assert_eq!(created["url"], "https://example.org/page");
+        let code = created["code"].as_str().unwrap();
+
+        let res = send(
+            router,
+            req(Method::GET, &format!("/{code}"), None, None),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FOUND);
+        assert_eq!(
+            res.headers()["location"],
+            "https://example.org/page"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unknown_code_is_a_404(pool: PgPool) {
+        let res = send(app(pool, "test-key"), req(Method::GET, "/zzzzzzz", None, None)).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_invalid_url_is_a_422(pool: PgPool) {
+        let body = serde_json::to_string(&serde_json::json!({ "url": "not a url" })).unwrap();
+        let res = send(
+            app(pool, "test-key"),
+            req(Method::POST, "/links", Some("test-key"), Some(body)),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body_string(res).await.contains("must be a valid URL"));
+    }
+
+    // The isolation guarantee, stated as a test: every test gets a fresh
+    // database, so a list that was never written to is empty - and if the
+    // tests ever start sharing a database, this assertion fails on the
+    // second test that runs.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn each_test_starts_from_an_empty_database(pool: PgPool) {
+        let res = send(app(pool, "test-key"), req(Method::GET, "/links", Some("test-key"), None)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let page: Value = serde_json::from_str(&body_string(res).await).unwrap();
+        assert_eq!(page["links"].as_array().unwrap().len(), 0);
+    }
+}
+
+// The whole service as a value. main adds the observability layers from
+// step 13 on top and serves it; the tests below drive it directly - no
+// listener, no port, no second process. Building the router needs a pool
+// handle but opens no connection, so a test can hold one before any query
+// has run.
+fn app(pool: PgPool, key: impl Into<Arc<str>>) -> Router {
+    // Two routers, because the routes have different audiences: browsers
+    // hitting /{code} send no headers, and a load balancer polling /health
+    // has none to offer. Only /links - the routes that change or read data -
+    // sit behind the layers. route_layer, not layer: it runs only once a
+    // route has matched, so a typo like /foo/bar stays a 404 instead of
+    // being told to authenticate against a path that does not exist.
+    // Both route_layers wrap the same routes, and the last one added is the
+    // outermost: a request meets auth before the limiter, because the
+    // limiter needs the identity auth leaves in the extensions.
+    let protected = Router::new()
+        .route("/links", get(list_links).post(create_link))
+        .route_layer(RateLimit::new(10.0, 5.0))
+        .route_layer(RequireApiKey::new(key));
+
+    Router::new()
+        .route("/health", get(health))
+        .route("/{code}", get(resolve_link))
+        .merge(protected)
+        .layer(Extension(pool))
+}
+
 #[tokio::main]
 async fn main() {
     // RUST_LOG picks the level, using the same syntax as env_logger. Without
@@ -637,32 +775,15 @@ async fn main() {
     // request is rejected, which is better discovered at boot.
     let key = std::env::var("SHORTLINK_API_KEY").expect("SHORTLINK_API_KEY is not set");
 
-    // Two routers, because the routes have different audiences: browsers
-    // hitting /{code} send no headers, and a load balancer polling /health
-    // has none to offer. Only /links - the routes that change or read data -
-    // sit behind the layers. route_layer, not layer: it runs only once a
-    // route has matched, so a typo like /foo/bar stays a 404 instead of
-    // being told to authenticate against a path that does not exist.
-    // Both route_layers wrap the same routes, and the last one added is the
-    // outermost: a request meets auth before the limiter, because the
-    // limiter needs the identity auth leaves in the extensions.
-    let protected = Router::new()
-        .route("/links", get(list_links).post(create_link))
-        .route_layer(RateLimit::new(10.0, 5.0))
-        .route_layer(RequireApiKey::new(key));
-
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/{code}", get(resolve_link))
-        .merge(protected)
-        .layer(Extension(pool))
-        // Step 12's rule again: the last layer added is the first to see the
-        // request. Set runs outermost and gives every request an id - or
-        // adopts the one in its x-request-id header. Propagate sits inside
-        // it and reads the header back on its way through, so it can stamp
-        // the response - a generated id included. The trace layer runs
-        // inside both, so its span is made after the id exists and every
-        // line carries it.
+    // app() builds the routes, the auth layer and the rate limiter. The
+    // three layers here are step 13's, and the rule is the same as step
+    // 12's: the last one added is the first to see the request. Set runs
+    // outermost and gives every request an id - or adopts the one in its
+    // x-request-id header. Propagate sits inside it and reads the header
+    // back on its way through, so it can stamp the response - a generated
+    // id included. The trace layer runs inside both, so its span is made
+    // after the id exists and every line carries it.
+    let router = app(pool, key)
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(RequestSpan)
@@ -673,5 +794,5 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, router).await.unwrap();
 }
