@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::{
+    collections::HashMap,
     convert::Infallible,
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
+    time::Instant,
 };
 use thiserror::Error;
 use tower::{Layer, Service};
@@ -56,6 +58,7 @@ fn next_code(state: &mut u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn encodes_the_boundaries() {
@@ -81,6 +84,47 @@ mod tests {
         let first = next_code(&mut state);
         let second = next_code(&mut state);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_fresh_bucket_bursts_to_capacity_then_rejects() {
+        let limiter = Limiter::new(3.0, 1.0);
+        let key: Arc<str> = "dev-key".into();
+        let start = Instant::now();
+        for _ in 0..3 {
+            assert!(limiter.check(key.clone(), start).is_ok());
+        }
+        // 0.7 seconds until the next token, rounded up to a whole second.
+        assert_eq!(limiter.check(key, start), Err(1));
+    }
+
+    #[test]
+    fn elapsed_time_refills_the_bucket() {
+        let limiter = Limiter::new(3.0, 1.0);
+        let key: Arc<str> = "dev-key".into();
+        let start = Instant::now();
+        for _ in 0..3 {
+            limiter.check(key.clone(), start).unwrap();
+        }
+        // Half a second back is half a token - not enough to admit.
+        let half = start + Duration::from_millis(500);
+        assert!(limiter.check(key.clone(), half).is_err());
+        // Half a second more completes the token.
+        let full = half + Duration::from_millis(500);
+        assert!(limiter.check(key, full).is_ok());
+    }
+
+    #[test]
+    fn keys_do_not_share_a_bucket() {
+        let limiter = Limiter::new(2.0, 1.0);
+        let alpha: Arc<str> = "alpha".into();
+        let beta: Arc<str> = "beta".into();
+        let start = Instant::now();
+        for _ in 0..2 {
+            limiter.check(alpha.clone(), start).unwrap();
+        }
+        assert!(limiter.check(alpha, start).is_err());
+        assert!(limiter.check(beta, start).is_ok());
     }
 }
 
@@ -145,6 +189,14 @@ enum ApiError {
     Unauthorized(&'static str),
     #[error("not found")]
     NotFound,
+    #[error("rate limit exceeded")]
+    TooManyRequests(u64),
+    // The rate limiter reads the identity the auth layer left behind. This
+    // variant means it found none - the two layers were wired in the wrong
+    // order. That is a deployment bug, not a client's fault, so it maps to
+    // 500 like the other internal errors.
+    #[error("internal server error")]
+    Miswired,
     // The sqlx error is kept as the source for logging (step 13) but never
     // serialised - its message names tables and columns a client has no
     // business reading.
@@ -161,9 +213,22 @@ impl IntoResponse for ApiError {
             ApiError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::NotFound => StatusCode::NOT_FOUND,
-            ApiError::Database(_) | ApiError::Exhausted => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::Miswired | ApiError::Database(_) | ApiError::Exhausted => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
-        (status, Json(json!({ "error": self.to_string() }))).into_response()
+        let mut res = (status, Json(json!({ "error": self.to_string() }))).into_response();
+        if let ApiError::TooManyRequests(retry) = &self {
+            // RFC 9110: Retry-After tells the client when to try again. The
+            // bucket refills continuously, so this is a whole-second
+            // estimate, rounded up.
+            res.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&retry.to_string()).expect("a u64 is a valid header value"),
+            );
+        }
+        res
     }
 }
 
@@ -185,8 +250,8 @@ where
     }
 }
 
-// The identity the layer proved. Handlers never re-check the header, and the
-// rate limiter in the next step reads it from the request extensions.
+// The identity the auth layer proved. Handlers never re-check the header,
+// and the rate limiter below keys its buckets on it.
 #[derive(Clone)]
 struct ApiUser {
     key: Arc<str>,
@@ -279,6 +344,118 @@ fn check_key(headers: &HeaderMap, key: &str) -> Result<(), ApiError> {
         return Err(ApiError::Unauthorized("invalid API key"));
     }
     Ok(())
+}
+
+// One bucket per key. `capacity` tokens are available immediately - that is
+// the burst a client may spend at once - and `refill_per_sec` drips back in
+// continuously. A client that waits between requests never sees the limit;
+// one that hammers is cut to the refill rate once the burst is spent.
+struct TokenBucket {
+    tokens: f64,
+    updated: Instant,
+}
+
+// Cloned services share one Limiter through the Arc, so every connection
+// agrees on how many tokens a key has left.
+struct Limiter {
+    buckets: Mutex<HashMap<Arc<str>, TokenBucket>>,
+    capacity: f64,
+    refill_per_sec: f64,
+}
+
+impl Limiter {
+    fn new(capacity: f64, refill_per_sec: f64) -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+            capacity,
+            refill_per_sec,
+        }
+    }
+
+    // One token per request. Ok(()) admits it; Err(retry) is how many
+    // seconds until a token is back, rounded up to a whole second because
+    // Retry-After takes integer seconds.
+    fn check(&self, key: Arc<str>, now: Instant) -> Result<(), u64> {
+        let mut buckets = self.buckets.lock().expect("bucket map poisoned");
+        let bucket = buckets.entry(key).or_insert(TokenBucket {
+            tokens: self.capacity,
+            updated: now,
+        });
+        let elapsed = now.duration_since(bucket.updated).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        bucket.updated = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            Ok(())
+        } else {
+            let secs = ((1.0 - bucket.tokens) / self.refill_per_sec).ceil();
+            Err(secs.max(1.0) as u64)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RateLimit {
+    limiter: Arc<Limiter>,
+}
+
+impl RateLimit {
+    fn new(capacity: f64, refill_per_sec: f64) -> Self {
+        Self {
+            limiter: Arc::new(Limiter::new(capacity, refill_per_sec)),
+        }
+    }
+}
+
+impl<S> Layer<S> for RateLimit {
+    type Service = RateLimitService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RateLimitService {
+            inner,
+            limiter: self.limiter.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RateLimitService<S> {
+    inner: S,
+    limiter: Arc<Limiter>,
+}
+
+impl<S> Service<Request> for RateLimitService<S>
+where
+    S: Service<Request, Response = Response, Error = Infallible> + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request) -> Self::Future {
+        // The auth layer runs first and left the identity behind. Its
+        // absence here means the layers were wired in the wrong order - the
+        // limiter has nothing to key on and must not guess.
+        let key = match req.extensions().get::<ApiUser>() {
+            Some(user) => user.key.clone(),
+            None => {
+                let res = ApiError::Miswired.into_response();
+                return Box::pin(async move { Ok(res) });
+            }
+        };
+        match self.limiter.check(key, Instant::now()) {
+            Err(retry) => {
+                let res = ApiError::TooManyRequests(retry).into_response();
+                Box::pin(async move { Ok(res) })
+            }
+            Ok(()) => Box::pin(self.inner.call(req)),
+        }
+    }
 }
 
 async fn health(Extension(pool): Extension<PgPool>) -> Result<&'static str, StatusCode> {
@@ -403,11 +580,15 @@ async fn main() {
     // Two routers, because the routes have different audiences: browsers
     // hitting /{code} send no headers, and a load balancer polling /health
     // has none to offer. Only /links - the routes that change or read data -
-    // sit behind the layer. route_layer, not layer: it runs only once a
+    // sit behind the layers. route_layer, not layer: it runs only once a
     // route has matched, so a typo like /foo/bar stays a 404 instead of
     // being told to authenticate against a path that does not exist.
+    // Both route_layers wrap the same routes, and the last one added is the
+    // outermost: a request meets auth before the limiter, because the
+    // limiter needs the identity auth leaves in the extensions.
     let protected = Router::new()
         .route("/links", get(list_links).post(create_link))
+        .route_layer(RateLimit::new(10.0, 5.0))
         .route_layer(RequireApiKey::new(key));
 
     let app = Router::new()

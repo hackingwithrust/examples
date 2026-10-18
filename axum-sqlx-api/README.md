@@ -2,7 +2,7 @@
 
 Track: <https://hackingwithrust.com/projects/axum-sqlx-api/>
 
-**Status: step 11 of 15 published.**
+**Status: step 12 of 15 published.**
 
 Tags: `api-ch02` … `api-ch15`.
 
