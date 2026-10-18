@@ -1,12 +1,15 @@
 use axum::{
     Json, Router,
-    extract::{Extension, Path, Query},
+    extract::{Extension, FromRequest, Path, Query, Request},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions};
+use thiserror::Error;
+use validator::{Validate, ValidationErrors};
 
 const ALPHABET: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
@@ -79,8 +82,9 @@ struct Pagination {
     limit: Option<usize>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Validate)]
 struct CreateLink {
+    #[validate(url(message = "must be a valid URL"))]
     url: String,
 }
 
@@ -121,6 +125,55 @@ impl<T: Serialize> IntoResponse for ApiResponse<T> {
     }
 }
 
+#[derive(Debug, Error)]
+enum ApiError {
+    // Extractor rejections carry their own status: 400 for malformed JSON,
+    // 415 for a missing or wrong content-type.
+    #[error("{1}")]
+    BadBody(StatusCode, String),
+    #[error("{0}")]
+    Validation(#[from] ValidationErrors),
+    #[error("not found")]
+    NotFound,
+    // The sqlx error is kept as the source for logging (step 13) but never
+    // serialised - its message names tables and columns a client has no
+    // business reading.
+    #[error("internal server error")]
+    Database(#[from] sqlx::Error),
+    #[error("internal server error")]
+    Exhausted,
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let status = match &self {
+            ApiError::BadBody(status, _) => *status,
+            ApiError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::NotFound => StatusCode::NOT_FOUND,
+            ApiError::Database(_) | ApiError::Exhausted => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(json!({ "error": self.to_string() }))).into_response()
+    }
+}
+
+struct ValidatedJson<T>(T);
+
+impl<S, T> FromRequest<S> for ValidatedJson<T>
+where
+    T: DeserializeOwned + Validate,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let Json(value) = Json::<T>::from_request(req, state)
+            .await
+            .map_err(|rejection| ApiError::BadBody(rejection.status(), rejection.body_text()))?;
+        value.validate()?;
+        Ok(ValidatedJson(value))
+    }
+}
+
 async fn health(Extension(pool): Extension<PgPool>) -> Result<&'static str, StatusCode> {
     // query! macros read the schema through DATABASE_URL at compile time.
     match sqlx::query_scalar!("SELECT 1").fetch_one(&pool).await {
@@ -131,8 +184,8 @@ async fn health(Extension(pool): Extension<PgPool>) -> Result<&'static str, Stat
 
 async fn create_link(
     Extension(pool): Extension<PgPool>,
-    Json(input): Json<CreateLink>,
-) -> Result<ApiResponse<Link>, StatusCode> {
+    ValidatedJson(input): ValidatedJson<CreateLink>,
+) -> Result<ApiResponse<Link>, ApiError> {
     // The seed comes from the clock; every call to next_code advances the
     // state, so a retried insert draws a different code.
     let mut state = std::time::SystemTime::now()
@@ -166,7 +219,7 @@ async fn create_link(
                     .as_database_error()
                     .is_some_and(|db| matches!(db.kind(), sqlx::error::ErrorKind::UniqueViolation));
                 if !retryable {
-                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                    return Err(err.into());
                 }
             }
         }
@@ -174,13 +227,13 @@ async fn create_link(
 
     // Five collisions in a row out of 3.5 trillion codes is not bad luck,
     // it is a bug - but a 500 beats an infinite loop.
-    Err(StatusCode::INTERNAL_SERVER_ERROR)
+    Err(ApiError::Exhausted)
 }
 
 async fn list_links(
     Extension(pool): Extension<PgPool>,
     Query(p): Query<Pagination>,
-) -> Result<ApiResponse<LinkPage>, StatusCode> {
+) -> Result<ApiResponse<LinkPage>, ApiError> {
     let page = p.page.unwrap_or(1).max(1) as i64;
     let limit = p.limit.unwrap_or(20) as i64;
 
@@ -190,8 +243,7 @@ async fn list_links(
         (page - 1) * limit
     )
     .fetch_all(&pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .await?;
 
     Ok(ApiResponse::ok(LinkPage {
         page: page as usize,
@@ -209,11 +261,10 @@ async fn list_links(
 async fn resolve_link(
     Path(code): Path<String>,
     Extension(pool): Extension<PgPool>,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ApiError> {
     let row = sqlx::query!("SELECT url FROM links WHERE code = $1", code)
         .fetch_optional(&pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .await?;
 
     match row {
         Some(row) => Ok((
@@ -221,7 +272,7 @@ async fn resolve_link(
             [("Location", row.url.as_str())],
         )
             .into_response()),
-        None => Err(StatusCode::NOT_FOUND),
+        None => Err(ApiError::NotFound),
     }
 }
 
