@@ -1192,6 +1192,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "tower",
  "validator",
 ]
 

@@ -1,14 +1,22 @@
 use axum::{
     Json, Router,
     extract::{Extension, FromRequest, Path, Query, Request},
-    http::StatusCode,
+    http::{StatusCode, header, HeaderMap, HeaderValue},
     response::{IntoResponse, Response},
     routing::get,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions};
+use std::{
+    convert::Infallible,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 use thiserror::Error;
+use tower::{Layer, Service};
 use validator::{Validate, ValidationErrors};
 
 const ALPHABET: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -133,6 +141,8 @@ enum ApiError {
     BadBody(StatusCode, String),
     #[error("{0}")]
     Validation(#[from] ValidationErrors),
+    #[error("{0}")]
+    Unauthorized(&'static str),
     #[error("not found")]
     NotFound,
     // The sqlx error is kept as the source for logging (step 13) but never
@@ -149,6 +159,7 @@ impl IntoResponse for ApiError {
         let status = match &self {
             ApiError::BadBody(status, _) => *status,
             ApiError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::Database(_) | ApiError::Exhausted => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -172,6 +183,102 @@ where
         value.validate()?;
         Ok(ValidatedJson(value))
     }
+}
+
+// The identity the layer proved. Handlers never re-check the header, and the
+// rate limiter in the next step reads it from the request extensions.
+#[derive(Clone)]
+struct ApiUser {
+    key: Arc<str>,
+}
+
+// Wraps the routes only an authenticated client may touch. A tower layer
+// sits between the router and the handler: it sees every request first and
+// can answer it without the handler ever running.
+#[derive(Clone)]
+struct RequireApiKey {
+    key: Arc<str>,
+}
+
+impl RequireApiKey {
+    fn new(key: impl Into<Arc<str>>) -> Self {
+        Self { key: key.into() }
+    }
+}
+
+impl<S> Layer<S> for RequireApiKey {
+    type Service = RequireApiKeyService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequireApiKeyService {
+            inner,
+            key: self.key.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RequireApiKeyService<S> {
+    inner: S,
+    key: Arc<str>,
+}
+
+impl<S> Service<Request> for RequireApiKeyService<S>
+where
+    S: Service<Request, Response = Response, Error = Infallible> + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response;
+    // axum requires every service in the stack to be infallible: the router
+    // has no Err branch to handle. A failed check therefore becomes a
+    // Response here - which ApiError's IntoResponse already knows how to
+    // build.
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request) -> Self::Future {
+        match check_key(req.headers(), &self.key) {
+            Err(err) => {
+                let mut res = err.into_response();
+                // RFC 9110: a 401 tells the client how to authenticate. This
+                // is the only place the header can be added - handlers never
+                // see a rejected request.
+                res.headers_mut().insert(
+                    header::WWW_AUTHENTICATE,
+                    HeaderValue::from_static("Bearer"),
+                );
+                Box::pin(async move { Ok(res) })
+            }
+            Ok(()) => {
+                let mut req = req;
+                req.extensions_mut().insert(ApiUser {
+                    key: self.key.clone(),
+                });
+                Box::pin(self.inner.call(req))
+            }
+        }
+    }
+}
+
+// The scheme is case-insensitive per RFC 9110, so "bearer" passes too.
+fn check_key(headers: &HeaderMap, key: &str) -> Result<(), ApiError> {
+    let value = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(ApiError::Unauthorized("missing API key"))?;
+    let token = value
+        .split_once(' ')
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token)
+        .ok_or(ApiError::Unauthorized("expected a Bearer token"))?;
+    if token != key {
+        return Err(ApiError::Unauthorized("invalid API key"));
+    }
+    Ok(())
 }
 
 async fn health(Extension(pool): Extension<PgPool>) -> Result<&'static str, StatusCode> {
@@ -288,10 +395,25 @@ async fn main() {
 
     sqlx::migrate!().run(&pool).await.expect("failed to run migrations");
 
+    // The key lives in the environment, not in the source. The service
+    // refuses to start without one - a missing key means every /links
+    // request is rejected, which is better discovered at boot.
+    let key = std::env::var("SHORTLINK_API_KEY").expect("SHORTLINK_API_KEY is not set");
+
+    // Two routers, because the routes have different audiences: browsers
+    // hitting /{code} send no headers, and a load balancer polling /health
+    // has none to offer. Only /links - the routes that change or read data -
+    // sit behind the layer. route_layer, not layer: it runs only once a
+    // route has matched, so a typo like /foo/bar stays a 404 instead of
+    // being told to authenticate against a path that does not exist.
+    let protected = Router::new()
+        .route("/links", get(list_links).post(create_link))
+        .route_layer(RequireApiKey::new(key));
+
     let app = Router::new()
         .route("/health", get(health))
-        .route("/links", get(list_links).post(create_link))
         .route("/{code}", get(resolve_link))
+        .merge(protected)
         .layer(Extension(pool));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await.unwrap();
