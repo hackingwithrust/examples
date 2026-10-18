@@ -19,6 +19,12 @@ use std::{
 };
 use thiserror::Error;
 use tower::{Layer, Service};
+use tower_http::{
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
+    trace::{DefaultOnResponse, MakeSpan, TraceLayer},
+};
+use tracing::Level;
+use tracing_subscriber::EnvFilter;
 use validator::{Validate, ValidationErrors};
 
 const ALPHABET: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -197,9 +203,8 @@ enum ApiError {
     // 500 like the other internal errors.
     #[error("internal server error")]
     Miswired,
-    // The sqlx error is kept as the source for logging (step 13) but never
-    // serialised - its message names tables and columns a client has no
-    // business reading.
+    // The sqlx error is kept as the source so into_response can log it -
+    // the response body still only says "internal server error".
     #[error("internal server error")]
     Database(#[from] sqlx::Error),
     #[error("internal server error")]
@@ -208,6 +213,26 @@ enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // Every rejected request passes through here once. The lines below
+        // run inside the request's span, so each one carries the request id
+        // - a 500 in the log can be traced to the exact request. 5xx errors
+        // log their cause; a 429 is worth a warning; 401 and 404 are the
+        // client's story, already told by the response line.
+        match &self {
+            ApiError::Database(source) => {
+                tracing::error!(error = ?source, "database error");
+            }
+            ApiError::Miswired => {
+                tracing::error!("rate limiter found no API user; the layer order is wrong");
+            }
+            ApiError::Exhausted => {
+                tracing::error!("five code collisions in a row; refusing to retry again");
+            }
+            ApiError::TooManyRequests(_) => {
+                tracing::warn!("rate limit exceeded");
+            }
+            _ => {}
+        }
         let status = match &self {
             ApiError::BadBody(status, _) => *status,
             ApiError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -458,6 +483,29 @@ where
     }
 }
 
+// The span every log line of a request lands in. tower-http calls this once
+// the request reaches the trace layer, and the request-id layer sits outside
+// it, so the id is already in the extensions here. One id, chosen at the
+// edge, printed on every line this request produces.
+#[derive(Clone)]
+struct RequestSpan;
+
+impl<B> MakeSpan<B> for RequestSpan {
+    fn make_span(&mut self, request: &axum::http::Request<B>) -> tracing::Span {
+        let request_id = request
+            .extensions()
+            .get::<RequestId>()
+            .map(|id| id.header_value().to_str().unwrap_or("-"))
+            .unwrap_or("-");
+        tracing::info_span!(
+            "http_request",
+            request_id = %request_id,
+            method = %request.method(),
+            path = %request.uri().path(),
+        )
+    }
+}
+
 async fn health(Extension(pool): Extension<PgPool>) -> Result<&'static str, StatusCode> {
     // query! macros read the schema through DATABASE_URL at compile time.
     match sqlx::query_scalar!("SELECT 1").fetch_one(&pool).await {
@@ -562,6 +610,18 @@ async fn resolve_link(
 
 #[tokio::main]
 async fn main() {
+    // RUST_LOG picks the level, using the same syntax as env_logger. Without
+    // it, info and up. The names are crate names, so `RUST_LOG=shortlink=debug`
+    // turns up only this service's own lines and leaves the dependencies alone.
+    // No colour: these lines are headed for files and aggregators, and the
+    // escape codes would be noise there.
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL is not set");
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -595,8 +655,23 @@ async fn main() {
         .route("/health", get(health))
         .route("/{code}", get(resolve_link))
         .merge(protected)
-        .layer(Extension(pool));
+        .layer(Extension(pool))
+        // Step 12's rule again: the last layer added is the first to see the
+        // request. Set runs outermost and gives every request an id - or
+        // adopts the one in its x-request-id header. Propagate sits inside
+        // it and reads the header back on its way through, so it can stamp
+        // the response - a generated id included. The trace layer runs
+        // inside both, so its span is made after the id exists and every
+        // line carries it.
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(RequestSpan)
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
+        .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await.unwrap();
+    tracing::info!("listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
 }
