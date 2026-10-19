@@ -74,6 +74,24 @@ button {
   box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
 }
 
+textarea {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  font-family: inherit;
+  color: #0f0f0f;
+  background-color: #ffffff;
+  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
+  outline: none;
+  resize: none;
+}
+
+li {
+  cursor: pointer;
+}
+
 button {
   cursor: pointer;
 }
@@ -106,6 +124,7 @@ button {
   }
 
   input,
+  textarea,
   button {
     color: #ffffff;
     background-color: #0f0f0f98;

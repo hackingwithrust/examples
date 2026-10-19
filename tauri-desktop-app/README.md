@@ -2,7 +2,7 @@
 
 Track: <https://hackingwithrust.com/projects/tauri-desktop-app/>
 
-**Status: step 6 of 12 published.**
+**Status: step 7 of 12 published.**
 
 Tags: `tauri-ch02` … `tauri-ch11` (one per code article; the pure-documentation steps have none).
 

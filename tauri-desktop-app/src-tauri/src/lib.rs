@@ -98,6 +98,26 @@ async fn list_notes(state: State<'_, Mutex<Connection>>) -> Result<Vec<Note>, St
     Ok(notes)
 }
 
+#[tauri::command]
+async fn update_note(
+    state: State<'_, Mutex<Connection>>,
+    id: i64,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    let conn = state.lock().map_err(|e| e.to_string())?;
+    let updated = conn
+        .execute(
+            "UPDATE notes SET title = ?1, body = ?2 WHERE id = ?3",
+            rusqlite::params![title, body, id],
+        )
+        .map_err(|e| e.to_string())?;
+    if updated == 0 {
+        return Err(format!("no note #{id}"));
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -110,7 +130,9 @@ pub fn run() {
             app.manage(Mutex::new(conn));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![add, divide, stats, create_note, list_notes])
+        .invoke_handler(tauri::generate_handler![
+            add, divide, stats, create_note, list_notes, update_note
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

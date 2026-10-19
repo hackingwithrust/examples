@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
@@ -12,8 +12,11 @@ function App() {
   const [b, setB] = useState("7");
   const [result, setResult] = useState("");
   const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [editingId, setEditingId] = useState<number | null>(null);
   const [saved, setSaved] = useState("");
   const [notes, setNotes] = useState<Note[]>([]);
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   async function add() {
     try {
@@ -66,6 +69,34 @@ function App() {
     loadNotes();
   }, []);
 
+  function startEdit(note: Note) {
+    setEditingId(note.id);
+    setTitle(note.title);
+    setBody(note.body);
+    setSaved(`editing note #${note.id}`);
+  }
+
+  function newNote() {
+    setEditingId(null);
+    setTitle("");
+    setBody("");
+    setSaved("");
+  }
+
+  function scheduleSave(id: number, nextTitle: string, nextBody: string) {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    setSaved("saving…");
+    saveTimer.current = setTimeout(async () => {
+      try {
+        await invoke("update_note", { id, title: nextTitle, body: nextBody });
+        setSaved(`saved note #${id}`);
+        await loadNotes();
+      } catch (e) {
+        setSaved(`Error: ${e}`);
+      }
+    }, 500);
+  }
+
   return (
     <main className="container">
       <h1>rustnote</h1>
@@ -94,15 +125,35 @@ function App() {
       <div className="row">
         <input
           value={title}
-          onChange={(e) => setTitle(e.currentTarget.value)}
+          onChange={(e) => {
+            const next = e.currentTarget.value;
+            setTitle(next);
+            if (editingId !== null) scheduleSave(editingId, next, body);
+          }}
           aria-label="note title"
         />
-        <button onClick={saveNote}>Save note</button>
+        {editingId === null ? (
+          <button onClick={saveNote}>Save note</button>
+        ) : (
+          <button onClick={newNote}>New note</button>
+        )}
       </div>
+      <textarea
+        value={body}
+        rows={6}
+        cols={40}
+        disabled={editingId === null}
+        onChange={(e) => {
+          const next = e.currentTarget.value;
+          setBody(next);
+          if (editingId !== null) scheduleSave(editingId, title, next);
+        }}
+        aria-label="note body"
+      />
       <p>{saved}</p>
       <ul>
         {notes.map((note) => (
-          <li key={note.id}>
+          <li key={note.id} onClick={() => startEdit(note)}>
             {note.title}{" "}
             <small>{new Date(note.created_at * 1000).toLocaleDateString()}</small>
           </li>
