@@ -2,7 +2,10 @@ use std::sync::Mutex;
 
 use rusqlite::Connection;
 use serde::Serialize;
-use tauri::{Manager, State};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 #[derive(Serialize)]
 pub struct Stats {
@@ -186,18 +189,130 @@ async fn search_notes(
     Ok(hits)
 }
 
+fn show_main(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn open_new_note(app: &AppHandle) {
+    show_main(app);
+    let _ = app.emit("new-note", ());
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             let dir = app.path().app_data_dir().expect("no app data directory");
             std::fs::create_dir_all(&dir).expect("cannot create the app data directory");
             let conn = Connection::open(dir.join("rustnote.db")).expect("cannot open rustnote.db");
             run_migrations(&conn).expect("migrations failed");
             app.manage(Mutex::new(conn));
+
+            let app_menu = Submenu::with_items(
+                app,
+                "rustnote",
+                true,
+                &[
+                    &PredefinedMenuItem::about(app, None, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::hide(app, None)?,
+                    &PredefinedMenuItem::hide_others(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::quit(app, None)?,
+                ],
+            )?;
+            let new_note_item =
+                MenuItem::with_id(app, "new-note", "New Note", true, Some("CmdOrCtrl+N"))?;
+            let file_menu = Submenu::with_items(
+                app,
+                "File",
+                true,
+                &[
+                    &new_note_item,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::close_window(app, None)?,
+                ],
+            )?;
+            let edit_menu = Submenu::with_items(
+                app,
+                "Edit",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(app, None)?,
+                    &PredefinedMenuItem::redo(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::cut(app, None)?,
+                    &PredefinedMenuItem::copy(app, None)?,
+                    &PredefinedMenuItem::paste(app, None)?,
+                    &PredefinedMenuItem::select_all(app, None)?,
+                ],
+            )?;
+            let menu = Menu::with_items(app, &[&app_menu, &file_menu, &edit_menu])?;
+            app.set_menu(menu)?;
+
+            app.on_menu_event(|app, event| match event.id().as_ref() {
+                "new-note" => open_new_note(app),
+                "open" => show_main(app),
+                "quit" => app.exit(0),
+                _ => {}
+            });
+
+            let open_item =
+                MenuItem::with_id(app, "open", "Open rustnote", true, None::<&str>)?;
+            let tray_new_item =
+                MenuItem::with_id(app, "new-note", "New Note", true, None::<&str>)?;
+            let quit_item =
+                MenuItem::with_id(app, "quit", "Quit rustnote", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(
+                app,
+                &[
+                    &open_item,
+                    &tray_new_item,
+                    &PredefinedMenuItem::separator(app)?,
+                    &quit_item,
+                ],
+            )?;
+            TrayIconBuilder::with_id("main-tray")
+                .icon(
+                    app.default_window_icon()
+                        .expect("no default window icon")
+                        .clone(),
+                )
+                .tooltip("rustnote")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+
+            app.global_shortcut()
+                .on_shortcut("CmdOrCtrl+Shift+N", |app, _shortcut, event| {
+                    if event.state == ShortcutState::Pressed {
+                        open_new_note(app);
+                    }
+                })?;
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readTextFile } from "@tauri-apps/plugin-fs";
@@ -168,6 +169,13 @@ function App() {
         }
       }
     });
+    return () => {
+      unlisten.then((stop) => stop());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen("new-note", () => newNote());
     return () => {
       unlisten.then((stop) => stop());
     };
