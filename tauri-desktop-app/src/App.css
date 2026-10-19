@@ -92,6 +92,12 @@ li {
   cursor: pointer;
 }
 
+mark {
+  background-color: #ffe58f;
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
 button {
   cursor: pointer;
 }

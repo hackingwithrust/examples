@@ -53,11 +53,29 @@ CREATE TABLE notes (
     created_at INTEGER NOT NULL
 );";
 
+const MIGRATION_2: &str = "
+CREATE VIRTUAL TABLE notes_fts USING fts5(title, body);
+INSERT INTO notes_fts(rowid, title, body) SELECT id, title, body FROM notes;
+CREATE TRIGGER notes_ai AFTER INSERT ON notes BEGIN
+    INSERT INTO notes_fts(rowid, title, body) VALUES (new.id, new.title, new.body);
+END;
+CREATE TRIGGER notes_ad AFTER DELETE ON notes BEGIN
+    DELETE FROM notes_fts WHERE rowid = old.id;
+END;
+CREATE TRIGGER notes_au AFTER UPDATE ON notes BEGIN
+    DELETE FROM notes_fts WHERE rowid = old.id;
+    INSERT INTO notes_fts(rowid, title, body) VALUES (new.id, new.title, new.body);
+END;";
+
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < 1 {
         conn.execute_batch(MIGRATION_1)?;
         conn.pragma_update(None, "user_version", 1)?;
+    }
+    if version < 2 {
+        conn.execute_batch(MIGRATION_2)?;
+        conn.pragma_update(None, "user_version", 2)?;
     }
     Ok(())
 }
@@ -118,6 +136,56 @@ async fn update_note(
     Ok(())
 }
 
+#[derive(Serialize)]
+pub struct SearchHit {
+    id: i64,
+    title: String,
+    snippet: String,
+}
+
+fn quote_tokens(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[tauri::command]
+async fn search_notes(
+    state: State<'_, Mutex<Connection>>,
+    query: String,
+) -> Result<Vec<SearchHit>, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let match_query = quote_tokens(trimmed);
+    let conn = state.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT notes.id,
+                    highlight(notes_fts, 0, '«', '»') AS title,
+                    snippet(notes_fts, 1, '«', '»', '…', 12) AS snippet
+             FROM notes_fts JOIN notes ON notes.id = notes_fts.rowid
+             WHERE notes_fts MATCH ?1
+             ORDER BY rank",
+        )
+        .map_err(|e| e.to_string())?;
+    let hits = stmt
+        .query_map([&match_query], |row| {
+            Ok(SearchHit {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                snippet: row.get(2)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<SearchHit>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(hits)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -131,7 +199,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            add, divide, stats, create_note, list_notes, update_note
+            add, divide, stats, create_note, list_notes, update_note, search_notes
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

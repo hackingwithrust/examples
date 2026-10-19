@@ -4,8 +4,24 @@ import "./App.css";
 
 type Stats = { count: number; total: number; mean: number };
 type Note = { id: number; title: string; body: string; created_at: number };
+type SearchHit = { id: number; title: string; snippet: string };
 
 const SAMPLE = [3, 1, 4, 1, 5, 9, 2, 6];
+
+function Highlighted({ text }: { text: string }) {
+  const parts = text.split(/(«[^»]*»)/g);
+  return (
+    <>
+      {parts.map((part, i) =>
+        part.startsWith("«") ? (
+          <mark key={i}>{part.slice(1, -1)}</mark>
+        ) : (
+          <span key={i}>{part}</span>
+        )
+      )}
+    </>
+  );
+}
 
 function App() {
   const [a, setA] = useState("42");
@@ -16,6 +32,8 @@ function App() {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [saved, setSaved] = useState("");
   const [notes, setNotes] = useState<Note[]>([]);
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<SearchHit[] | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   async function add() {
@@ -68,6 +86,18 @@ function App() {
   useEffect(() => {
     loadNotes();
   }, []);
+
+  async function search() {
+    try {
+      if (query.trim() === "") {
+        setHits(null);
+        return;
+      }
+      setHits(await invoke<SearchHit[]>("search_notes", { query }));
+    } catch (e) {
+      setSaved(`Error: ${e}`);
+    }
+  }
 
   function startEdit(note: Note) {
     setEditingId(note.id);
@@ -151,6 +181,51 @@ function App() {
         aria-label="note body"
       />
       <p>{saved}</p>
+      <form
+        className="row"
+        onSubmit={(e) => {
+          e.preventDefault();
+          search();
+        }}
+      >
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.currentTarget.value)}
+          aria-label="search notes"
+        />
+        <button type="submit">Search</button>
+        {hits !== null && (
+          <button
+            type="button"
+            onClick={() => {
+              setHits(null);
+              setQuery("");
+            }}
+          >
+            Clear
+          </button>
+        )}
+      </form>
+      {hits !== null && (
+        <ul className="hits">
+          {hits.map((hit) => (
+            <li
+              key={hit.id}
+              onClick={() => {
+                const note = notes.find((n) => n.id === hit.id);
+                if (note) startEdit(note);
+              }}
+            >
+              <Highlighted text={hit.title} />
+              <br />
+              <small>
+                <Highlighted text={hit.snippet} />
+              </small>
+            </li>
+          ))}
+          {hits.length === 0 && <li>no matches</li>}
+        </ul>
+      )}
       <ul>
         {notes.map((note) => (
           <li key={note.id} onClick={() => startEdit(note)}>
