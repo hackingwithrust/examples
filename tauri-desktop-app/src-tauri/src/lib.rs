@@ -1,4 +1,8 @@
+use std::sync::Mutex;
+
+use rusqlite::Connection;
 use serde::Serialize;
+use tauri::{Manager, State};
 
 #[derive(Serialize)]
 pub struct Stats {
@@ -33,11 +37,51 @@ fn stats(numbers: Vec<i32>) -> Stats {
     Stats { count, total, mean }
 }
 
+const MIGRATION_1: &str = "
+CREATE TABLE notes (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);";
+
+fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 1 {
+        conn.execute_batch(MIGRATION_1)?;
+        conn.pragma_update(None, "user_version", 1)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn create_note(state: State<'_, Mutex<Connection>>, title: String) -> Result<i64, String> {
+    let conn = state.lock().map_err(|e| e.to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT INTO notes (title, body, created_at) VALUES (?1, '', ?2)",
+        rusqlite::params![title, now],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(conn.last_insert_rowid())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![add, divide, stats])
+        .setup(|app| {
+            let dir = app.path().app_data_dir().expect("no app data directory");
+            std::fs::create_dir_all(&dir).expect("cannot create the app data directory");
+            let conn = Connection::open(dir.join("rustnote.db")).expect("cannot open rustnote.db");
+            run_migrations(&conn).expect("migrations failed");
+            app.manage(Mutex::new(conn));
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![add, divide, stats, create_note])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

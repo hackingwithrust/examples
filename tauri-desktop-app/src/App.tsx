@@ -10,6 +10,8 @@ function App() {
   const [a, setA] = useState("42");
   const [b, setB] = useState("7");
   const [result, setResult] = useState("");
+  const [title, setTitle] = useState("");
+  const [saved, setSaved] = useState("");
 
   async function add() {
     try {
@@ -40,6 +42,15 @@ function App() {
     setResult(`${s.count} numbers, total ${s.total}, mean ${s.mean.toFixed(3)}`);
   }
 
+  async function saveNote() {
+    try {
+      const id = await invoke<number>("create_note", { title });
+      setSaved(`saved note #${id}`);
+    } catch (e) {
+      setSaved(`Error: ${e}`);
+    }
+  }
+
   return (
     <main className="container">
       <h1>rustnote</h1>
@@ -65,6 +76,15 @@ function App() {
         <button onClick={summarise}>Summarise the sample</button>
       </div>
       <p>{result}</p>
+      <div className="row">
+        <input
+          value={title}
+          onChange={(e) => setTitle(e.currentTarget.value)}
+          aria-label="note title"
+        />
+        <button onClick={saveNote}>Save note</button>
+      </div>
+      <p>{saved}</p>
     </main>
   );
 }
