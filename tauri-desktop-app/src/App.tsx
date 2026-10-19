@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open } from "@tauri-apps/plugin-dialog";
+import { readTextFile } from "@tauri-apps/plugin-fs";
 import "./App.css";
 
 type Stats = { count: number; total: number; mean: number };
@@ -127,6 +130,49 @@ function App() {
     }, 500);
   }
 
+  async function importNote(path: string) {
+    try {
+      const content = await readTextFile(path);
+      const lines = content.split("\n");
+      const heading = lines.findIndex((line) => line.startsWith("# "));
+      const name = path.split(/[\\/]/).pop() ?? path;
+      const title =
+        heading >= 0 ? lines[heading].slice(2).trim() : name.replace(/\.md$/, "");
+      const body = heading >= 0 ? lines.slice(heading + 1).join("\n").trimStart() : content;
+      const id = await invoke<number>("create_note", { title });
+      await invoke("update_note", { id, title, body });
+      await loadNotes();
+      setSaved(`imported ${name} as note #${id}`);
+    } catch (e) {
+      setSaved(`Error: ${e}`);
+    }
+  }
+
+  async function importFile() {
+    try {
+      const path = await open({
+        filters: [{ name: "Markdown", extensions: ["md"] }],
+      });
+      if (path === null) return;
+      await importNote(path);
+    } catch (e) {
+      setSaved(`Error: ${e}`);
+    }
+  }
+
+  useEffect(() => {
+    const unlisten = getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === "drop") {
+        for (const path of event.payload.paths) {
+          if (path.toLowerCase().endsWith(".md")) importNote(path);
+        }
+      }
+    });
+    return () => {
+      unlisten.then((stop) => stop());
+    };
+  }, []);
+
   return (
     <main className="container">
       <h1>rustnote</h1>
@@ -226,6 +272,10 @@ function App() {
           {hits.length === 0 && <li>no matches</li>}
         </ul>
       )}
+      <div className="row">
+        <button onClick={importFile}>Import .md</button>
+        <span>or drag a .md file into the window</span>
+      </div>
       <ul>
         {notes.map((note) => (
           <li key={note.id} onClick={() => startEdit(note)}>
