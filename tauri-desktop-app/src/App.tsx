@@ -1,49 +1,70 @@
 import { useState } from "react";
-import reactLogo from "./assets/react.svg";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+type Stats = { count: number; total: number; mean: number };
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
+const SAMPLE = [3, 1, 4, 1, 5, 9, 2, 6];
+
+function App() {
+  const [a, setA] = useState("42");
+  const [b, setB] = useState("7");
+  const [result, setResult] = useState("");
+
+  async function add() {
+    try {
+      const value = await invoke<number>("add", {
+        firstNumber: Number(a),
+        secondNumber: Number(b),
+      });
+      setResult(String(value));
+    } catch (e) {
+      setResult(`Error: ${e}`);
+    }
+  }
+
+  async function divide() {
+    try {
+      const value = await invoke<number>("divide", {
+        dividend: Number(a),
+        divisor: Number(b),
+      });
+      setResult(String(value));
+    } catch (e) {
+      setResult(`Error: ${e}`);
+    }
+  }
+
+  async function summarise() {
+    const s = await invoke<Stats>("stats", { numbers: SAMPLE });
+    setResult(`${s.count} numbers, total ${s.total}, mean ${s.mean.toFixed(3)}`);
   }
 
   return (
     <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
+      <h1>rustnote</h1>
+      <p>
+        Three commands, registered in <code>generate_handler!</code> and called
+        with <code>invoke()</code>.
+      </p>
       <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
         <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
+          value={a}
+          onChange={(e) => setA(e.currentTarget.value)}
+          aria-label="first number"
         />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
+        <input
+          value={b}
+          onChange={(e) => setB(e.currentTarget.value)}
+          aria-label="second number"
+        />
+      </div>
+      <div className="row">
+        <button onClick={add}>Add</button>
+        <button onClick={divide}>Divide</button>
+        <button onClick={summarise}>Summarise the sample</button>
+      </div>
+      <p>{result}</p>
     </main>
   );
 }
