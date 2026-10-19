@@ -37,6 +37,14 @@ fn stats(numbers: Vec<i32>) -> Stats {
     Stats { count, total, mean }
 }
 
+#[derive(Serialize)]
+pub struct Note {
+    id: i64,
+    title: String,
+    body: String,
+    created_at: i64,
+}
+
 const MIGRATION_1: &str = "
 CREATE TABLE notes (
     id INTEGER PRIMARY KEY,
@@ -69,6 +77,27 @@ async fn create_note(state: State<'_, Mutex<Connection>>, title: String) -> Resu
     Ok(conn.last_insert_rowid())
 }
 
+#[tauri::command]
+async fn list_notes(state: State<'_, Mutex<Connection>>) -> Result<Vec<Note>, String> {
+    let conn = state.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT id, title, body, created_at FROM notes ORDER BY id DESC")
+        .map_err(|e| e.to_string())?;
+    let notes = stmt
+        .query_map([], |row| {
+            Ok(Note {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                body: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<Note>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(notes)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -81,7 +110,7 @@ pub fn run() {
             app.manage(Mutex::new(conn));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![add, divide, stats, create_note])
+        .invoke_handler(tauri::generate_handler![add, divide, stats, create_note, list_notes])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
 type Stats = { count: number; total: number; mean: number };
+type Note = { id: number; title: string; body: string; created_at: number };
 
 const SAMPLE = [3, 1, 4, 1, 5, 9, 2, 6];
 
@@ -12,6 +13,7 @@ function App() {
   const [result, setResult] = useState("");
   const [title, setTitle] = useState("");
   const [saved, setSaved] = useState("");
+  const [notes, setNotes] = useState<Note[]>([]);
 
   async function add() {
     try {
@@ -46,17 +48,30 @@ function App() {
     try {
       const id = await invoke<number>("create_note", { title });
       setSaved(`saved note #${id}`);
+      await loadNotes();
     } catch (e) {
       setSaved(`Error: ${e}`);
     }
   }
 
+  async function loadNotes() {
+    try {
+      setNotes(await invoke<Note[]>("list_notes"));
+    } catch (e) {
+      setSaved(`Error: ${e}`);
+    }
+  }
+
+  useEffect(() => {
+    loadNotes();
+  }, []);
+
   return (
     <main className="container">
       <h1>rustnote</h1>
       <p>
-        Three commands, registered in <code>generate_handler!</code> and called
-        with <code>invoke()</code>.
+        Commands registered in <code>generate_handler!</code> and called with{" "}
+        <code>invoke()</code>.
       </p>
       <div className="row">
         <input
@@ -85,6 +100,14 @@ function App() {
         <button onClick={saveNote}>Save note</button>
       </div>
       <p>{saved}</p>
+      <ul>
+        {notes.map((note) => (
+          <li key={note.id}>
+            {note.title}{" "}
+            <small>{new Date(note.created_at * 1000).toLocaleDateString()}</small>
+          </li>
+        ))}
+      </ul>
     </main>
   );
 }
