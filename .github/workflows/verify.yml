@@ -40,8 +40,6 @@ jobs:
           - track: cli-tool
           - track: toy-database
           - track: react-wasm
-          - track: axum-sqlx-api
-            sqlx-offline: true
           - track: tauri-desktop-app/src-tauri
             gtk: true
     name: ${{ matrix.track }}
@@ -75,16 +73,58 @@ jobs:
           key: cargo-${{ runner.os }}-${{ matrix.track }}
 
       - name: Build
-        env:
-          SQLX_OFFLINE: ${{ matrix.sqlx-offline && 'true' || '' }}
         run: cargo build --locked --quiet
         working-directory: ${{ matrix.track }}
 
       - name: Test
-        env:
-          SQLX_OFFLINE: ${{ matrix.sqlx-offline && 'true' || '' }}
         run: cargo test --locked --quiet
         working-directory: ${{ matrix.track }}
+
+  # shortlink gets its own job because its tests need it: #[sqlx::test]
+  # creates a per-test database on the Postgres server DATABASE_URL points
+  # at, so the job runs a Postgres service next to the build. SQLX_OFFLINE
+  # covers the compile-time query! macros via the committed .sqlx cache.
+  shortlink:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.99.0
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --no-self-update
+          rustc 1.99.0 --version
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-axum-sqlx-api
+
+      - name: Build
+        env:
+          SQLX_OFFLINE: 'true'
+        run: cargo build --locked --quiet
+        working-directory: axum-sqlx-api
+
+      - name: Test
+        run: cargo test --locked --quiet
+        working-directory: axum-sqlx-api
 
   tag:
     if: startsWith(github.ref, 'refs/tags/')
