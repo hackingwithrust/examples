@@ -6,6 +6,38 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use pulldown_cmark::{html, Options, Parser};
+
+fn render_markdown(source: &str) -> String {
+    let mut html = String::new();
+    html::push_html(&mut html, Parser::new_ext(source, Options::all()));
+    html
+}
+
+#[derive(Serialize)]
+pub struct ExportedNote {
+    title: String,
+    html: String,
+}
+
+#[tauri::command]
+async fn export_note(
+    state: State<'_, Mutex<Connection>>,
+    id: i64,
+) -> Result<ExportedNote, String> {
+    let conn = state.lock().map_err(|e| e.to_string())?;
+    let (title, body): (String, String) = conn
+        .query_row(
+            "SELECT title, body FROM notes WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| format!("no note #{id}"))?;
+    Ok(ExportedNote {
+        title,
+        html: render_markdown(&body),
+    })
+}
 
 #[derive(Serialize)]
 pub struct Stats {
@@ -201,6 +233,14 @@ fn open_new_note(app: &AppHandle) {
     let _ = app.emit("new-note", ());
 }
 
+#[tauri::command]
+fn print_main(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "no main window".to_string())?;
+    window.print().map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -316,7 +356,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            add, divide, stats, create_note, list_notes, update_note, search_notes
+            add, divide, stats, create_note, list_notes, update_note, search_notes, export_note,
+            print_main
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

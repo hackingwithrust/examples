@@ -139,3 +139,17 @@ button {
     background-color: #0f0f0f69;
   }
 }
+
+.print-root {
+  display: none;
+}
+
+@media print {
+  .container > *:not(.print-root) {
+    display: none;
+  }
+
+  .print-root {
+    display: block;
+  }
+}

@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { open } from "@tauri-apps/plugin-dialog";
-import { readTextFile } from "@tauri-apps/plugin-fs";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import "./App.css";
 
 type Stats = { count: number; total: number; mean: number };
@@ -38,6 +38,7 @@ function App() {
   const [notes, setNotes] = useState<Note[]>([]);
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<SearchHit[] | null>(null);
+  const [printHtml, setPrintHtml] = useState("");
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   async function add() {
@@ -161,6 +162,42 @@ function App() {
     }
   }
 
+  async function exportHtml() {
+    if (editingId === null) {
+      setSaved("open a note first");
+      return;
+    }
+    try {
+      const note = await invoke<{ title: string; html: string }>("export_note", {
+        id: editingId,
+      });
+      const path = await save({ defaultPath: `${note.title}.html` });
+      if (path === null) return;
+      await writeTextFile(
+        path,
+        `<!doctype html>\n<meta charset="utf-8">\n<title>${note.title}</title>\n<h1>${note.title}</h1>\n${note.html}\n`
+      );
+      setSaved(`exported ${path}`);
+    } catch (e) {
+      setSaved(`Error: ${e}`);
+    }
+  }
+
+  function printNote() {
+    if (editingId === null) {
+      setSaved("open a note first");
+      return;
+    }
+    invoke<{ title: string; html: string }>("export_note", { id: editingId })
+      .then((note) => setPrintHtml(note.html))
+      .catch((e) => setSaved(`Error: ${e}`));
+  }
+
+  useEffect(() => {
+    if (printHtml === "") return;
+    invoke("print_main").catch((e) => setSaved(`Error: ${e}`));
+  }, [printHtml]);
+
   useEffect(() => {
     const unlisten = getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === "drop") {
@@ -282,6 +319,8 @@ function App() {
       )}
       <div className="row">
         <button onClick={importFile}>Import .md</button>
+        {editingId !== null && <button onClick={exportHtml}>Export HTML</button>}
+        {editingId !== null && <button onClick={printNote}>Print</button>}
         <span>or drag a .md file into the window</span>
       </div>
       <ul>
@@ -292,6 +331,7 @@ function App() {
           </li>
         ))}
       </ul>
+      <div className="print-root" dangerouslySetInnerHTML={{ __html: printHtml }} />
     </main>
   );
 }
