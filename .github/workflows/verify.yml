@@ -100,6 +100,10 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # Compile-time macros must not consult the live server — it has no
+      # tables until a #[sqlx::test] applies the migrations to its own
+      # per-test database. The committed .sqlx cache serves them instead.
+      SQLX_OFFLINE: 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -117,8 +121,6 @@ jobs:
           key: cargo-${{ runner.os }}-axum-sqlx-api
 
       - name: Build
-        env:
-          SQLX_OFFLINE: 'true'
         run: cargo build --locked --quiet
         working-directory: axum-sqlx-api
 
