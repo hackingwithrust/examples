@@ -1,0 +1,143 @@
+# The reader clones this repository and runs what is here. That only holds if
+# what is here builds — per track, and at every chapter tag a reader might
+# check out. This workflow makes both machine-enforced.
+#
+# Two jobs:
+#
+#   tracks — on every push to main, build and test each track at its tip.
+#   tag    — on every `*-ch*` tag push, build and test the project exactly as
+#            it stands at that tag, which is the state a reader following the
+#            corresponding article lands on.
+#
+# A tag prefix maps to a track directory in the `tag` job's case block. When a
+# new track ships its first chapter tag, that mapping needs one new line.
+#
+# The tauri track needs the Linux system libraries its dependency graph links
+# against (GTK/webkit); nothing else here does.
+
+name: Verify
+
+on:
+  push:
+    branches: [main]
+    tags: ['*-ch*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  tracks:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - track: cli-tool
+          - track: toy-database
+          - track: react-wasm
+          - track: axum-sqlx-api
+            sqlx-offline: true
+          - track: tauri-desktop-app/src-tauri
+            gtk: true
+    name: ${{ matrix.track }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+
+      - name: Install the system libraries the Tauri graph links against
+        if: matrix.gtk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+
+      - name: Install Rust 1.99.0
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --no-self-update
+          rustc 1.99.0 --version
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ matrix.track }}
+
+      - name: Build
+        env:
+          SQLX_OFFLINE: ${{ matrix.sqlx-offline && 'true' || '' }}
+        run: cargo build --locked --quiet
+        working-directory: ${{ matrix.track }}
+
+      - name: Test
+        env:
+          SQLX_OFFLINE: ${{ matrix.sqlx-offline && 'true' || '' }}
+        run: cargo test --locked --quiet
+        working-directory: ${{ matrix.track }}
+
+  tag:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Map the tag to its track
+        run: |
+          case "$GITHUB_REF_NAME" in
+            cli-*)    dir=cli-tool ;;
+            api-*)    dir=axum-sqlx-api ;;
+            lsm-*)    dir=toy-database ;;
+            wasm-*)   dir=react-wasm ;;
+            tauri-*)  dir=tauri-desktop-app/src-tauri ;;
+            *) echo "::error::no track mapping for tag $GITHUB_REF_NAME — add one to .github/workflows/verify.yml"; exit 1 ;;
+          esac
+          echo "DIR=$dir" >> "$GITHUB_ENV"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+
+      - name: Install the system libraries the Tauri graph links against
+        if: startsWith(env.DIR, 'tauri-desktop-app')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+
+      - name: Install Rust 1.99.0
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --no-self-update
+          rustc 1.99.0 --version
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-tag
+
+      - name: Build
+        env:
+          SQLX_OFFLINE: ${{ startsWith(env.DIR, 'axum-sqlx-api') && 'true' || '' }}
+        run: cargo build --locked --quiet
+        working-directory: ${{ env.DIR }}
+
+      - name: Test
+        env:
+          SQLX_OFFLINE: ${{ startsWith(env.DIR, 'axum-sqlx-api') && 'true' || '' }}
+        run: cargo test --locked --quiet
+        working-directory: ${{ env.DIR }}
