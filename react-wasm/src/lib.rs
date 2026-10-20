@@ -1,5 +1,7 @@
+use std::hint::black_box;
 use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
+use web_time::Instant;
 
 // Numbers cross the boundary as plain JavaScript numbers.
 #[wasm_bindgen]
@@ -112,4 +114,20 @@ pub fn search(query: &str, limit: usize) -> Vec<u32> {
         out.push(score as u32);
     }
     out
+}
+
+// The scan timed from inside the module: the query crosses once, then the
+// same call a keystroke makes repeats iters times with one Instant around
+// the loop. Total milliseconds back; no boundary crossing inside the timed
+// region, so this measures the scan, not the road to it.
+#[wasm_bindgen]
+pub fn bench_search(query: &str, iters: u32) -> f64 {
+    let start = Instant::now();
+    let mut sink = 0u32;
+    for _ in 0..iters {
+        let hits = search(query, 20);
+        sink = sink.wrapping_add(hits.first().copied().unwrap_or(0));
+    }
+    black_box(sink); // keep the optimizer from deleting the loop
+    start.elapsed().as_secs_f64() * 1000.0
 }

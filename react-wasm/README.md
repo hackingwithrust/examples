@@ -2,7 +2,7 @@
 
 Track: <https://hackingwithrust.com/projects/react-wasm/>
 
-**Status: step 5 of 8 published.**
+**Status: step 6 of 8 published.**
 
 Tags: `wasm-ch02` … `wasm-ch08`.
 
