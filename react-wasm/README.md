@@ -2,9 +2,9 @@
 
 Track: <https://hackingwithrust.com/projects/react-wasm/>
 
-**Status: not started.** The first commit lands with article 2, *Setting up wasm-bindgen and wasm-pack*.
+**Status: step 2 of 8 published.**
 
-Tags: `wasm-ch01` … `wasm-ch08`.
+Tags: `wasm-ch02` … `wasm-ch08`.
 
 Needs the wasm target and wasm-pack:
 
