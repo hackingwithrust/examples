@@ -2,11 +2,14 @@
 
 Track: <https://hackingwithrust.com/projects/embedded-stm32/>
 
-**Status: article 5 of 10.** The firmware reads PC13 — the board's user button, B1 —
-and toggles PA5, the user LED LD2, on each accepted press. A press counts once the
-line has held its new level for ten 1 ms ticks, so contact bounce does not register.
-It carries its own panic handler: a panic lights LD2 and leaves it lit. The next step
-dims the LED with a timer.
+**Status: article 7 of 10.** The firmware reads PC13 — the board's user button, B1 — and
+toggles a breathing pattern on PA5, the user LED LD2: the duty ramps up and down, and each
+accepted press pauses or resumes the breath. A press counts once the line has held its new
+level for ten 1 ms ticks, so contact bounce does not register. It also reads a BMP280 sensor
+over I2C1 (PB8/PB9) every half second and lets the temperature set how fast the breath runs.
+It carries its own panic handler: a panic lights LD2 and leaves it lit — the same look a
+sensor that does not answer gets at start-up. The next step gives readings a channel to be
+printed on.
 
 Tags: `stm32-ch02` … `stm32-ch10`.
 

@@ -24,6 +24,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46afbd2983a5d5a7bd740ccb198caf5b82f45c40c09c0eed36052d91cb92e719"
 
 [[package]]
+name = "bmpe280"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dacbd9fe0afa7868a65dd08c8c8429c07276f43aa1ce6395a5b5b9cd2f943e5e"
+dependencies = [
+ "embedded-hal 1.0.0",
+]
+
+[[package]]
 name = "cortex-m"
 version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -161,6 +170,7 @@ dependencies = [
 name = "firmware"
 version = "0.1.0"
 dependencies = [
+ "bmpe280",
  "cortex-m",
  "cortex-m-rt",
  "embedded-hal 1.0.0",

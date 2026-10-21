@@ -5,6 +5,7 @@ edition = "2024"
 repository = "https://github.com/hackingwithrust/examples"
 
 [dependencies]
+bmpe280 = "1.0.5"
 cortex-m = "0.7.9"
 cortex-m-rt = "0.7"
 embedded-hal = "1.0.0"
