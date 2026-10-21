@@ -4,7 +4,8 @@
 use cortex_m::delay::Delay;
 use cortex_m_rt::entry;
 use embedded_hal::delay::DelayNs;
-use embedded_hal::digital::{InputPin, OutputPin};
+use embedded_hal::digital::InputPin;
+use embedded_hal::pwm::SetDutyCycle;
 use stm32f4xx_hal::pac;
 use stm32f4xx_hal::prelude::*;
 use stm32f4xx_hal::rcc::Config;
@@ -19,24 +20,30 @@ fn main() -> ! {
     let mut rcc = dp.RCC.constrain().freeze(Config::default());
     let clocks = rcc.clocks;
 
-    // Splitting a port hands out its pins one at a time; the `&mut rcc`
-    // is what turns the port's clock on. The button sits on port C, so
-    // that port is split alongside the one the LED is on.
     let gpioa = dp.GPIOA.split(&mut rcc);
     let gpioc = dp.GPIOC.split(&mut rcc);
-    let mut led = gpioa.pa5.into_push_pull_output();
 
-    // PC13 is the board's user button. The line idles high and the press
-    // pulls it low, so the pin reads low while the button is down. The
-    // internal pull-up reinforces the idle level, which also keeps the
-    // pin defined when nothing is wired to it.
+    // PC13 is the board's user button, wired as step 5 left it.
     let button_pin = gpioc.pc13.into_pull_up_input();
     let mut button = Button::new(button_pin);
+
+    // TIM2's channel 1 is muxed onto PA5, the pin LD2 is wired to. The
+    // pin changes jobs here: no longer an output the firmware writes
+    // outright, but a timer output the firmware only loads. One
+    // kilohertz makes a period of 1 ms — the same length as the loop's
+    // tick, so the duty is written once per period and never lands
+    // mid-period.
+    let (_, channels) = dp.TIM2.pwm_hz(1.kHz(), &mut rcc);
+    let mut led = channels.0.with(gpioa.pa5.into_alternate::<1>());
+    // The channel starts with its output disabled: the counter runs and
+    // the waveform is generated, but nothing reaches the pin until this
+    // call sets the channel's output-enable bit.
+    led.enable();
 
     // The delay counts SysTick ticks against the AHB frequency.
     let mut delay = Delay::new(cp.SYST, clocks.hclk().to_Hz());
 
-    react(&mut led, &mut button, &mut delay)
+    breathe(&mut led, &mut button, &mut delay)
 }
 
 /// A button that reports one event per accepted press.
@@ -99,48 +106,108 @@ impl<I: InputPin> Button<I> {
     }
 }
 
-/// The loop, written against the traits instead of the chip's pin and
-/// timer types, as step 3's `blink` was: `P` drives the LED, `I` reads the
+/// The breathing curve, kept free of chip types so the same struct runs
+/// against a mock PWM channel on a host (that is how it was tested) and
+/// against TIM2's channel 1 on the board.
+struct Breath {
+    /// Ticks since the ramp started, 0..=2*half.
+    phase: u16,
+    /// Ticks in half a cycle: the ramp up, or the ramp down. The duty
+    /// climbs from 0 to full and back inside 2*half ticks.
+    half: u16,
+    /// Whether the breath runs at all; the button flips this.
+    running: bool,
+}
+
+impl Breath {
+    fn new(half: u16) -> Self {
+        Breath {
+            phase: 0,
+            half,
+            running: true,
+        }
+    }
+
+    /// A press switches the breathing off or on, and either way the next
+    /// breath starts from dark.
+    fn toggle(&mut self) {
+        self.running = !self.running;
+        self.phase = 0;
+    }
+
+    /// The duty the LED should hold right now, in percent. The curve is
+    /// a triangle: straight up to full brightness, straight back down,
+    /// one tick wide at each turnaround.
+    fn duty(&self) -> u8 {
+        if !self.running {
+            return 0;
+        }
+        // Integer arithmetic only — no float in sight, and none needed
+        // for a straight line. The percent is the numerator over `half`.
+        let percent = if self.phase < self.half {
+            self.phase as u32 * 100
+        } else {
+            (2 * self.half as u32 - self.phase as u32) * 100
+        } / self.half as u32;
+        percent as u8
+    }
+
+    /// One tick of the loop. A paused breath does not advance.
+    fn advance(&mut self) {
+        if !self.running {
+            return;
+        }
+        self.phase += 1;
+        if self.phase > 2 * self.half {
+            self.phase = 0;
+        }
+    }
+}
+
+/// The loop, written against the traits instead of the chip's channel
+/// and pin types, as `react` was: `P` carries the duty, `I` reads the
 /// button, `D` counts the time.
 ///
-/// Each accepted press toggles LD2, and the poll runs on a 1 ms cadence
-/// so the debounce window is ten milliseconds of wall time.
-fn react<P: OutputPin, I: InputPin, D: DelayNs>(
+/// The LED is no longer switched, it is dimmed: one duty write per
+/// millisecond, and each accepted press pauses or resumes the breath.
+fn breathe<P: SetDutyCycle, I: InputPin, D: DelayNs>(
     led: &mut P,
     button: &mut Button<I>,
     delay: &mut D,
 ) -> ! {
-    let mut lit = false;
+    // Half a second up, half a second down: one breath takes a second.
+    let mut breath = Breath::new(500);
+
     loop {
         if button.tick() {
-            lit = !lit;
-            if lit {
-                led.set_high().unwrap();
-            } else {
-                led.set_low().unwrap();
-            }
+            breath.toggle();
         }
+        // One write per tick, running or paused. On this chip the error
+        // type is `Infallible`, so the unwrap cannot fire.
+        led.set_duty_cycle_percent(breath.duty()).unwrap();
         delay.delay_ms(1);
+        breath.advance();
     }
 }
 
 /// What runs when the firmware panics. Step 2 filled this slot with the
-/// `panic-halt` crate; this step writes the handler out instead.
+/// `panic-halt` crate; step 4 replaced that with the handler below.
 ///
-/// `react` owns the LED pin and a panic ends that loop for good, so there
-/// is no pin to reach for here. GPIOA sits at a fixed address for as long
-/// as the chip has power, and the pin is still configured as a push-pull
-/// output — mode bits survive. Setting bit 5 of the port's bit set/reset
-/// register lights LD2 and leaves it lit: a panic now freezes the board
-/// with the LED on instead of mid-blink, which tells the two apart.
+/// Step 6 gave PA5 to the timer, and a pin in alternate mode is driven
+/// by the peripheral: a BSRR write alone would no longer reach it. The
+/// mode bits are the handler's to rewrite, so the pin goes back to a
+/// plain output first and the LED is the BSRR's again — a panic still
+/// freezes the board with LD2 lit, which tells it apart from a breath
+/// that merely stopped.
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     // Safety: `ptr()` returns the register block's address without
-    // checking ownership. GPIOA exists at that address from reset onward,
-    // nothing else runs once a panic has fired, and BSRR is write-only:
-    // a set-bit write cannot race another reader or writer of the pin.
+    // checking ownership. GPIOA exists at that address from reset
+    // onward, and nothing else runs once a panic has fired.
     unsafe {
-        (*pac::GPIOA::ptr()).bsrr().write(|w| w.bs5().set_());
+        let gpioa = pac::GPIOA::ptr();
+        (*gpioa).moder().modify(|_, w| w.moder5().output());
+        (*gpioa).bsrr().write(|w| w.bs5().set_());
     }
     loop {}
 }
