@@ -2,9 +2,10 @@
 
 Track: <https://hackingwithrust.com/projects/embedded-stm32/>
 
-**Status: not started.** The first commit lands with article 2, *Setting up the toolchain*.
+**Status: article 2 of 10.** The toolchain is set up and the project builds for the chip;
+the next step blinks the LED.
 
-Tags: `stm32-ch01` … `stm32-ch10`.
+Tags: `stm32-ch02` … `stm32-ch10`.
 
 Needs the cross target and a flashing tool:
 
@@ -13,6 +14,15 @@ rustup target add thumbv7em-none-eabihf
 cargo install probe-rs-tools
 ```
 
-This crate does not build for the host. Use `cargo build --target thumbv7em-none-eabihf`.
+Build and flash (the board is a NUCLEO-F401RE, chip `STM32F401RE`):
+
+```sh
+cargo build                          # .cargo/config.toml pins the target
+cargo flash --chip STM32F401RE       # or plain `cargo run`, which flashes via the runner
+```
+
+This crate does not build for the host: `.cargo/config.toml` sets
+`target = "thumbv7em-none-eabihf"` for every cargo command, so `cargo build` cross-compiles
+without an explicit `--target`.
 
 See [`../README.md`](../README.md) for what the tags mean.
