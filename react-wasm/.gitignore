@@ -1,2 +1,4 @@
 /target
 /pkg
+app/node_modules
+app/dist
