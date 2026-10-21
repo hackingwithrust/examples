@@ -1,8 +1,6 @@
 #![no_std]
 #![no_main]
 
-use panic_halt as _;
-
 use cortex_m::delay::Delay;
 use cortex_m_rt::entry;
 use embedded_hal::delay::DelayNs;
@@ -42,4 +40,25 @@ fn blink<P: OutputPin, D: DelayNs>(led: &mut P, delay: &mut D) -> ! {
         led.set_low().unwrap();
         delay.delay_ms(500);
     }
+}
+
+/// What runs when the firmware panics. Step 2 filled this slot with the
+/// `panic-halt` crate; this step writes the handler out instead.
+///
+/// `blink` owns the LED pin and a panic ends that loop for good, so there
+/// is no pin to reach for here. GPIOA sits at a fixed address for as long
+/// as the chip has power, and the pin is still configured as a push-pull
+/// output — mode bits survive. Setting bit 5 of the port's bit set/reset
+/// register lights LD2 and leaves it lit: a panic now freezes the board
+/// with the LED on instead of mid-blink, which tells the two apart.
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    // Safety: `ptr()` returns the register block's address without
+    // checking ownership. GPIOA exists at that address from reset onward,
+    // nothing else runs once a panic has fired, and BSRR is write-only:
+    // a set-bit write cannot race another reader or writer of the pin.
+    unsafe {
+        (*pac::GPIOA::ptr()).bsrr().write(|w| w.bs5().set_());
+    }
+    loop {}
 }

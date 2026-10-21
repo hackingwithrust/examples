@@ -2,9 +2,9 @@
 
 Track: <https://hackingwithrust.com/projects/embedded-stm32/>
 
-**Status: article 3 of 10.** The firmware drives PA5 — the board's user LED, LD2 —
-high for 500 ms and low for 500 ms, in a loop. The next step looks at what `no_std`
-costs.
+**Status: article 4 of 10.** The firmware drives PA5 — the board's user LED, LD2 —
+high for 500 ms and low for 500 ms, in a loop, and carries its own panic handler:
+a panic lights LD2 and leaves it lit. The next step reads a button.
 
 Tags: `stm32-ch02` … `stm32-ch10`.
 

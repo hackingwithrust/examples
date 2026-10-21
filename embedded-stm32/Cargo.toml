@@ -8,5 +8,4 @@ repository = "https://github.com/hackingwithrust/examples"
 cortex-m = "0.7.9"
 cortex-m-rt = "0.7"
 embedded-hal = "1.0.0"
-panic-halt = "1.0"
 stm32f4xx-hal = { version = "0.23.0", features = ["stm32f401"] }
