@@ -2,8 +2,9 @@
 
 Track: <https://hackingwithrust.com/projects/embedded-stm32/>
 
-**Status: article 2 of 10.** The toolchain is set up and the project builds for the chip;
-the next step blinks the LED.
+**Status: article 3 of 10.** The firmware drives PA5 — the board's user LED, LD2 —
+high for 500 ms and low for 500 ms, in a loop. The next step looks at what `no_std`
+costs.
 
 Tags: `stm32-ch02` … `stm32-ch10`.
 
