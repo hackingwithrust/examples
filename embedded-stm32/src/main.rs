@@ -2,8 +2,11 @@
 #![no_main]
 
 use bmpe280::BMP280;
+use core::fmt::Write as _;
+use core::sync::atomic::{AtomicU32, Ordering};
 use cortex_m::delay::Delay;
 use cortex_m_rt::entry;
+use defmt_rtt as _;
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::InputPin;
 use embedded_hal::i2c::I2c;
@@ -11,6 +14,7 @@ use embedded_hal::pwm::SetDutyCycle;
 use stm32f4xx_hal::pac;
 use stm32f4xx_hal::prelude::*;
 use stm32f4xx_hal::rcc::Config;
+use stm32f4xx_hal::serial::{Config as SerialConfig, Serial};
 
 /// The BMP280's chip ID, read from register 0xD0 at start-up. A chip
 /// that answers with anything else was not configured by the driver.
@@ -38,6 +42,14 @@ const MAX_HALF: u16 = 500;
 
 /// Ticks shaved off the half-period per degree Celsius.
 const TEMP_STEP: f64 = 10.0;
+
+/// Loop ticks since start-up, one per millisecond. This is the
+/// timestamp every defmt record carries: the firmware has no clock
+/// peripheral wired up yet, and the loop's own pace is the clock
+/// there is.
+static TICKS: AtomicU32 = AtomicU32::new(0);
+
+defmt::timestamp!("{=u32}", TICKS.load(Ordering::Relaxed));
 
 #[entry]
 fn main() -> ! {
@@ -85,10 +97,31 @@ fn main() -> ! {
         stall_lit();
     }
 
+    // USART2's TX and RX are muxed onto PA2 and PA3, which the Nucleo
+    // wires to the ST-Link's virtual COM port: the firmware's plain
+    // text output shows up on the host as a serial device, with no
+    // hardware beyond the board's own USB cable. The pins are handed
+    // over plain, as the bus's were, and the constructor moves them
+    // into alternate mode itself. `SerialConfig::default()` is 115200
+    // baud, eight data bits, no parity, one stop bit.
+    //
+    // The `Result` is real — a baud rate the bus clock cannot produce
+    // is an error — but 16 MHz divided down to 115200 is comfortably
+    // inside the peripheral's range, so a failure here means the port
+    // is unusable and the board says so the only way it can.
+    let mut serial = match dp.USART2.serial(
+        (gpioa.pa2, gpioa.pa3),
+        SerialConfig::default(),
+        &mut rcc,
+    ) {
+        Ok(serial) => serial,
+        Err(_) => stall_lit(),
+    };
+
     // The delay counts SysTick ticks against the AHB frequency.
     let mut delay = Delay::new(cp.SYST, clocks.hclk().to_Hz());
 
-    sense(&mut sensor, &mut led, &mut button, &mut delay)
+    sense(&mut sensor, &mut led, &mut button, &mut serial, &mut delay)
 }
 
 /// A button that reports one event per accepted press.
@@ -233,14 +266,16 @@ fn half_for(temperature: f64) -> u16 {
 /// pin and bus types, as `breathe` was: `S` carries the bus the sensor
 /// sits on, `P` the duty, `I` the button, `D` the time.
 ///
-/// The button still pauses and resumes the breath. What the sensor adds
-/// is the speed: one reading every `READING_TICKS`, and the temperature
-/// in it sets the half-period. Until step 8 gives readings a channel to
-/// be printed on, the LED is the only output the board has.
+/// The serial port is the one concrete chip type in the list, because
+/// this step's whole subject is what the firmware says about itself:
+/// every reading is reported twice, once as a line of plain text on
+/// the UART and once as a defmt record, and the two reports are the
+/// comparison the article is about.
 fn sense<S: I2c, P: SetDutyCycle, I: InputPin, D: DelayNs>(
     sensor: &mut BMP280<S>,
     led: &mut P,
     button: &mut Button<I>,
+    serial: &mut Serial<stm32f4xx_hal::pac::USART2>,
     delay: &mut D,
 ) -> ! {
     let mut breath = Breath::new(DEFAULT_HALF);
@@ -249,11 +284,20 @@ fn sense<S: I2c, P: SetDutyCycle, I: InputPin, D: DelayNs>(
     loop {
         if button.tick() {
             breath.toggle();
+            // A pause and a resume leave no trace on the board — the
+            // LED going dark is all the signal there is — so they are
+            // worth a record of their own.
+            if breath.running {
+                defmt::info!("breath resumed");
+            } else {
+                defmt::info!("breath paused");
+            }
         }
         // One write per tick, running or paused. On this chip the error
         // type is `Infallible`, so the unwrap cannot fire.
         led.set_duty_cycle_percent(breath.duty()).unwrap();
         delay.delay_ms(1);
+        TICKS.fetch_add(1, Ordering::Relaxed);
         breath.advance();
 
         since_reading += 1;
@@ -264,13 +308,22 @@ fn sense<S: I2c, P: SetDutyCycle, I: InputPin, D: DelayNs>(
             // half second is not where the cycles go.
             let reading = sensor.measure();
             breath.set_half(half_for(reading.temperature));
+            // The same number, twice. The first report formats it into
+            // text on the spot — the whole line, every character, goes
+            // out over the wire. The second hands defmt the raw bytes
+            // and a reference to the format string. `.ok()` because a
+            // UART that cannot take a byte is not worth stopping the
+            // firmware over.
+            writeln!(serial, "temperature {:.2} C", reading.temperature).ok();
+            defmt::info!("temperature {=f64} C", reading.temperature);
         }
     }
 }
 
 /// The board sits with LD2 lit: the look a panic gives, reused for a
-/// sensor that does not answer. Nothing else is running, so nothing
-/// else can take the pin back — the mode bits are ours to rewrite.
+/// sensor that does not answer and a serial port that cannot be
+/// configured. Nothing else is running, so nothing else can take the
+/// pin back — the mode bits are ours to rewrite.
 fn stall_lit() -> ! {
     // Safety: `ptr()` returns the register block's address without
     // checking ownership. GPIOA exists at that address from reset
@@ -292,7 +345,15 @@ fn stall_lit() -> ! {
 /// plain output first and the LED is the BSRR's again — a panic still
 /// freezes the board with LD2 lit, which tells it apart from a breath
 /// that merely stopped.
+///
+/// Step 8 gives the handler a voice as well: the record goes out over
+/// RTT before the LED lights. There is no `defmt::flush()` here on
+/// purpose — flush blocks until the host has read the bytes, and with
+/// the probe detached that would leave the board dark instead of lit.
+/// The RTT buffer is in RAM and the probe reads it whenever it is
+/// attached; what is lost is the record of a panic nobody was watching.
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    defmt::error!("panic: {=?}", info);
     stall_lit()
 }
