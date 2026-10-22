@@ -2,19 +2,31 @@
 #![no_main]
 
 use bmpe280::BMP280;
+use core::cell::RefCell;
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicU32, Ordering};
-use cortex_m::delay::Delay;
-use cortex_m_rt::entry;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use cortex_m::peripheral::NVIC;
+use critical_section::{CriticalSection, Mutex};
 use defmt_rtt as _;
-use embedded_hal::delay::DelayNs;
+use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use embassy_sync::signal::Signal;
+use embassy_sync::watch::Watch;
+use embassy_time::{Duration, Timer};
+use embassy_time_driver::{Driver, time_driver_impl};
+use embassy_time_queue_utils::Queue;
 use embedded_hal::digital::InputPin;
-use embedded_hal::i2c::I2c;
 use embedded_hal::pwm::SetDutyCycle;
+use stm32f4xx_hal::gpio::Pin;
+use stm32f4xx_hal::i2c::I2c;
 use stm32f4xx_hal::pac;
+use stm32f4xx_hal::pac::interrupt;
 use stm32f4xx_hal::prelude::*;
 use stm32f4xx_hal::rcc::Config;
-use stm32f4xx_hal::serial::{Config as SerialConfig, Serial};
+use stm32f4xx_hal::serial::{Config as SerialConfig, Tx};
+use stm32f4xx_hal::timer::PwmChannel;
 
 /// The BMP280's chip ID, read from register 0xD0 at start-up. A chip
 /// that answers with anything else was not configured by the driver.
@@ -26,55 +38,288 @@ const BMP280_ID: u8 = 0x58;
 /// `new` defaults to, which is why the address is passed explicitly.
 const SENSOR_ADDRESS: u8 = 0x76;
 
-/// The half-period the breath starts with, before the first reading
-/// has arrived.
-const DEFAULT_HALF: u16 = 300;
-
-/// Ticks between sensor readings: half a second.
-const READING_TICKS: u16 = 500;
+/// The half-period the breath starts with, in ticks. A tick is ten
+/// milliseconds in the executor, so this is a third of a second —
+/// the same half-period step 8's loop ran at, on a finer clock.
+const DEFAULT_HALF: u16 = 30;
 
 /// The fastest half-period the mapping allows, in ticks. Below this a
 /// breath stops being a breath and becomes a strobe.
-const MIN_HALF: u16 = 50;
+const MIN_HALF: u16 = 5;
 
 /// The slowest half-period the mapping allows, in ticks.
-const MAX_HALF: u16 = 500;
+const MAX_HALF: u16 = 50;
 
-/// Ticks shaved off the half-period per degree Celsius.
-const TEMP_STEP: f64 = 10.0;
+/// Ticks shaved off the half-period per degree Celsius. One tick is
+/// ten milliseconds, so a degree is worth a tenth of a second.
+const TEMP_STEP: f64 = 1.0;
 
-/// Loop ticks since start-up, one per millisecond. This is the
-/// timestamp every defmt record carries: the firmware has no clock
-/// peripheral wired up yet, and the loop's own pace is the clock
-/// there is.
-static TICKS: AtomicU32 = AtomicU32::new(0);
+/// A level change has to hold for this many consecutive 1 ms ticks
+/// before it counts. Ten milliseconds is a starting point: long enough
+/// that chatter cannot reach it, short enough that a deliberate press
+/// registers on the first attempt.
+const DEBOUNCE_TICKS: u8 = 10;
 
-defmt::timestamp!("{=u32}", TICKS.load(Ordering::Relaxed));
+// Every record's timestamp is the same millisecond count the tasks
+// wait on, read straight from the time driver. Step 8 kept this
+// counter by hand in the loop; the loop is gone, and the clock it was
+// standing in for is now real hardware.
+defmt::timestamp!("{=u64}", embassy_time_driver::now());
 
-#[entry]
-fn main() -> ! {
+/// One thing the firmware has to say about itself. Step 8 wrote each
+/// of these on the spot, from inside the loop that produced them; they
+/// now travel to the task that owns the ports, and that task is the
+/// only place either port is touched.
+enum Report {
+    /// A temperature reading, in degrees Celsius.
+    Temperature(f64),
+    /// Whether the breath is running: `true` resumed, `false` paused.
+    Breath(bool),
+}
+
+/// Reports waiting for the serial port. The logger is the only reader
+/// and both producers are slower than it is, so eight slots never fill.
+static REPORTS: Channel<CriticalSectionRawMutex, Report, 8> = Channel::new();
+
+/// The latest temperature reading. A `Watch` rather than a channel
+/// because the breath wants the current value whenever it looks, not
+/// every value that ever arrived — one slot, overwritten in place.
+static TEMPERATURE: Watch<CriticalSectionRawMutex, f64, 1> = Watch::new();
+
+/// A press that has been accepted and not yet acted on. The button
+/// task raises it; the breath task waits on it.
+static PRESS: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// TIM5's registers, reached through the pointer the PAC hands out.
+/// The driver configures the timer once and only the interrupt handler
+/// touches it after that, so a second handle to the same block is the
+/// normal way to reach it — the owned `TIM5` singleton is never moved
+/// anywhere.
+fn tim5() -> &'static pac::tim5::RegisterBlock {
+    // Safety: TIM5 exists at this address from reset onward, and its
+    // clock is enabled before the interrupt that reads it is unmasked.
+    unsafe { &*pac::TIM5::ptr() }
+}
+
+/// The firmware's clock, and the reason any task can wait at all.
+///
+/// embassy-time has no clock of its own. It calls out to a driver
+/// through two functions — `now` and `schedule_wake` — and whoever
+/// provides them decides what a tick is and how long it lasts. This is
+/// that provider: TIM5 counting milliseconds, stretched to 64 bits in
+/// software, with the queue of pending wakeups shared between the
+/// tasks and the timer interrupt.
+struct Tim5Driver {
+    /// Cleared until the timer registers have been configured. The
+    /// `Driver` trait requires `now` to answer even before the
+    /// hardware is ready, and zero is the only honest answer there is.
+    started: AtomicBool,
+    /// Counter wraps since boot. Only the update interrupt writes it,
+    /// so a plain load is a correct read.
+    wraps: AtomicU32,
+    /// Wakeups embassy-time has asked for, shared with the timer
+    /// interrupt: a task adds one while it is being polled, the
+    /// interrupt takes one out when it is due.
+    queue: Mutex<RefCell<Queue>>,
+}
+
+time_driver_impl!(static DRIVER: Tim5Driver = Tim5Driver {
+    started: AtomicBool::new(false),
+    wraps: AtomicU32::new(0),
+    queue: Mutex::new(RefCell::new(Queue::new())),
+});
+
+impl Tim5Driver {
+    /// Configure TIM5 as a 1 kHz tick source and start it. Called once,
+    /// before the first task runs.
+    fn init(&self) {
+        let tim = tim5();
+
+        // APB1 carries the 16 MHz internal oscillator under the default
+        // clock configuration, so the prescaler divides by 16 000 for
+        // one tick per millisecond. The prescaler and the reload value
+        // only take effect on an update event, and an update event with
+        // the update interrupt live would fire it at once — so the
+        // counter is stopped, the registers are loaded, and one update
+        // is generated by hand with the update interrupt still muted.
+        tim.cr1().modify(|_, w| w.cen().disabled());
+        tim.psc().write(|w| w.psc().set(15_999));
+        // A 32-bit counter at 1 kHz wraps after 2^32 ticks, a little
+        // under 50 days. The wrap is counted here in software rather
+        // than being the timebase itself.
+        tim.arr().write(|w| w.arr().set(0xFFFF_FFFF));
+        // URS counter-only: the manual update below reloads the
+        // registers without setting the update flag.
+        tim.cr1().modify(|_, w| w.urs().counter_only());
+        tim.egr().write(|w| w.ug().update());
+        tim.cr1().modify(|_, w| w.urs().any_event());
+        // The wrap counter needs the update interrupt. The compare
+        // interrupt stays off until something is actually armed.
+        tim.dier().modify(|_, w| w.uie().enabled());
+        tim.cr1().modify(|_, w| w.cen().enabled());
+
+        self.started.store(true, Ordering::Relaxed);
+    }
+
+    /// One more counter wrap, from the update interrupt.
+    fn on_wrap(&self) {
+        self.wraps.fetch_add(1, Ordering::Release);
+    }
+
+    /// The compare interrupt fired: wake everything that is due and arm
+    /// the next alarm.
+    fn on_alarm(&self, cs: CriticalSection) {
+        let mut queue = self.queue.borrow(cs).borrow_mut();
+        let mut next = queue.next_expiration(self.now());
+        while !self.set_alarm(next) {
+            next = queue.next_expiration(self.now());
+        }
+    }
+
+    /// Arm the compare register for `timestamp`, or report that it
+    /// cannot be armed. `false` means the caller must look at the queue
+    /// again: the deadline has already passed.
+    ///
+    /// Called with the queue's lock held, from `schedule_wake` and from
+    /// the timer interrupt — never from two places at once, which is
+    /// what makes the read-modify-write on DIER safe.
+    fn set_alarm(&self, timestamp: u64) -> bool {
+        let tim = tim5();
+
+        if timestamp == u64::MAX {
+            // Nothing is scheduled: switch the compare interrupt off
+            // and leave it off.
+            tim.dier().modify(|_, w| w.cc1ie().disabled());
+            return true;
+        }
+
+        let now = self.now();
+        if timestamp <= now {
+            // Due already. Disarm and let the caller take the next
+            // deadline from the queue, which will wake this one.
+            tim.dier().modify(|_, w| w.cc1ie().disabled());
+            return false;
+        }
+
+        // How far away the deadline is. The compare register is 32 bits
+        // wide, like the counter, so anything closer than a full wrap is
+        // written directly. A deadline further out than that is armed
+        // for the end of the current period instead: the compare fires,
+        // finds nothing due, and arms the next period — one interrupt
+        // per 49 days is a fair price for a compare register that is
+        // not 64 bits wide.
+        let diff = timestamp - now;
+        let ccr = if diff >= 0xFFFF_FFFF {
+            0xFFFF_FFFF
+        } else {
+            timestamp as u32
+        };
+        tim.ccr1().write(|w| w.ccr().set(ccr));
+        tim.dier().modify(|_, w| w.cc1ie().enabled());
+
+        // The counter may have reached the compare value while it was
+        // being written. If the deadline has passed since, say so and
+        // let the caller retry.
+        self.now() < timestamp
+    }
+}
+
+impl Driver for Tim5Driver {
+    /// Ticks since boot: the software wrap count in the high word, the
+    /// counter in the low one.
+    fn now(&self) -> u64 {
+        if !self.started.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let tim = tim5();
+        loop {
+            // The counter is read twice around the wrap count. If it
+            // went backwards between the two reads, a wrap raced the
+            // first one and the wrap count just read is stale: start
+            // over.
+            let first = tim.cnt().read().cnt().bits() as u64;
+            let wraps = self.wraps.load(Ordering::Acquire);
+            let second = tim.cnt().read().cnt().bits() as u64;
+            if first <= second {
+                return (wraps as u64) << 32 | second;
+            }
+        }
+    }
+
+    fn schedule_wake(&self, at: u64, waker: &core::task::Waker) {
+        critical_section::with(|cs| {
+            let mut queue = self.queue.borrow(cs).borrow_mut();
+            if queue.schedule_wake(at, waker) {
+                let mut next = queue.next_expiration(self.now());
+                while !self.set_alarm(next) {
+                    next = queue.next_expiration(self.now());
+                }
+            }
+        })
+    }
+}
+
+/// The timer interrupt: one vector for both of TIM5's events, the
+/// counter wrap and the alarm.
+#[cortex_m_rt::interrupt]
+fn TIM5() {
+    let tim = tim5();
+    let sr = tim.sr().read();
+    // The status flags clear by writing a zero, so the register is
+    // written back inverted: every flag that was set is cleared and the
+    // ones that were not stay clear. Reading first and writing the
+    // inverse cannot miss a flag that arrived in between.
+    //
+    // Safety: writing a zero to these flags is their documented clear
+    // condition, and the inverted write touches no other field. The
+    // block covers both unsafe calls: the write itself and the
+    // raw-bits writer inside the closure.
+    unsafe {
+        tim.sr().write_with_zero(|w| w.bits(!sr.bits()));
+    }
+
+    if sr.uif().bit() {
+        DRIVER.on_wrap();
+    }
+    if sr.cc1if().bit() {
+        critical_section::with(|cs| DRIVER.on_alarm(cs));
+    }
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
     let dp = pac::Peripherals::take().unwrap();
-    let cp = cortex_m::peripheral::Peripherals::take().unwrap();
 
     // Constrain the RCC and apply the default clock configuration: the
-    // chip's 16 MHz internal oscillator, no PLL.
+    // chip's 16 MHz internal oscillator, no PLL. APB1 runs at the same
+    // 16 MHz, which is the clock the time driver divides.
     let mut rcc = dp.RCC.constrain().freeze(Config::default());
-    let clocks = rcc.clocks;
 
     let gpioa = dp.GPIOA.split(&mut rcc);
     let gpiob = dp.GPIOB.split(&mut rcc);
     let gpioc = dp.GPIOC.split(&mut rcc);
 
+    // TIM5 hangs off APB1 and nothing in the HAL takes it over, so its
+    // clock is enabled here by hand: without it the counter never runs
+    // and every `Timer` in the firmware waits forever.
+    rcc.apb1enr().modify(|_, w| w.tim5en().enabled());
+
+    // The clock every task waits on comes up before anything can wait
+    // on it: the driver configures TIM5 and unmasks its interrupt here,
+    // and the first task is not spawned until that is done.
+    DRIVER.init();
+    NVIC::unpend(pac::Interrupt::TIM5);
+    unsafe {
+        NVIC::unmask(pac::Interrupt::TIM5);
+    }
+
     // PC13 is the board's user button, wired as step 5 left it.
-    let button_pin = gpioc.pc13.into_pull_up_input();
-    let mut button = Button::new(button_pin);
+    let button = Button::new(gpioc.pc13.into_pull_up_input());
 
     // TIM2's channel 1 is muxed onto PA5, the pin LD2 is wired to. The
     // pin changes jobs here: no longer an output the firmware writes
     // outright, but a timer output the firmware only loads. One
-    // kilohertz makes a period of 1 ms — the same length as the loop's
-    // tick, so the duty is written once per period and never lands
-    // mid-period.
+    // kilohertz makes a period of 1 ms.
     let (_, channels) = dp.TIM2.pwm_hz(1.kHz(), &mut rcc);
     let mut led = channels.0.with(gpioa.pa5.into_alternate::<1>());
     // The channel starts with its output disabled: the counter runs and
@@ -109,7 +354,7 @@ fn main() -> ! {
     // is an error — but 16 MHz divided down to 115200 is comfortably
     // inside the peripheral's range, so a failure here means the port
     // is unusable and the board says so the only way it can.
-    let mut serial = match dp.USART2.serial(
+    let serial = match dp.USART2.serial(
         (gpioa.pa2, gpioa.pa3),
         SerialConfig::default(),
         &mut rcc,
@@ -117,11 +362,132 @@ fn main() -> ! {
         Ok(serial) => serial,
         Err(_) => stall_lit(),
     };
+    // The port splits in two: the transmitter moves into the task that
+    // owns the logging, and the receiver is dropped — nothing reads it,
+    // as in step 8.
+    let (tx, _rx) = serial.split();
 
-    // The delay counts SysTick ticks against the AHB frequency.
-    let mut delay = Delay::new(cp.SYST, clocks.hclk().to_Hz());
+    // One job per task, and each task owns the hardware it needs. What
+    // the tasks have to say to each other travels over the statics
+    // above, not through shared borrows that would have to outlive the
+    // executor's poll of them.
+    spawner.spawn(breathe(led, &TEMPERATURE, &REPORTS).unwrap());
+    spawner.spawn(watch_button(button).unwrap());
+    spawner.spawn(read_sensor(sensor, &TEMPERATURE, &REPORTS).unwrap());
+    spawner.spawn(report(tx, &REPORTS).unwrap());
+}
 
-    sense(&mut sensor, &mut led, &mut button, &mut serial, &mut delay)
+/// The breath: one step of the ramp every ten milliseconds, and a
+/// pause or resume when a press arrives.
+///
+/// The task owns the PWM channel. It shares the temperature `Watch`
+/// and the report `Channel`, which is why both are borrowed for
+/// `'static`: a task argument has to live as long as the executor, and
+/// a static does.
+#[embassy_executor::task]
+async fn breathe(
+    mut led: PwmChannel<pac::TIM2, 0>,
+    temperature: &'static Watch<CriticalSectionRawMutex, f64, 1>,
+    reports: &'static Channel<CriticalSectionRawMutex, Report, 8>,
+) {
+    let mut breath = Breath::new(DEFAULT_HALF);
+
+    loop {
+        // Two things can happen in the next ten milliseconds: the tick
+        // comes due, or a press arrives. Whichever comes first is what
+        // this task does; the other waits. `select` polls both futures
+        // and drops the one that lost.
+        match select(PRESS.wait(), Timer::after(Duration::from_millis(10))).await {
+            Either::First(()) => {
+                breath.toggle();
+                // A pause and a resume leave no trace on the board —
+                // the LED going dark is all the signal there is — so
+                // they are worth a report of their own.
+                reports.send(Report::Breath(breath.running)).await;
+            }
+            Either::Second(()) => {
+                // A new reading only changes the half-period; there is
+                // nothing to do on the ticks in between.
+                if let Some(t) = temperature.try_get() {
+                    breath.set_half(half_for(t));
+                }
+                breath.advance();
+                // One write per tick, running or paused. On this chip
+                // the error type is `Infallible`, so the unwrap cannot
+                // fire.
+                led.set_duty_cycle_percent(breath.duty()).unwrap();
+            }
+        }
+    }
+}
+
+/// The button: one poll per millisecond, the same debounce step 5
+/// settled on, and one signal per accepted press.
+#[embassy_executor::task]
+async fn watch_button(mut button: Button<Pin<'C', 13>>) {
+    loop {
+        if button.tick() {
+            // The debouncer reports one event per accepted press. The
+            // signal carries it to the breath task; a press that
+            // arrives while the breath task is mid-tick waits there
+            // until it looks.
+            PRESS.signal(());
+        }
+        Timer::after(Duration::from_millis(1)).await;
+    }
+}
+
+/// The sensor: one reading every half second, handed to whoever wants
+/// it.
+#[embassy_executor::task]
+async fn read_sensor(
+    mut sensor: BMP280<I2c<pac::I2C1>>,
+    temperature: &'static Watch<CriticalSectionRawMutex, f64, 1>,
+    reports: &'static Channel<CriticalSectionRawMutex, Report, 8>,
+) {
+    loop {
+        Timer::after(Duration::from_millis(500)).await;
+        // The driver returns degrees Celsius as an `f64`; on this chip
+        // that is a software double, and one reading every half second
+        // is not where the cycles go. The measurement itself is a
+        // blocking I2C transfer: seven bytes at 100 kHz is a little
+        // over half a millisecond, so the task holds the executor for
+        // that long and then gives it back. Nothing else is due in the
+        // window, and nothing is late because of it.
+        let reading = sensor.measure();
+        // The breath paces itself on the latest value whenever it
+        // looks; the logger gets every one.
+        temperature.sender().send(reading.temperature);
+        reports.send(Report::Temperature(reading.temperature)).await;
+    }
+}
+
+/// The logger: the only task that touches either port.
+#[embassy_executor::task]
+async fn report(mut serial: Tx<pac::USART2>, reports: &'static Channel<CriticalSectionRawMutex, Report, 8>) {
+    loop {
+        // Waiting here until something is said is the point: the port
+        // is free for the rest of the time, and nothing else has to
+        // take a lock to use it.
+        match reports.receive().await {
+            Report::Temperature(t) => {
+                // The same number, twice: once as a line of text on the
+                // UART, once as a defmt record over RTT. `.ok()` because
+                // a UART that cannot take a byte is not worth stopping
+                // the firmware over.
+                writeln!(serial, "temperature {:.2} C", t).ok();
+                defmt::info!("temperature {=f64} C", t);
+            }
+            Report::Breath(true) => {
+                writeln!(serial, "breath resumed").ok();
+                defmt::info!("breath resumed");
+            }
+            Report::Breath(false) => {
+                writeln!(serial, "breath paused").ok();
+                defmt::info!("breath paused");
+            }
+        }
+    }
 }
 
 /// A button that reports one event per accepted press.
@@ -140,12 +506,6 @@ struct Button<I: InputPin> {
     /// How many consecutive ticks have disagreed with `pressed`.
     held: u8,
 }
-
-/// A level change has to hold for this many consecutive 1 ms ticks before
-/// it counts. Ten milliseconds is a starting point: long enough that
-/// chatter cannot reach it, short enough that a deliberate press
-/// registers on the first attempt.
-const DEBOUNCE_TICKS: u8 = 10;
 
 impl<I: InputPin> Button<I> {
     fn new(pin: I) -> Self {
@@ -262,64 +622,6 @@ fn half_for(temperature: f64) -> u16 {
     (MAX_HALF as f64 - TEMP_STEP * temperature).clamp(MIN_HALF as f64, MAX_HALF as f64) as u16
 }
 
-/// The loop, written against the traits instead of the chip's channel,
-/// pin and bus types, as `breathe` was: `S` carries the bus the sensor
-/// sits on, `P` the duty, `I` the button, `D` the time.
-///
-/// The serial port is the one concrete chip type in the list, because
-/// this step's whole subject is what the firmware says about itself:
-/// every reading is reported twice, once as a line of plain text on
-/// the UART and once as a defmt record, and the two reports are the
-/// comparison the article is about.
-fn sense<S: I2c, P: SetDutyCycle, I: InputPin, D: DelayNs>(
-    sensor: &mut BMP280<S>,
-    led: &mut P,
-    button: &mut Button<I>,
-    serial: &mut Serial<stm32f4xx_hal::pac::USART2>,
-    delay: &mut D,
-) -> ! {
-    let mut breath = Breath::new(DEFAULT_HALF);
-    let mut since_reading: u16 = 0;
-
-    loop {
-        if button.tick() {
-            breath.toggle();
-            // A pause and a resume leave no trace on the board — the
-            // LED going dark is all the signal there is — so they are
-            // worth a record of their own.
-            if breath.running {
-                defmt::info!("breath resumed");
-            } else {
-                defmt::info!("breath paused");
-            }
-        }
-        // One write per tick, running or paused. On this chip the error
-        // type is `Infallible`, so the unwrap cannot fire.
-        led.set_duty_cycle_percent(breath.duty()).unwrap();
-        delay.delay_ms(1);
-        TICKS.fetch_add(1, Ordering::Relaxed);
-        breath.advance();
-
-        since_reading += 1;
-        if since_reading >= READING_TICKS {
-            since_reading = 0;
-            // The driver returns degrees Celsius as an `f64`; on this
-            // chip that is a software double, and one reading every
-            // half second is not where the cycles go.
-            let reading = sensor.measure();
-            breath.set_half(half_for(reading.temperature));
-            // The same number, twice. The first report formats it into
-            // text on the spot — the whole line, every character, goes
-            // out over the wire. The second hands defmt the raw bytes
-            // and a reference to the format string. `.ok()` because a
-            // UART that cannot take a byte is not worth stopping the
-            // firmware over.
-            writeln!(serial, "temperature {:.2} C", reading.temperature).ok();
-            defmt::info!("temperature {=f64} C", reading.temperature);
-        }
-    }
-}
-
 /// The board sits with LD2 lit: the look a panic gives, reused for a
 /// sensor that does not answer and a serial port that cannot be
 /// configured. Nothing else is running, so nothing else can take the
@@ -352,6 +654,10 @@ fn stall_lit() -> ! {
 /// the probe detached that would leave the board dark instead of lit.
 /// The RTT buffer is in RAM and the probe reads it whenever it is
 /// attached; what is lost is the record of a panic nobody was watching.
+///
+/// A panic in a task lands here too: the executor polls tasks in thread
+/// mode, so a panic in a task is a panic on the spot, and the board
+/// stops with the LED lit exactly as it did when the loop panicked.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     defmt::error!("panic: {=?}", info);
