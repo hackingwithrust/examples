@@ -23,12 +23,12 @@ impl Index {
         self.documents.push(path.to_string());
 
         // The terms this document contributes, each at most once.
-        let mut terms: Vec<&str> = tokenize(text).collect();
+        let mut terms: Vec<String> = tokenize(text).collect();
         terms.sort_unstable();
         terms.dedup();
 
         for term in terms {
-            self.postings.entry(term.to_string()).or_default().push(id);
+            self.postings.entry(term).or_default().push(id);
         }
 
         id
@@ -36,6 +36,10 @@ impl Index {
 
     /// The ids of the documents containing `term`, in insertion order.
     /// Empty when the index has never seen the term.
+    ///
+    /// The term has to be normalised the way the tokeniser normalises
+    /// text: `search("borrowing")` finds nothing, because the dictionary
+    /// holds "borrow". Normalising the query is the caller's job.
     fn search(&self, term: &str) -> &[u32] {
         self.postings.get(term).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -54,10 +58,99 @@ impl Index {
     }
 }
 
-/// Split text into terms. Whitespace only, for now: casing, stop words and
-/// stemming arrive in step 3, and nothing outside this function changes then.
-fn tokenize(text: &str) -> impl Iterator<Item = &str> {
-    text.split_whitespace()
+/// The stop words: terms so common that indexing them costs memory and
+/// buys nothing. This is the classic short English list; a production
+/// engine keeps a longer one, and one per language.
+const STOP_WORDS: &[&str] = &[
+    "a", "am", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "can", "could",
+    "did", "do", "does", "for", "from", "had", "has", "have", "he", "her", "his", "how", "i", "if",
+    "in", "into", "is", "it", "its", "may", "might", "must", "no", "nor", "not", "of", "on", "or",
+    "our", "shall", "she", "should", "so", "such", "than", "that", "the", "their", "them", "then",
+    "there", "these", "they", "this", "those", "through", "to", "us", "was", "we", "were", "what",
+    "when", "where", "which", "while", "who", "whom", "will", "with", "would", "you", "your",
+];
+
+fn is_stop_word(word: &str) -> bool {
+    STOP_WORDS.contains(&word)
+}
+
+/// Shortest stem worth keeping. Without the guard "ring" stems to "r".
+const MIN_STEM: usize = 3;
+
+/// Strip `suffix`, but only when a stem of at least `MIN_STEM`
+/// characters is left.
+fn strip_suffix(word: &str, suffix: &str) -> Option<String> {
+    let base = word.strip_suffix(suffix)?;
+    (base.chars().count() >= MIN_STEM).then_some(base.to_string())
+}
+
+/// "runn" -> "run", "dropp" -> "drop": a doubled final consonant is
+/// usually the suffix's doing. l, s and z double naturally, so
+/// "class", "fall" and "buzz" keep both letters.
+fn undouble(stem: String) -> String {
+    let mut chars: Vec<char> = stem.chars().collect();
+    if chars.len() >= 2 {
+        let (last, before) = (chars[chars.len() - 1], chars[chars.len() - 2]);
+        if last == before && !matches!(last, 'l' | 's' | 'z') {
+            chars.pop();
+        }
+    }
+    chars.into_iter().collect()
+}
+
+/// "boxes" -> "box", "watches" -> "watch", "classes" -> "class":
+/// after a sibilant that is not a bare "s", the plural's "es" detaches.
+/// Everywhere else the "s" alone is the marker, so "causes" -> "cause"
+/// and "buses" -> "buse", which is a known miss.
+fn strip_sibilant_es(word: &str) -> Option<String> {
+    let base = word.strip_suffix("es")?;
+    let sibilant = base.ends_with('x')
+        || base.ends_with('z')
+        || base.ends_with("ss")
+        || base.ends_with("ch")
+        || base.ends_with("sh");
+    if !sibilant || base.chars().count() < MIN_STEM {
+        return None;
+    }
+    Some(base.to_string())
+}
+
+/// A small rule-based stemmer: strip one inflectional suffix, then fix
+/// the doubling it left behind. "borrow", "borrows", "borrowed" and
+/// "borrowing" all come out as "borrow".
+///
+/// It produces terms, not lemmas: "built" ends in no suffix it knows
+/// and stays whole, and "ownership" does not stem at all. Porter's
+/// algorithm is the full version of this idea; this is its small
+/// cousin.
+fn stem(word: &str) -> String {
+    if let Some(base) = strip_suffix(word, "ing") {
+        return undouble(base);
+    }
+    if let Some(base) = strip_suffix(word, "ed") {
+        return undouble(base);
+    }
+    if let Some(base) = strip_sibilant_es(word) {
+        return base;
+    }
+    if let Some(base) = strip_suffix(word, "s") {
+        return base;
+    }
+    word.to_string()
+}
+
+/// Split text into terms: lowercase, split on anything that is not a
+/// letter or a digit, drop stop words, and stem what is left.
+///
+/// The terms are owned. Step 2's version handed back slices of the text
+/// it was given; lowercasing a word builds a new String, and so does
+/// stemming one, so the output cannot borrow `text` any more.
+fn tokenize(text: &str) -> impl Iterator<Item = String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .filter(|word| !is_stop_word(word))
+        .map(|word| stem(&word))
 }
 
 fn main() {
@@ -108,16 +201,30 @@ fn main() {
         }
     }
 
-    println!("\nqueries that miss:");
+    println!("\nthe queries that used to miss:");
     for query in ["ownership", "valid"] {
-        let hits = index.search(query);
-        if hits.is_empty() {
-            println!("  {:?} -> no documents", query);
-        } else {
-            for id in hits {
-                println!("  {:?} -> {}", query, index.path(*id));
-            }
+        println!("  query {:?}:", query);
+        for id in index.search(query) {
+            println!("    {}", index.path(*id));
         }
+    }
+
+    println!("\ninflections fold onto one term:");
+    for query in ["borrow", "borrowing"] {
+        let terms: Vec<String> = tokenize(query).collect();
+        println!("  query {query:?} -> terms {terms:?}");
+        for term in &terms {
+            println!("    {term:?}: {:?}", index.search(term));
+        }
+    }
+
+    println!("\nstop words are not terms:");
+    for query in ["the", "is"] {
+        println!(
+            "  query {:?}: {} documents",
+            query,
+            index.search(query).len()
+        );
     }
 }
 
@@ -127,7 +234,7 @@ mod tests {
 
     fn sample() -> Index {
         let mut index = Index::new();
-        index.add_document("a.md", "the quick brown fox");
+        index.add_document("a.md", "The Quick Brown Fox");
         index.add_document("b.md", "the lazy dog, the quick cat");
         index
     }
@@ -142,7 +249,6 @@ mod tests {
     #[test]
     fn a_term_in_two_documents_lists_both() {
         let index = sample();
-        assert_eq!(index.search("the"), &[0, 1]);
         assert_eq!(index.search("quick"), &[0, 1]);
     }
 
@@ -158,7 +264,7 @@ mod tests {
         let index = sample();
         assert_eq!(index.path(0), "a.md");
         assert_eq!(index.path(1), "b.md");
-        assert_eq!(index.search("dog,"), &[1]);
+        assert_eq!(index.search("dog"), &[1]);
     }
 
     #[test]
@@ -168,10 +274,59 @@ mod tests {
     }
 
     #[test]
-    fn casing_and_punctuation_stay_part_of_the_term_for_now() {
+    fn casing_and_punctuation_are_folded_away() {
         let index = sample();
-        assert!(index.search("Fox").is_empty());
         assert_eq!(index.search("fox"), &[0]);
-        assert!(index.search("dog").is_empty());
+        assert_eq!(index.search("dog"), &[1]);
+    }
+
+    #[test]
+    fn stop_words_are_not_indexed() {
+        let index = sample();
+        assert!(index.search("the").is_empty());
+        assert_eq!(index.search("quick"), &[0, 1]);
+    }
+
+    #[test]
+    fn inflections_share_one_term() {
+        let mut index = Index::new();
+        index.add_document("a.md", "borrowing");
+        index.add_document("b.md", "borrowed");
+        index.add_document("c.md", "borrows");
+        assert_eq!(index.search("borrow"), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn a_doubled_consonant_from_the_suffix_is_collapsed() {
+        let mut index = Index::new();
+        index.add_document("a.md", "running dropped");
+        assert_eq!(index.search("run"), &[0]);
+        assert_eq!(index.search("drop"), &[0]);
+    }
+
+    #[test]
+    fn doubling_that_is_not_the_suffixs_fault_survives() {
+        let mut index = Index::new();
+        index.add_document("a.md", "classes");
+        index.add_document("b.md", "boxes");
+        index.add_document("c.md", "buzzes");
+        assert_eq!(index.search("class"), &[0]);
+        assert_eq!(index.search("box"), &[1]);
+        assert_eq!(index.search("buzz"), &[2]);
+    }
+
+    #[test]
+    fn a_stem_needs_three_characters() {
+        let mut index = Index::new();
+        index.add_document("a.md", "ring");
+        assert_eq!(index.search("ring"), &[0]);
+        assert!(index.search("r").is_empty());
+    }
+
+    #[test]
+    fn case_folding_is_unicode_aware() {
+        let mut index = Index::new();
+        index.add_document("a.md", "Ärger");
+        assert_eq!(index.search("ärger"), &[0]);
     }
 }

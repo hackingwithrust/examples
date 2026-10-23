@@ -2,7 +2,7 @@
 
 Track: <https://hackingwithrust.com/projects/search-engine/>
 
-**Status: step 2 of 12 published.**
+**Status: step 3 of 12 published.**
 
 Tags: `search-ch02` … `search-ch12`. See [`../README.md`](../README.md) for what the tags mean.
 
