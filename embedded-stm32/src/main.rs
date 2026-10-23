@@ -5,7 +5,7 @@ use bmpe280::BMP280;
 use core::cell::RefCell;
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use cortex_m::peripheral::NVIC;
+use cortex_m::peripheral::{NVIC, SCB};
 use critical_section::{CriticalSection, Mutex};
 use defmt_rtt as _;
 use embassy_executor::Spawner;
@@ -19,7 +19,7 @@ use embassy_time_driver::{Driver, time_driver_impl};
 use embassy_time_queue_utils::Queue;
 use embedded_hal::digital::InputPin;
 use embedded_hal::pwm::SetDutyCycle;
-use stm32f4xx_hal::gpio::Pin;
+use stm32f4xx_hal::gpio::{Edge, Pin};
 use stm32f4xx_hal::i2c::I2c;
 use stm32f4xx_hal::pac;
 use stm32f4xx_hal::pac::interrupt;
@@ -60,6 +60,12 @@ const TEMP_STEP: f64 = 1.0;
 /// registers on the first attempt.
 const DEBOUNCE_TICKS: u8 = 10;
 
+/// Ticks the button has to be held before the chip is put to sleep. The
+/// button task polls once a millisecond, so this is two seconds: long
+/// enough that nobody stops the chip by accident, short enough that the
+/// wait does not feel broken.
+const HOLD_TICKS: u32 = 2_000;
+
 // Every record's timestamp is the same millisecond count the tasks
 // wait on, read straight from the time driver. Step 8 kept this
 // counter by hand in the loop; the loop is gone, and the clock it was
@@ -75,6 +81,8 @@ enum Report {
     Temperature(f64),
     /// Whether the breath is running: `true` resumed, `false` paused.
     Breath(bool),
+    /// The chip came back from Stop mode.
+    Awake,
 }
 
 /// Reports waiting for the serial port. The logger is the only reader
@@ -89,6 +97,10 @@ static TEMPERATURE: Watch<CriticalSectionRawMutex, f64, 1> = Watch::new();
 /// A press that has been accepted and not yet acted on. The button
 /// task raises it; the breath task waits on it.
 static PRESS: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// A hold long enough to stop the chip. The button task raises it; the
+/// power task waits on it.
+static SLEEP: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// TIM5's registers, reached through the pointer the PAC hands out.
 /// The driver configures the timer once and only the interrupt handler
@@ -286,6 +298,33 @@ fn TIM5() {
     }
 }
 
+/// The button's interrupt: one vector shared by EXTI lines 10 to 15, of
+/// which this firmware uses one. The handler's whole job is to clear
+/// the pending bit. While the chip is awake the poll loop in
+/// `watch_button` is what acts on the press — this interrupt only stops
+/// itself from re-entering. While the chip is in Stop mode this
+/// interrupt is the wake-up: the line brings the core back, the handler
+/// runs, and the firmware continues where `enter_stop_mode` left off.
+#[cortex_m_rt::interrupt]
+fn EXTI15_10() {
+    clear_button_interrupt();
+}
+
+/// Clear the pending bit on EXTI line 13 — PC13's line — without
+/// owning the pin the line is wired to. The button task owns the pin,
+/// so the interrupt handler and the stop-mode entry both reach the
+/// line through the block's address instead.
+fn clear_button_interrupt() {
+    // Safety: `ptr()` hands out the EXTI block's address without
+    // checking ownership. The block exists at that address from reset
+    // onward. Writing a one to a pending bit is its documented clear
+    // condition, so this write touches line 13 and leaves the others
+    // exactly as they were.
+    unsafe {
+        (*pac::EXTI::ptr()).pr().write(|w| w.bits(1 << 13));
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let dp = pac::Peripherals::take().unwrap();
@@ -304,6 +343,11 @@ async fn main(spawner: Spawner) {
     // and every `Timer` in the firmware waits forever.
     rcc.apb1enr().modify(|_, w| w.tim5en().enabled());
 
+    // The PWR block is the same story: the HAL has no stop-mode API, so
+    // nothing else enables its clock, and a register write with the
+    // block's clock off does not land.
+    rcc.apb1enr().modify(|_, w| w.pwren().enabled());
+
     // The clock every task waits on comes up before anything can wait
     // on it: the driver configures TIM5 and unmasks its interrupt here,
     // and the first task is not spawned until that is done.
@@ -313,8 +357,32 @@ async fn main(spawner: Spawner) {
         NVIC::unmask(pac::Interrupt::TIM5);
     }
 
-    // PC13 is the board's user button, wired as step 5 left it.
-    let button = Button::new(gpioc.pc13.into_pull_up_input());
+    // The two blocks the EXTI setup writes: SYSCFG picks which pin
+    // feeds line 13, and EXTI holds the edge and mask bits themselves.
+    let mut syscfg = dp.SYSCFG.constrain(&mut rcc);
+    let mut exti = dp.EXTI;
+
+    // PC13 is the board's user button, wired as step 5 left it. The
+    // EXTI line behind the pin is armed here, once, and stays armed:
+    // it is what wakes the chip from Stop mode, and while the chip is
+    // awake it costs an interrupt whose only job is to clear a pending
+    // bit. The pin itself stays in the button task's hands, polled as
+    // before — the line and the poll see the same press, and only the
+    // poll acts on it.
+    let mut pc13 = gpioc.pc13.into_pull_up_input();
+    // The line has to be told which pin feeds it: SYSCFG's fourth
+    // external interrupt configuration register maps EXTI13 to port C.
+    pc13.make_interrupt_source(&mut syscfg);
+    // Both edges, so a release wakes the chip too. A press that is
+    // still held when the chip stops is no longer an edge — the line
+    // has already fallen — so without the rising edge the user would
+    // have to keep holding the button to keep the chip asleep.
+    pc13.trigger_on_edge(&mut exti, Edge::RisingFalling);
+    pc13.enable_interrupt(&mut exti);
+    let button = Button::new(pc13);
+    unsafe {
+        NVIC::unmask(pac::Interrupt::EXTI15_10);
+    }
 
     // TIM2's channel 1 is muxed onto PA5, the pin LD2 is wired to. The
     // pin changes jobs here: no longer an output the firmware writes
@@ -375,6 +443,14 @@ async fn main(spawner: Spawner) {
     spawner.spawn(watch_button(button).unwrap());
     spawner.spawn(read_sensor(sensor, &TEMPERATURE, &REPORTS).unwrap());
     spawner.spawn(report(tx, &REPORTS).unwrap());
+    // The power task owns the two blocks the stop-mode entry touches:
+    // the PWR registers, and the core's System Control Block, which is
+    // where the SLEEPDEEP bit lives. Taking them here rather than
+    // inside the task keeps every `take()` in the firmware in one
+    // place, and the executor's own idle — a `wfe` that sleeps shallowly
+    // — never sees the bit set.
+    let cp = cortex_m::peripheral::Peripherals::take().unwrap();
+    spawner.spawn(power(dp.PWR, cp.SCB, &REPORTS).unwrap());
 }
 
 /// The breath: one step of the ramp every ten milliseconds, and a
@@ -422,9 +498,15 @@ async fn breathe(
 }
 
 /// The button: one poll per millisecond, the same debounce step 5
-/// settled on, and one signal per accepted press.
+/// settled on, and one signal per accepted press. The hold counter is
+/// new: a press held for `HOLD_TICKS` raises `SLEEP`, and the power
+/// task is what acts on it.
 #[embassy_executor::task]
 async fn watch_button(mut button: Button<Pin<'C', 13>>) {
+    // Ticks the button has been held. Saturating rather than wrapping:
+    // a button held for an hour is still just a button held, and the
+    // count is not the signal — `HOLD_TICKS` is.
+    let mut held: u32 = 0;
     loop {
         if button.tick() {
             // The debouncer reports one event per accepted press. The
@@ -432,6 +514,16 @@ async fn watch_button(mut button: Button<Pin<'C', 13>>) {
             // arrives while the breath task is mid-tick waits there
             // until it looks.
             PRESS.signal(());
+        }
+        if button.pressed() {
+            held = held.saturating_add(1);
+            if held == HOLD_TICKS {
+                // A hold is not a press: the breath has already
+                // paused, and this says the chip should stop.
+                SLEEP.signal(());
+            }
+        } else {
+            held = 0;
         }
         Timer::after(Duration::from_millis(1)).await;
     }
@@ -486,8 +578,89 @@ async fn report(mut serial: Tx<pac::USART2>, reports: &'static Channel<CriticalS
                 writeln!(serial, "breath paused").ok();
                 defmt::info!("breath paused");
             }
+            Report::Awake => {
+                // No duration: the executor's clock stopped with the
+                // chip, so there is nothing honest to measure the
+                // sleep against. The record is the event, not the
+                // length.
+                writeln!(serial, "awake").ok();
+                defmt::info!("awake");
+            }
         }
     }
+}
+
+/// The chip's power state: the one task that stops the chip, and the
+/// only one that knows what woke it.
+///
+/// Everything else in the firmware runs whether or not anyone is
+/// watching. This task waits for a hold, stops the chip, and reports
+/// the wake-up — the shape a battery-powered build would give the
+/// whole firmware, with a clock in place of the finger.
+#[embassy_executor::task]
+async fn power(
+    mut pwr: pac::PWR,
+    mut scb: SCB,
+    reports: &'static Channel<CriticalSectionRawMutex, Report, 8>,
+) {
+    loop {
+        SLEEP.wait().await;
+        enter_stop_mode(&mut pwr, &mut scb);
+        reports.send(Report::Awake).await;
+    }
+}
+
+/// Put the chip in Stop mode, and return when the EXTI line on PC13
+/// wakes it.
+///
+/// Stop mode stops every clock in the 1.2 V domain — the CPU, every
+/// peripheral, and the HSI oscillator the whole firmware runs on —
+/// while the SRAM and the register contents survive (RM0368 § 5.3.4).
+/// What brings the chip back is the line armed on PC13 in `main`: any
+/// enabled EXTI line wakes the chip from Stop mode, and that line is
+/// enabled.
+///
+/// The clock the executor keeps time with stops with the chip: TIM5 is
+/// on APB1, and APB1 is inside the stopped domain. Every `Timer` that
+/// was pending when the chip stopped comes due late, by however long
+/// the chip was stopped — the counter resumes where it froze instead
+/// of catching up, so nothing is lost and nothing is on time. A
+/// firmware that needs to know the time across a stop has to move its
+/// time driver to the RTC, which keeps counting on its own crystal;
+/// that is a bigger change than this step makes, and it is why the
+/// wake-up report carries no duration.
+fn enter_stop_mode(pwr: &mut pac::PWR, scb: &mut SCB) {
+    // One write picks the flavour of Stop: PDDS clear for Stop rather
+    // than Standby, LPDS for the low-power regulator, FPDS to power the
+    // flash down with it. That combination is STOP LPFPD in RM0368's
+    // Table 18 — the slowest to wake and the cheapest to run, 12 µA
+    // typical at 3.3 V and 25 °C (DS10086, Table 28) against 42 µA
+    // with the flash left running. The rest of the register — VOS, the
+    // PVD, the backup domain — is read-modify-written back unchanged.
+    pwr.cr()
+        .modify(|_, w| w.pdds().enter_stop().lpds().low_power().fpds().power_down());
+
+    // A bounce that arrived while the hold was being recognised has
+    // left a pending bit behind, and WFI with a pending interrupt
+    // returns at once instead of sleeping. Clearing the line's bit and
+    // the NVIC's makes the stop the default; an edge that lands after
+    // this still wins, which is the right outcome — something
+    // happened.
+    NVIC::unpend(pac::Interrupt::EXTI15_10);
+    clear_button_interrupt();
+
+    // SLEEPDEEP is what makes the next WFI a deep sleep. The
+    // executor's idle is a `wfe`, which sleeps shallowly; setting the
+    // bit here and clearing it on the way out is what keeps the two
+    // apart, so the executor can never stop the chip by accident.
+    scb.set_sleepdeep();
+    cortex_m::asm::wfi();
+    scb.clear_sleepdeep();
+
+    // The wake-up flag says the chip came back from a low-power mode.
+    // Clearing it here leaves the next Stop starting from a clean
+    // slate, so a stale flag can never be mistaken for a fresh wake.
+    pwr.cr().modify(|_, w| w.cwuf().clear());
 }
 
 /// A button that reports one event per accepted press.
@@ -516,6 +689,13 @@ impl<I: InputPin> Button<I> {
             pressed: false,
             held: 0,
         }
+    }
+
+    /// Whether the debouncer believes the button is down right now.
+    /// The hold counter needs this: `tick` reports edges, and a hold is
+    /// not an edge — it is a level that lasts.
+    fn pressed(&self) -> bool {
+        self.pressed
     }
 
     /// One tick of the poll loop. Returns `true` on the tick a press is

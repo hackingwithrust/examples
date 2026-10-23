@@ -2,14 +2,13 @@
 
 Track: <https://hackingwithrust.com/projects/embedded-stm32/>
 
-**Status: article 7 of 10.** The firmware reads PC13 — the board's user button, B1 — and
-toggles a breathing pattern on PA5, the user LED LD2: the duty ramps up and down, and each
-accepted press pauses or resumes the breath. A press counts once the line has held its new
-level for ten 1 ms ticks, so contact bounce does not register. It also reads a BMP280 sensor
-over I2C1 (PB8/PB9) every half second and lets the temperature set how fast the breath runs.
-It carries its own panic handler: a panic lights LD2 and leaves it lit — the same look a
-sensor that does not answer gets at start-up. The next step gives readings a channel to be
-printed on.
+**Status: article 10 of 10.** Four embassy tasks run the board: a breath on PA5 (LD2), the
+button on PC13 (B1), a BMP280 over I2C1 (PB8/PB9) and a logger on USART2 plus defmt-RTT. An
+accepted press pauses or resumes the breath — a press counts once the line has held its new
+level for ten 1 ms ticks, so contact bounce does not register — and the temperature sets how
+fast the breath runs. Holding B1 for two seconds puts the chip in Stop mode: every clock
+stops, the SRAM survives, and the EXTI line on PC13 brings it back. The firmware carries its
+own panic handler: a panic lights LD2 and leaves it lit.
 
 Tags: `stm32-ch02` … `stm32-ch10`.
 
