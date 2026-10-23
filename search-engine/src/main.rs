@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -5,15 +6,16 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-/// One entry in a term's postings list: the document, and how many
-/// times the term appears in it.
+/// One entry in a term's postings list: the document, and where each
+/// occurrence of the term sits in it.
 #[derive(Debug, PartialEq)]
 struct Posting {
     /// The document this posting refers to.
     doc: u32,
-    /// How many times the term occurs in that document. At least one:
-    /// a posting exists because the term is there.
-    tf: u32,
+    /// Where each occurrence sits in the document's term sequence,
+    /// ascending. One position per occurrence, so the term frequency
+    /// is the length of this list.
+    positions: Vec<u32>,
 }
 
 /// One document the index has seen: the path it was indexed under,
@@ -46,10 +48,18 @@ impl Index {
     /// Index one document. `path` is its id; `text` is its contents.
     /// Returns the id the document was given.
     fn add_document(&mut self, path: &str, text: &str) -> u32 {
-        // The terms this document contributes, sorted so that equal
-        // terms sit next to each other and can be counted in runs.
-        let mut terms: Vec<String> = tokenize(text).collect();
-        terms.sort_unstable();
+        // The terms this document contributes, each tagged with its
+        // position: the index of the term in the sequence the
+        // tokeniser produced. Positions are attached before the sort,
+        // because the sort is about the dictionary and the positions
+        // are about the document.
+        let mut terms: Vec<(u32, String)> = tokenize(text)
+            .enumerate()
+            .map(|(position, term)| (position as u32, term))
+            .collect();
+        // Sorted by term, then position, so one term's occurrences sit
+        // next to each other in position order.
+        terms.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
         let id = self.documents.len() as u32;
         self.documents.push(Document {
@@ -57,13 +67,16 @@ impl Index {
             length: terms.len() as u32,
         });
 
-        // Each distinct term becomes one posting, carrying the size of
-        // its run as the term frequency.
-        for (term, tf) in count_terms(&terms) {
+        // Each distinct term becomes one posting, carrying its run's
+        // positions — the count of which is the term frequency.
+        for (term, run) in count_terms(&terms) {
             self.postings
                 .entry(term.to_string())
                 .or_default()
-                .push(Posting { doc: id, tf });
+                .push(Posting {
+                    doc: id,
+                    positions: run,
+                });
         }
 
         id
@@ -77,6 +90,60 @@ impl Index {
     /// holds "borrow". Normalising the query is the caller's job.
     fn search(&self, term: &str) -> &[Posting] {
         self.postings.get(term).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The posting for `term` in `doc`, when the document contains
+    /// the term. The postings list is ascending in document id, so
+    /// this is a binary search rather than a scan.
+    fn posting(&self, term: &str, doc: u32) -> Option<&Posting> {
+        let postings = self.search(term);
+        let found = postings.binary_search_by_key(&doc, |p| p.doc);
+        found.ok().map(|i| &postings[i])
+    }
+
+    /// Where each occurrence of `term` sits in document `doc`'s term
+    /// sequence. Empty when the document does not contain the term.
+    fn positions(&self, term: &str, doc: u32) -> &[u32] {
+        match self.posting(term, doc) {
+            Some(p) => &p.positions,
+            None => &[],
+        }
+    }
+
+    /// The documents where `terms` appear one after another, in
+    /// order: the phrase "borrow checker" matches "the borrow checker
+    /// enforces" and not "the checker borrows".
+    ///
+    /// The terms are the normalised ones — what the index holds, not
+    /// what the reader typed. An empty phrase matches nothing: there
+    /// is no adjacency to find.
+    fn phrase(&self, terms: &[&str]) -> Vec<u32> {
+        // A document can only match if it holds every term, so the
+        // candidates are the first term's postings: every document
+        // the phrase matches is in that list.
+        let Some(first) = terms.first() else {
+            return Vec::new();
+        };
+        let mut matches = Vec::new();
+        'postings: for posting in self.search(first) {
+            // One occurrence of the first term has to be followed by
+            // the second one position later, the third two later,
+            // and so on.
+            for &start in &posting.positions {
+                let consecutive = terms[1..]
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, term)| {
+                        self.positions(term, posting.doc)
+                            .contains(&(start + 1 + offset as u32))
+                    });
+                if consecutive {
+                    matches.push(posting.doc);
+                    continue 'postings;
+                }
+            }
+        }
+        matches
     }
 
     /// The path a document was indexed under.
@@ -128,7 +195,7 @@ impl Index {
     /// from step 5 — times BM25's term-frequency component: a count that
     /// saturates as it grows, over a length measured against the
     /// collection average. A query with several terms sums one
-    /// contribution per term; this step asks about one at a time.
+    /// contribution per term; this method asks about one at a time.
     ///
     /// Equal scores keep the input order, and postings arrive in
     /// ascending document order, so ties come out in document order.
@@ -139,10 +206,11 @@ impl Index {
         let mut ranked: Vec<(u32, u32, f64)> = postings
             .iter()
             .map(|p| {
+                let tf = p.positions.len() as u32;
                 (
                     p.doc,
-                    p.tf,
-                    weight * tf_score(p.tf, self.length(p.doc) as f64, avgdl, K1, B),
+                    tf,
+                    weight * tf_score(tf, self.length(p.doc) as f64, avgdl, K1, B),
                 )
             })
             .collect();
@@ -151,6 +219,170 @@ impl Index {
         // keep the order they arrived in.
         ranked.sort_by(|a, b| b.2.total_cmp(&a.2));
         ranked
+    }
+
+    /// BM25 for every document in `docs`, summing one contribution per
+    /// term in `terms`: a query about two terms scores a document by
+    /// both, which is what makes a multi-term query rank.
+    ///
+    /// Best first. Equal scores keep the input order — and the input is
+    /// ascending document ids, from the set operations below — so ties
+    /// come out in document order, the same rule `rank` follows.
+    fn score(&self, docs: &[u32], terms: &[&str]) -> Vec<(u32, f64)> {
+        let avgdl = self.average_length();
+        // One weight per term, worked out once: the idf depends on how
+        // many documents hold the term, not on which document is being
+        // scored.
+        let weights: Vec<f64> = terms
+            .iter()
+            .map(|term| idf(self.search(term).len(), self.documents()))
+            .collect();
+        let mut scored: Vec<(u32, f64)> = docs
+            .iter()
+            .map(|&doc| {
+                let total: f64 = terms
+                    .iter()
+                    .zip(&weights)
+                    .map(|(term, weight)| {
+                        let tf = self.positions(term, doc).len() as u32;
+                        weight * tf_score(tf, self.length(doc) as f64, avgdl, K1, B)
+                    })
+                    .sum();
+                (doc, total)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        scored
+    }
+
+    /// The documents one query token matches, and the terms it scores
+    /// by.
+    ///
+    /// A quoted token is a phrase: its words go through the tokeniser,
+    /// so stop words drop out and what is left has to be adjacent. A
+    /// bare word is one word, normalised the same way — and a word
+    /// that normalises to several terms ("borrow-checker") is the
+    /// phrase they form, because that is what the hyphen meant in the
+    /// text.
+    fn operand(&self, token: &str) -> (BTreeSet<u32>, Vec<String>) {
+        let text = token
+            .strip_prefix('"')
+            .map(|inside| inside.strip_suffix('"').unwrap_or(inside))
+            .unwrap_or(token);
+        let terms: Vec<String> = tokenize(text).collect();
+        let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+        let docs = match refs.as_slice() {
+            [] => BTreeSet::new(),
+            [only] => self.search(only).iter().map(|p| p.doc).collect(),
+            phrase => self.phrase(phrase).into_iter().collect(),
+        };
+        (docs, terms)
+    }
+
+    /// Evaluate a boolean query: the documents that match, and the
+    /// terms their scores come from.
+    ///
+    /// The grammar is terms, "quoted phrases", and the operators AND,
+    /// OR and NOT, evaluated left to right with equal precedence —
+    /// "a OR b AND c" is "(a OR b) AND c", which is not how Lucene
+    /// reads it. NOT applies to the operand that follows it, and
+    /// between two operands it reads as AND: "borrow NOT checker" is
+    /// "borrow AND NOT checker". Two operands with no operator
+    /// between them mean AND as well, so "borrow checker" and
+    /// "borrow AND checker" ask the same question.
+    fn evaluate(&self, query: &str) -> Result<Matches, QueryError> {
+        let tokens = query_tokens(query);
+        if tokens.is_empty() {
+            return Err(QueryError::Empty);
+        }
+
+        let mut matched: Option<BTreeSet<u32>> = None;
+        let mut terms: Vec<String> = Vec::new();
+        // The operator waiting for its right-hand operand. AND is the
+        // default: two operands in a row are ANDed.
+        let mut op = Operator::And;
+        let mut negate = false;
+        // Whether the next token has to be an operand. True at the
+        // start — a query opens with an operand, NOT may come first —
+        // and true again after every operator.
+        let mut want_operand = true;
+
+        for token in tokens {
+            if !token.starts_with('"') {
+                match token.as_str() {
+                    "AND" | "OR" => {
+                        if want_operand {
+                            // Two operators in a row, or a query that
+                            // opens with one.
+                            return Err(QueryError::DanglingOperator);
+                        }
+                        op = if token == "AND" {
+                            Operator::And
+                        } else {
+                            Operator::Or
+                        };
+                        want_operand = true;
+                        continue;
+                    }
+                    "NOT" => {
+                        negate = !negate;
+                        want_operand = true;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
+            let (docs, operand_terms) = self.operand(&token);
+            let negated = negate;
+            negate = false;
+            let docs = if negated {
+                // NOT is the complement inside the collection: every
+                // document the index has, minus the operand's.
+                let all: BTreeSet<u32> = (0..self.documents() as u32).collect();
+                all.difference(&docs).copied().collect()
+            } else {
+                docs
+            };
+            matched = Some(match matched {
+                None => docs,
+                Some(so_far) => match op {
+                    Operator::And => so_far.intersection(&docs).copied().collect(),
+                    Operator::Or => so_far.union(&docs).copied().collect(),
+                },
+            });
+            if !negated {
+                terms.extend(operand_terms);
+            }
+            op = Operator::And;
+            want_operand = false;
+        }
+
+        if want_operand {
+            // The query ended on an operator, or on a NOT.
+            return Err(QueryError::DanglingOperator);
+        }
+        Ok(Matches {
+            docs: matched.into_iter().flatten().collect(),
+            terms,
+        })
+    }
+
+    /// The documents a boolean query matches, ascending.
+    fn boolean(&self, query: &str) -> Result<Vec<u32>, QueryError> {
+        Ok(self.evaluate(query)?.docs)
+    }
+
+    /// Run a query and rank what it matched by BM25 over the query's
+    /// positive terms.
+    ///
+    /// A query with no positive terms — "NOT checker", say — still
+    /// returns its documents, but every score is zero and the order is
+    /// document order: there is nothing to rank on.
+    fn query(&self, query: &str) -> Result<Vec<(u32, f64)>, QueryError> {
+        let matches = self.evaluate(query)?;
+        let refs: Vec<&str> = matches.terms.iter().map(String::as_str).collect();
+        Ok(self.score(&matches.docs, &refs))
     }
 
     /// Write the index to `path` as one binary file: the magic and the
@@ -175,7 +407,10 @@ impl Index {
             out.extend_from_slice(&(postings.len() as u32).to_le_bytes());
             for posting in postings {
                 out.extend_from_slice(&posting.doc.to_le_bytes());
-                out.extend_from_slice(&posting.tf.to_le_bytes());
+                out.extend_from_slice(&(posting.positions.len() as u32).to_le_bytes());
+                for position in &posting.positions {
+                    out.extend_from_slice(&position.to_le_bytes());
+                }
             }
         }
         fs::write(path, out)
@@ -215,7 +450,11 @@ impl Index {
             let mut previous: Option<u32> = None;
             for _ in 0..reader.u32()? {
                 let doc = reader.u32()?;
-                let tf = reader.u32()?;
+                let count = reader.u32()? as usize;
+                let mut positions = Vec::with_capacity(count);
+                for _ in 0..count {
+                    positions.push(reader.u32()?);
+                }
                 // Step 2 promised ascending, duplicate-free lists, and
                 // the ranker assumes it: a hand-edited file that breaks
                 // the order is refused here rather than trusted.
@@ -223,7 +462,7 @@ impl Index {
                     return Err(LoadError::BadPostings(term));
                 }
                 previous = Some(doc);
-                postings.push(Posting { doc, tf });
+                postings.push(Posting { doc, positions });
             }
             index.postings.insert(term, postings);
         }
@@ -234,18 +473,94 @@ impl Index {
     }
 }
 
+/// How the next operand combines with the documents matched so far.
+/// Two operands in a row mean AND, so this is also the default.
+#[derive(Clone, Copy, PartialEq)]
+enum Operator {
+    And,
+    Or,
+}
+
+/// What can be wrong with a query. A query is typed by a person, so it
+/// can be malformed in ways an index file cannot.
+#[derive(Debug)]
+enum QueryError {
+    /// Nothing to ask: the query holds no operands at all.
+    Empty,
+    /// An operator with nothing on one side of it: the query opens
+    /// with AND or OR, ends with an operator or a NOT, or has two
+    /// operators in a row.
+    DanglingOperator,
+}
+
+impl fmt::Display for QueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            QueryError::Empty => write!(f, "the query is empty"),
+            QueryError::DanglingOperator => {
+                write!(f, "an operator in this query is missing its operand")
+            }
+        }
+    }
+}
+
+impl Error for QueryError {}
+
+/// What a query matched: the documents, and the terms their scores are
+/// built from. A NOT'ed operand's terms are left out — they selected
+/// documents to remove, not documents to rank.
+struct Matches {
+    docs: Vec<u32>,
+    terms: Vec<String>,
+}
+
+/// Split a query into tokens: bare words, "quoted phrases", and the
+/// operators AND, OR and NOT. The operators are capitals only, so a
+/// document about the word "and" stays searchable. Whitespace between
+/// tokens is dropped; whitespace inside quotes is kept, and the quotes
+/// stay on the token so the parser can tell `"borrow checker"` — one
+/// phrase — from `borrow checker` — two terms with AND between them.
+fn query_tokens(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut in_quotes = false;
+    for c in query.chars() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+            token.push(c);
+            if !in_quotes {
+                // A closing quote ends the token even mid-word.
+                tokens.push(std::mem::take(&mut token));
+            }
+        } else if c.is_whitespace() && !in_quotes {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+        } else {
+            token.push(c);
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
 /// Count a sorted term list in runs: each distinct term once, with the
-/// number of times it occurred. ["dog", "fox", "fox", "fox"] counts
-/// "dog" once and "fox" three times.
-fn count_terms(sorted: &[String]) -> Vec<(&str, u32)> {
+/// positions of its occurrences. [("fox", 0), ("dog", 1), ("fox", 2)]
+/// counts "fox" at positions 0 and 2, and "dog" at 1.
+fn count_terms(sorted: &[(u32, String)]) -> Vec<(&str, Vec<u32>)> {
     let mut counts = Vec::new();
     let mut start = 0;
     while start < sorted.len() {
         let mut end = start + 1;
-        while end < sorted.len() && sorted[end] == sorted[start] {
+        while end < sorted.len() && sorted[end].1 == sorted[start].1 {
             end += 1;
         }
-        counts.push((sorted[start].as_str(), (end - start) as u32));
+        // The run is in position order — the sort put it there — so the
+        // positions come out ascending.
+        let positions: Vec<u32> = sorted[start..end].iter().map(|(pos, _)| *pos).collect();
+        counts.push((sorted[start].1.as_str(), positions));
         start = end;
     }
     counts
@@ -391,10 +706,11 @@ impl<'a> Reader<'a> {
 const MAGIC: &[u8] = b"haystack";
 
 /// The format version. A file announcing any other number is refused.
-/// Version 2 adds a length to every document and a term frequency to
-/// every posting; a version 1 file has neither, and this build will
-/// not guess them.
-const VERSION: u32 = 2;
+/// Version 2 added a length to every document and a term frequency to
+/// every posting; version 3 keeps the lengths and replaces the
+/// frequency with the positions of each occurrence — the frequency is
+/// their count, and a file carrying both could disagree with itself.
+const VERSION: u32 = 3;
 
 /// Where the demo writes its index. The file is output, not source: it
 /// is gitignored and rebuilt by every run.
@@ -466,23 +782,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         loaded.terms()
     );
 
-    // What a posting carries now: the document, how often the term
-    // appears in it, and how long the document is.
-    println!("\npostings for \"borrow\" — term frequency, then document length:");
+    // What a posting carries now: the document, and where each
+    // occurrence sits in it.
+    println!("\npostings for \"borrow\" — count, then positions:");
     for posting in loaded.search("borrow") {
         println!(
-            "  {:<26} tf={}  len={}",
+            "  {:<26} tf={}  positions={:?}",
             loaded.path(posting.doc),
-            posting.tf,
-            loaded.length(posting.doc)
+            posting.positions.len(),
+            posting.positions
         );
     }
 
-    println!(
-        "\naverage document length: {:.2} terms",
-        loaded.average_length()
-    );
-
+    // The single-term ranker from step 6, unchanged: the scores are
+    // the same, now read off the position counts.
     println!("\nquery \"borrow\", ranked by BM25:");
     for (doc, tf, score) in loaded.rank("borrow") {
         println!(
@@ -492,21 +805,55 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    println!("\nquery \"owner\", ranked by BM25:");
-    for (doc, tf, score) in loaded.rank("owner") {
-        println!(
-            "  {score:>7.4}  {:<26} tf={tf}  len={}",
-            loaded.path(doc),
-            loaded.length(doc)
-        );
+    // A phrase is a different question from its terms: the words have
+    // to be next to each other, in order.
+    println!("\nphrase \"borrow checker\":");
+    for doc in loaded.phrase(&["borrow", "checker"]) {
+        println!("  {}", loaded.path(doc));
+    }
+    println!("phrase \"checker borrow\" — the other order:");
+    if loaded.phrase(&["checker", "borrow"]).is_empty() {
+        println!("  no documents");
+    }
+
+    // AND only asks whether both terms are there. The phrase also
+    // asks where: "value" and "owner" share two documents, but sit
+    // next to each other in neither.
+    println!("\n\"value AND owner\":");
+    for doc in loaded.boolean("value AND owner").unwrap() {
+        println!("  {}", loaded.path(doc));
+    }
+    println!("phrase \"value owner\":");
+    if loaded.phrase(&["value", "owner"]).is_empty() {
+        println!("  no documents");
+    }
+
+    for query in ["borrow AND checker", "borrow OR value", "borrow NOT lifetime"] {
+        println!("\nquery \"{query}\":");
+        match loaded.query(query) {
+            Ok(ranked) => {
+                for (doc, score) in ranked {
+                    println!("  {score:>7.4}  {}", loaded.path(doc));
+                }
+            }
+            Err(e) => println!("  {e}"),
+        }
+    }
+
+    // The query grammar refuses an operator with nothing on one side
+    // of it, rather than guessing what was meant.
+    println!("\nquery \"borrow AND\":");
+    if let Err(e) = loaded.query("borrow AND") {
+        println!("  {e}");
     }
 
     // The version field, doing its job: the same file with the version
-    // patched to 1 is a file this build does not read.
+    // patched to 2 — the format this step replaced — is a file this
+    // build does not read.
     let mut stale = written.clone();
-    stale[8..12].copy_from_slice(&1u32.to_le_bytes());
+    stale[8..12].copy_from_slice(&2u32.to_le_bytes());
     if let Err(e) = Index::load_bytes(&stale) {
-        println!("\na version 1 file: {e}");
+        println!("\na version 2 file: {e}");
     }
 
     Ok(())
@@ -618,6 +965,15 @@ mod tests {
         index
     }
 
+    /// Three documents: "fox" alone, "dog" alone, and both.
+    fn three_docs() -> Index {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox");
+        index.add_document("b.md", "dog");
+        index.add_document("c.md", "fox dog");
+        index
+    }
+
     /// The document ids in a term's postings, for the tests that only
     /// care which documents matched.
     fn ids(index: &Index, term: &str) -> Vec<u32> {
@@ -645,18 +1001,61 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_term_records_how_often_it_repeated() {
+    fn a_repeated_term_records_where_each_copy_sits() {
         let mut index = Index::new();
         index.add_document("a.md", "fox fox fox");
-        assert_eq!(index.search("fox"), &[Posting { doc: 0, tf: 3 }]);
+        assert_eq!(
+            index.search("fox"),
+            &[Posting {
+                doc: 0,
+                positions: vec![0, 1, 2],
+            }]
+        );
     }
 
     #[test]
     fn distinct_terms_in_one_document_get_one_posting_each() {
         let mut index = Index::new();
         index.add_document("a.md", "fox dog fox");
-        assert_eq!(index.search("fox"), &[Posting { doc: 0, tf: 2 }]);
-        assert_eq!(index.search("dog"), &[Posting { doc: 0, tf: 1 }]);
+        assert_eq!(
+            index.search("fox"),
+            &[Posting {
+                doc: 0,
+                positions: vec![0, 2],
+            }]
+        );
+        assert_eq!(
+            index.search("dog"),
+            &[Posting {
+                doc: 0,
+                positions: vec![1],
+            }]
+        );
+    }
+
+    #[test]
+    fn the_term_frequency_is_the_position_count() {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox dog fox bird fox");
+        assert_eq!(index.positions("fox", 0), [0, 2, 4]);
+    }
+
+    #[test]
+    fn positions_are_ascending() {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox dog cat fox bird fox");
+        let positions = index.positions("fox", 0);
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn positions_skip_the_stop_words_around_them() {
+        let mut index = Index::new();
+        // "the" is dropped, so "fox" is the first term the index sees
+        // and sits at position 0.
+        index.add_document("a.md", "the fox and the dog");
+        assert_eq!(index.positions("fox", 0), [0]);
+        assert_eq!(index.positions("dog", 0), [1]);
     }
 
     #[test]
@@ -847,6 +1246,184 @@ mod tests {
         assert_eq!(Index::new().average_length(), 0.0);
     }
 
+    // --- phrase queries ---
+
+    #[test]
+    fn a_phrase_matches_adjacent_terms_in_order() {
+        let mut index = Index::new();
+        index.add_document("a.md", "the quick brown fox");
+        assert_eq!(index.phrase(&["quick", "brown"]), [0]);
+        // The other order is a different phrase.
+        assert_eq!(index.phrase(&["brown", "quick"]), []);
+    }
+
+    #[test]
+    fn a_phrase_needs_the_terms_next_to_each_other() {
+        let mut index = Index::new();
+        index.add_document("a.md", "quick brown fox");
+        assert!(index.phrase(&["quick", "fox"]).is_empty());
+    }
+
+    #[test]
+    fn a_phrase_matches_inside_a_longer_document() {
+        let mut index = Index::new();
+        index.add_document("a.md", "one two borrow checker three four");
+        assert_eq!(index.phrase(&["borrow", "checker"]), [0]);
+    }
+
+    #[test]
+    fn a_phrase_across_several_documents() {
+        let mut index = Index::new();
+        index.add_document("a.md", "borrow checker");
+        index.add_document("b.md", "checker borrow");
+        index.add_document("c.md", "nothing here");
+        assert_eq!(index.phrase(&["borrow", "checker"]), [0]);
+    }
+
+    /// Stop words are dropped before positions are counted, so a
+    /// phrase can match across one: "owner value" finds "owner of the
+    /// value". That is the trade-off step 3's tokeniser made, showing
+    /// up here.
+    #[test]
+    fn a_phrase_can_match_across_a_dropped_stop_word() {
+        let mut index = Index::new();
+        index.add_document("a.md", "the owner of the value");
+        assert_eq!(index.phrase(&["owner", "value"]), [0]);
+    }
+
+    #[test]
+    fn an_empty_phrase_matches_nothing() {
+        let index = Index::new();
+        assert!(index.phrase(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_one_word_phrase_is_that_words_postings() {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox");
+        index.add_document("b.md", "dog fox");
+        assert_eq!(index.phrase(&["fox"]), [0, 1]);
+    }
+
+    // --- boolean queries ---
+
+    #[test]
+    fn and_keeps_the_documents_with_both_terms() {
+        let index = three_docs();
+        assert_eq!(index.boolean("fox AND dog").unwrap(), [2]);
+    }
+
+    #[test]
+    fn or_keeps_the_documents_with_either_term() {
+        let index = three_docs();
+        assert_eq!(index.boolean("fox OR dog").unwrap(), [0, 1, 2]);
+    }
+
+    #[test]
+    fn not_removes_the_documents_with_the_term() {
+        let index = three_docs();
+        assert_eq!(index.boolean("fox NOT dog").unwrap(), [0]);
+        assert_eq!(index.boolean("NOT fox").unwrap(), [1]);
+    }
+
+    #[test]
+    fn two_terms_with_no_operator_mean_and() {
+        let index = three_docs();
+        assert_eq!(
+            index.boolean("fox dog").unwrap(),
+            index.boolean("fox AND dog").unwrap()
+        );
+    }
+
+    /// The documented evaluation order: left to right, equal
+    /// precedence. "fox OR dog AND cat" is "(fox OR dog) AND cat".
+    #[test]
+    fn operators_evaluate_left_to_right() {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox");
+        index.add_document("b.md", "dog");
+        index.add_document("c.md", "cat");
+        index.add_document("d.md", "fox cat");
+        // (fox OR dog) AND cat: a and b drop out for want of "cat",
+        // d has both. The other reading would also return a.
+        assert_eq!(index.boolean("fox OR dog AND cat").unwrap(), [3]);
+    }
+
+    #[test]
+    fn a_quoted_phrase_needs_adjacency_but_the_same_words_do_not() {
+        let mut index = Index::new();
+        index.add_document("a.md", "borrow checker");
+        index.add_document("b.md", "checker and borrow far apart");
+        // b holds both terms, but not next to each other.
+        assert_eq!(index.boolean("\"borrow checker\"").unwrap(), [0]);
+        assert_eq!(index.boolean("borrow checker").unwrap(), [0, 1]);
+    }
+
+    /// A hyphenated word is one word that normalises to two terms, so
+    /// the query treats it as the phrase they form — which is what
+    /// the hyphen meant in the text.
+    #[test]
+    fn a_hyphenated_word_is_a_phrase_in_disguise() {
+        let mut index = Index::new();
+        index.add_document("a.md", "borrow checker");
+        index.add_document("b.md", "checker borrow");
+        assert_eq!(index.boolean("borrow-checker").unwrap(), [0]);
+    }
+
+    #[test]
+    fn a_stop_word_in_a_query_matches_nothing() {
+        let index = three_docs();
+        assert!(index.boolean("the").unwrap().is_empty());
+        // An empty set on the right of an OR changes nothing.
+        assert_eq!(index.boolean("fox OR the").unwrap(), [0, 2]);
+    }
+
+    #[test]
+    fn double_negation_cancels() {
+        let index = three_docs();
+        assert_eq!(index.boolean("NOT NOT fox").unwrap(), [0, 2]);
+    }
+
+    #[test]
+    fn a_query_that_breaks_the_grammar_is_refused() {
+        let index = three_docs();
+        assert!(index.boolean("fox AND").is_err());
+        assert!(index.boolean("AND fox").is_err());
+        assert!(index.boolean("fox NOT").is_err());
+        assert!(index.boolean("fox AND OR dog").is_err());
+    }
+
+    #[test]
+    fn an_empty_query_is_refused() {
+        let index = three_docs();
+        assert!(index.boolean("").is_err());
+        assert!(index.boolean("   ").is_err());
+    }
+
+    #[test]
+    fn a_multi_term_query_sums_one_contribution_per_term() {
+        let index = three_docs();
+        let both = index.query("fox AND dog").unwrap();
+        let fox = index.query("fox").unwrap();
+        let dog = index.query("dog").unwrap();
+        // The document with both terms scores the sum of what each
+        // term alone gives it.
+        let both_score = both.iter().find(|(doc, _)| *doc == 2).unwrap().1;
+        let fox_score = fox.iter().find(|(doc, _)| *doc == 2).unwrap().1;
+        let dog_score = dog.iter().find(|(doc, _)| *doc == 2).unwrap().1;
+        assert!((both_score - (fox_score + dog_score)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_query_with_no_positive_terms_scores_zero() {
+        let index = three_docs();
+        // "NOT fox" removes the documents to rank by, so the one that
+        // is left has nothing to score on.
+        let ranked = index.query("NOT fox").unwrap();
+        assert_eq!(ranked.iter().map(|(doc, _)| *doc).collect::<Vec<_>>(), [1]);
+        assert_eq!(ranked[0].1, 0.0);
+    }
+
     /// A scratch path in the OS temp directory. Each test picks its own
     /// name, so the tests can run in parallel.
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -871,19 +1448,28 @@ mod tests {
     }
 
     #[test]
-    fn a_terms_frequency_survives_a_reload() {
+    fn a_terms_positions_survive_a_reload() {
         let mut index = Index::new();
         index.add_document("a.md", "fox fox fox");
         index.add_document("b.md", "fox");
-        let path = scratch("frequencies");
+        let path = scratch("positions");
         index.save(&path).unwrap();
         let loaded = Index::load(&path).unwrap();
         assert_eq!(
             loaded.search("fox"),
-            &[Posting { doc: 0, tf: 3 }, Posting { doc: 1, tf: 1 }]
+            &[
+                Posting {
+                    doc: 0,
+                    positions: vec![0, 1, 2],
+                },
+                Posting {
+                    doc: 1,
+                    positions: vec![0],
+                },
+            ]
         );
-        assert_eq!(loaded.length(0), 3);
-        assert_eq!(loaded.length(1), 1);
+        // A document that does not hold the term has no positions.
+        assert!(loaded.positions("fox", 2).is_empty());
     }
 
     #[test]
@@ -915,8 +1501,11 @@ mod tests {
         let mut terms = Vec::new();
         for _ in 0..reader.u32().unwrap() {
             let term = reader.string().unwrap();
-            let ids = reader.u32().unwrap();
-            reader.take(ids as usize * 8).unwrap(); // doc and tf, four bytes each
+            for _ in 0..reader.u32().unwrap() {
+                reader.u32().unwrap(); // the document
+                let count = reader.u32().unwrap(); // how many positions
+                reader.take(count as usize * 4).unwrap(); // the positions
+            }
             terms.push(term);
         }
         assert!(
@@ -954,9 +1543,9 @@ mod tests {
     fn a_newer_version_is_refused() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
         let error = Index::load_bytes(&bytes).unwrap_err();
-        assert_eq!(error.to_string(), "unsupported index version 3");
+        assert_eq!(error.to_string(), "unsupported index version 4");
     }
 
     #[test]
@@ -966,6 +1555,18 @@ mod tests {
         bytes.extend_from_slice(&1u32.to_le_bytes());
         let error = Index::load_bytes(&bytes).unwrap_err();
         assert_eq!(error.to_string(), "unsupported index version 1");
+    }
+
+    /// The format this step replaced. A version 2 file has term
+    /// frequencies where the positions are now, and this build does
+    /// not read it.
+    #[test]
+    fn a_version_2_file_is_refused() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        let error = Index::load_bytes(&bytes).unwrap_err();
+        assert_eq!(error.to_string(), "unsupported index version 2");
     }
 
     #[test]
@@ -979,9 +1580,11 @@ mod tests {
         bytes.push(b'x');
         bytes.extend_from_slice(&2u32.to_le_bytes()); // two postings
         bytes.extend_from_slice(&2u32.to_le_bytes()); // document 2
-        bytes.extend_from_slice(&1u32.to_le_bytes()); // term frequency 1
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // one position
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // position 0
         bytes.extend_from_slice(&1u32.to_le_bytes()); // document 1 — out of order
-        bytes.extend_from_slice(&1u32.to_le_bytes()); // term frequency 1
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // one position
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // position 0
         let error = Index::load_bytes(&bytes).unwrap_err();
         assert_eq!(
             error.to_string(),
