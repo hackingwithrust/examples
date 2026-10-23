@@ -2,7 +2,7 @@
 
 Track: <https://hackingwithrust.com/projects/search-engine/>
 
-**Status: step 7 of 12 published.**
+**Status: step 8 of 12 published.**
 
 Tags: `search-ch02` … `search-ch12`. See [`../README.md`](../README.md) for what the tags mean.
 
@@ -25,3 +25,9 @@ Since step 7, every posting carries the positions of its occurrences, and the
 demo answers phrase queries ("borrow checker") and boolean queries (AND, OR,
 NOT). The index file is version 3: every document carries its length, and every
 posting carries a position per occurrence — the term frequency is their count.
+
+Since step 8, a query word can carry a tilde — `borow~` — and the engine
+searches the dictionary by edit distance instead of looking the term up,
+so a typo finds what it was aiming at. The default radius is two edits,
+`borow~1` asks for one, and the grammar refuses a radius it does not
+have rather than guessing.

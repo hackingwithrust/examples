@@ -110,6 +110,29 @@ impl Index {
         }
     }
 
+    /// Every dictionary term within `max` edits of `term`, nearest
+    /// first, each with its distance.
+    ///
+    /// This step's whole idea: the query term is not in the dictionary
+    /// — a typo guarantees it — so the dictionary is searched instead
+    /// of looked up. The exact term is its own neighbour, at distance
+    /// zero.
+    ///
+    /// The order is deterministic. HashMap iteration is not, so the
+    /// hits are sorted by distance and then by term.
+    fn fuzzy(&self, term: &str, max: usize) -> Vec<(&str, usize)> {
+        let mut hits: Vec<(&str, usize)> = self
+            .postings
+            .keys()
+            .filter_map(|candidate| {
+                let distance = edit_distance_within(term, candidate, max)?;
+                Some((candidate.as_str(), distance))
+            })
+            .collect();
+        hits.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+        hits
+    }
+
     /// The documents where `terms` appear one after another, in
     /// order: the phrase "borrow checker" matches "the borrow checker
     /// enforces" and not "the checker borrows".
@@ -264,11 +287,18 @@ impl Index {
     /// that normalises to several terms ("borrow-checker") is the
     /// phrase they form, because that is what the hyphen meant in the
     /// text.
-    fn operand(&self, token: &str) -> (BTreeSet<u32>, Vec<String>) {
+    fn operand(&self, token: &str) -> Result<(BTreeSet<u32>, Vec<String>), QueryError> {
         let text = token
             .strip_prefix('"')
             .map(|inside| inside.strip_suffix('"').unwrap_or(inside))
             .unwrap_or(token);
+        // A quoted token is a phrase, and a phrase is exact: the tilde
+        // applies to bare words only.
+        if !token.starts_with('"') {
+            if let Some((word, max)) = parse_fuzzy(text)? {
+                return Ok(self.fuzzy_operand(word, max));
+            }
+        }
         let terms: Vec<String> = tokenize(text).collect();
         let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
         let docs = match refs.as_slice() {
@@ -276,7 +306,37 @@ impl Index {
             [only] => self.search(only).iter().map(|p| p.doc).collect(),
             phrase => self.phrase(phrase).into_iter().collect(),
         };
-        (docs, terms)
+        Ok((docs, terms))
+    }
+
+    /// The documents one fuzzy word matches, and the terms they score
+    /// by: every dictionary term within the radius, and the union of
+    /// their postings.
+    ///
+    /// The word the reader typed is not in the dictionary — that is
+    /// what makes it fuzzy — so it cannot score anything. Each variant
+    /// contributes its own BM25 score, exactly as the terms of an OR
+    /// do; a nearer variant is not boosted over a farther one, which
+    /// is a simplification of Lucene's distance-blended rewrite.
+    ///
+    /// The word is normalised first, by the tokeniser the index used.
+    /// A stop word matches nothing, exactly as it does without the
+    /// tilde. A word that normalises to several terms —
+    /// "borrow-checker", say — is a phrase this operator does not
+    /// cover: it matches nothing rather than guessing which half the
+    /// typo was in.
+    fn fuzzy_operand(&self, word: &str, max: usize) -> (BTreeSet<u32>, Vec<String>) {
+        let terms: Vec<String> = tokenize(word).collect();
+        if terms.len() != 1 {
+            return (BTreeSet::new(), Vec::new());
+        }
+        let hits = self.fuzzy(&terms[0], max);
+        let docs: BTreeSet<u32> = hits
+            .iter()
+            .flat_map(|&(term, _)| self.search(term).iter().map(|p| p.doc))
+            .collect();
+        let scored_by: Vec<String> = hits.iter().map(|&(term, _)| term.to_string()).collect();
+        (docs, scored_by)
     }
 
     /// Evaluate a boolean query: the documents that match, and the
@@ -333,7 +393,7 @@ impl Index {
                 }
             }
 
-            let (docs, operand_terms) = self.operand(&token);
+            let (docs, operand_terms) = self.operand(&token)?;
             let negated = negate;
             negate = false;
             let docs = if negated {
@@ -491,6 +551,10 @@ enum QueryError {
     /// with AND or OR, ends with an operator or a NOT, or has two
     /// operators in a row.
     DanglingOperator,
+    /// A tilde with no radius after it that this engine has:
+    /// "borow~3" asks for more edits than the cap allows, and
+    /// "borow~x" is not a radius at all.
+    BadFuzzy(String),
 }
 
 impl fmt::Display for QueryError {
@@ -499,6 +563,9 @@ impl fmt::Display for QueryError {
             QueryError::Empty => write!(f, "the query is empty"),
             QueryError::DanglingOperator => {
                 write!(f, "an operator in this query is missing its operand")
+            }
+            QueryError::BadFuzzy(token) => {
+                write!(f, "the fuzzy operator on {token:?} needs an edit count between 0 and {MAX_EDITS}")
             }
         }
     }
@@ -544,6 +611,92 @@ fn query_tokens(query: &str) -> Vec<String> {
         tokens.push(token);
     }
     tokens
+}
+
+/// The largest radius the `~` operator accepts. Lucene caps its fuzzy
+/// edits at two for the same reason: past two edits a radius stops
+/// correcting typos and starts matching half the dictionary.
+const MAX_EDITS: usize = 2;
+
+/// The radius a bare `~` means when no number follows it. Two, which
+/// is Lucene's default too.
+const DEFAULT_MAX_EDITS: usize = 2;
+
+/// Split a fuzzy token: "borow~2" is the word "borow" with a radius
+/// of 2, and "borow~" is the same word with the default radius.
+/// `Ok(None)` means the token carries no tilde at all, and the
+/// caller's ordinary exact path applies.
+///
+/// A tilde followed by anything that is not a radius this engine has
+/// is an error, the way a dangling operator is: the query said
+/// something the grammar does not cover, and guessing is worse than
+/// refusing.
+fn parse_fuzzy(token: &str) -> Result<Option<(&str, usize)>, QueryError> {
+    let Some((word, rest)) = token.split_once('~') else {
+        return Ok(None);
+    };
+    let max = if rest.is_empty() {
+        DEFAULT_MAX_EDITS
+    } else {
+        match rest.parse::<usize>() {
+            Ok(max) if max <= MAX_EDITS => max,
+            _ => return Err(QueryError::BadFuzzy(token.to_string())),
+        }
+    };
+    Ok(Some((word, max)))
+}
+
+/// The Levenshtein distance between `a` and `b`: the fewest
+/// single-character insertions, deletions and substitutions that turn
+/// one into the other. Counted over characters, not bytes, because
+/// the tokeniser is Unicode-aware and a distance that is not would be
+/// its own kind of wrong.
+///
+/// Transpositions are not edits here, so "teh" is two edits from
+/// "the" — two substitutions. Lucene's default counts a transposition
+/// as one, and that gap is a known difference.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    // Two rows of the table. Row i holds the distance between the
+    // first i characters of `a` and every prefix of `b`, and row i+1
+    // is computed from row i alone, so m * n entries are filled with
+    // n + 1 of them alive at a time.
+    //
+    // The first row is the empty prefix of `a`: turning it into the
+    // first j characters of `b` takes j insertions.
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        // The first column is the empty prefix of `b`: turning the
+        // first i + 1 characters of `a` into nothing takes i + 1
+        // deletions.
+        current[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            current[j + 1] = (previous[j + 1] + 1) // a deletion
+                .min(current[j] + 1) // an insertion
+                .min(previous[j] + cost); // a match, or a substitution
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    // The last swap left the final row in `previous`.
+    previous[b.len()]
+}
+
+/// The distance between `a` and `b` when it is at most `max`, and
+/// `None` when it is not.
+///
+/// The length check comes first because it is O(1) against the DP's
+/// O(m * n): the distance can never be smaller than the difference in
+/// lengths, so a candidate that differs in length by more than the
+/// radius is out without a table being filled.
+fn edit_distance_within(a: &str, b: &str, max: usize) -> Option<usize> {
+    if a.chars().count().abs_diff(b.chars().count()) > max {
+        return None;
+    }
+    let distance = edit_distance(a, b);
+    (distance <= max).then_some(distance)
 }
 
 /// Count a sorted term list in runs: each distinct term once, with the
@@ -838,6 +991,61 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             Err(e) => println!("  {e}"),
         }
+    }
+
+    // Step 8: a typo in a query used to miss, because the dictionary
+    // has no such key. Now the dictionary itself is searched by edit
+    // distance.
+    println!("\nfuzzy \"borow\" within 1 edit:");
+    for (term, distance) in loaded.fuzzy("borow", 1) {
+        println!("  {term:<12} distance {distance}");
+    }
+    println!("fuzzy \"liefetime\" within 2 edits:");
+    for (term, distance) in loaded.fuzzy("liefetime", 2) {
+        println!("  {term:<12} distance {distance}");
+    }
+    println!("fuzzy \"valu\" within 2 edits — the radius reaches further than you would think:");
+    for (term, distance) in loaded.fuzzy("valu", 2) {
+        println!("  {term:<12} distance {distance}");
+    }
+    println!("fuzzy \"zzzzz\" within 2 edits:");
+    if loaded.fuzzy("zzzzz", 2).is_empty() {
+        println!("  no terms");
+    }
+
+    // The typo'd query answers what the reader meant, and ranks it
+    // the way the correct spelling does: "borrow" is the only variant
+    // within reach, so it is the only term it scores by.
+    println!("\n\"borow~\" and \"borrow\" answer the same:");
+    println!(
+        "  {}",
+        loaded.query("borow~").unwrap() == loaded.query("borrow").unwrap()
+    );
+
+    // A radius that reaches two terms scores by both, the way an OR
+    // does: "valu" is one edit from "value" and two from "valid", and
+    // each document scores by the one it holds.
+    println!("\nquery \"valu~2\":");
+    for (doc, score) in loaded.query("valu~2").unwrap() {
+        println!("  {score:>7.4}  {}", loaded.path(doc));
+    }
+
+    // What the operator refuses to guess at.
+    println!("\nquery \"the~\" — a stop word:");
+    if loaded.query("the~").unwrap().is_empty() {
+        println!("  no documents");
+    }
+    println!("query \"borrow-checker~\" — a hyphenated word:");
+    if loaded.query("borrow-checker~").unwrap().is_empty() {
+        println!("  no documents");
+    }
+    println!("\nquery \"borow~3\" — a radius past the cap:");
+    if let Err(e) = loaded.query("borow~3") {
+        println!("  {e}");
+    }
+    println!("query \"borow~x\" — not a radius at all:");
+    if let Err(e) = loaded.query("borow~x") {
+        println!("  {e}");
     }
 
     // The query grammar refuses an operator with nothing on one side
@@ -1422,6 +1630,224 @@ mod tests {
         let ranked = index.query("NOT fox").unwrap();
         assert_eq!(ranked.iter().map(|(doc, _)| *doc).collect::<Vec<_>>(), [1]);
         assert_eq!(ranked[0].1, 0.0);
+    }
+
+    // --- fuzzy matching ---
+
+    #[test]
+    fn the_distance_between_equal_terms_is_zero() {
+        assert_eq!(edit_distance("borrow", "borrow"), 0);
+        assert_eq!(edit_distance("", ""), 0);
+    }
+
+    #[test]
+    fn the_distance_counts_each_kind_of_edit() {
+        assert_eq!(edit_distance("fox", "foxes"), 2); // two insertions
+        assert_eq!(edit_distance("foxes", "fox"), 2); // two deletions
+        assert_eq!(edit_distance("fox", "box"), 1); // one substitution
+    }
+
+    #[test]
+    fn the_classic_examples_come_out_right() {
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("saturday", "sunday"), 3);
+        assert_eq!(edit_distance("flaw", "lawn"), 2);
+    }
+
+    /// A transposition is two edits here — two substitutions — because
+    /// the DP knows three operations, not four. Lucene's default
+    /// counts it as one, and that is a known difference.
+    #[test]
+    fn a_transposition_costs_two_edits() {
+        assert_eq!(edit_distance("teh", "the"), 2);
+    }
+
+    #[test]
+    fn the_distance_is_counted_over_characters_not_bytes() {
+        // One substitution each, though both are two bytes in UTF-8.
+        assert_eq!(edit_distance("arger", "ärger"), 1);
+        assert_eq!(edit_distance("strase", "straße"), 1);
+    }
+
+    #[test]
+    fn an_empty_term_is_all_insertions() {
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("abc", ""), 3);
+    }
+
+    #[test]
+    fn a_candidate_too_different_in_length_is_out_without_a_table() {
+        // The length check: "ownership" is four edits from "owner",
+        // so it is out at any radius below four.
+        assert_eq!(edit_distance_within("owner", "ownership", 3), None);
+        assert_eq!(edit_distance_within("owner", "ownership", 4), Some(4));
+    }
+
+    #[test]
+    fn the_radius_caps_the_distance() {
+        assert_eq!(edit_distance_within("kitten", "sitting", 2), None);
+        assert_eq!(edit_distance_within("kitten", "sitting", 3), Some(3));
+    }
+
+    #[test]
+    fn fuzzy_finds_the_term_a_typo_was_aiming_at() {
+        let mut index = Index::new();
+        for (path, text) in &corpus() {
+            index.add_document(path, text);
+        }
+        assert_eq!(index.fuzzy("borow", 1), [("borrow", 1)]);
+    }
+
+    /// One typo can reach several terms: "valu" is one edit from
+    /// "value" and two from both "call" (v->c, u->l) and "valid".
+    /// That is a radius of two doing what it says — it is wide.
+    #[test]
+    fn one_typo_can_reach_several_terms() {
+        let mut index = Index::new();
+        for (path, text) in &corpus() {
+            index.add_document(path, text);
+        }
+        assert_eq!(
+            index.fuzzy("valu", 2),
+            [("value", 1), ("call", 2), ("valid", 2)]
+        );
+    }
+
+    #[test]
+    fn fuzzy_lists_the_exact_term_at_distance_zero() {
+        let mut index = Index::new();
+        for (path, text) in &corpus() {
+            index.add_document(path, text);
+        }
+        assert_eq!(index.fuzzy("borrow", 1).first(), Some(&("borrow", 0)));
+    }
+
+    #[test]
+    fn fuzzy_returns_nothing_when_no_term_is_close() {
+        let mut index = Index::new();
+        for (path, text) in &corpus() {
+            index.add_document(path, text);
+        }
+        assert!(index.fuzzy("zzzzz", 2).is_empty());
+    }
+
+    #[test]
+    fn fuzzy_hits_are_ordered_by_distance_then_term() {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox fog dog");
+        // "fx" is one edit from "fox" and two from "fog"; "dog" is
+        // three away and out at a radius of two.
+        assert_eq!(index.fuzzy("fx", 2), [("fox", 1), ("fog", 2)]);
+    }
+
+    #[test]
+    fn a_fuzzy_query_scores_by_every_variant_it_matched() {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox");
+        index.add_document("b.md", "fog");
+        index.add_document("c.md", "fox fog");
+        // "fx~2" matches fox and fog, and the document holding both
+        // scores by both — the way an OR's does.
+        let ranked = index.query("fx~2").unwrap();
+        assert_eq!(ranked[0].0, 2);
+        let fox = index.query("fox").unwrap();
+        let fog = index.query("fog").unwrap();
+        let both = ranked.iter().find(|(doc, _)| *doc == 2).unwrap().1;
+        let fox_score = fox.iter().find(|(doc, _)| *doc == 2).unwrap().1;
+        let fog_score = fog.iter().find(|(doc, _)| *doc == 2).unwrap().1;
+        assert!((both - (fox_score + fog_score)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_typo_query_answers_what_the_correct_spelling_answers() {
+        let mut index = Index::new();
+        for (path, text) in &corpus() {
+            index.add_document(path, text);
+        }
+        assert_eq!(
+            index.query("borow~").unwrap(),
+            index.query("borrow").unwrap()
+        );
+        assert_eq!(
+            index.boolean("ower~1").unwrap(),
+            index.boolean("owner").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_bare_tilde_means_the_default_radius() {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox fog");
+        assert_eq!(
+            index.boolean("fx~").unwrap(),
+            index.boolean("fx~2").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_radius_of_zero_is_an_exact_match() {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox");
+        assert_eq!(index.boolean("fox~0").unwrap(), [0]);
+        assert!(index.boolean("fx~0").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stop_word_with_a_tilde_matches_nothing() {
+        let index = three_docs();
+        assert!(index.boolean("the~").unwrap().is_empty());
+    }
+
+    /// The fuzzy word goes through the tokeniser before the scan, so
+    /// casing and punctuation fold away exactly as they do for an
+    /// exact term.
+    #[test]
+    fn an_uppercase_fuzzy_word_is_lowercased() {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox");
+        assert_eq!(index.boolean("FOx~1").unwrap(), [0]);
+    }
+
+    /// The tilde covers one word. A word that normalises to two terms
+    /// is a phrase, and this operator does not do phrases.
+    #[test]
+    fn a_hyphenated_word_with_a_tilde_matches_nothing() {
+        let mut index = Index::new();
+        index.add_document("a.md", "borrow checker");
+        assert!(index.boolean("borrow-checker~").unwrap().is_empty());
+    }
+
+    #[test]
+    fn not_applies_to_a_fuzzy_operand() {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox");
+        index.add_document("b.md", "fox dog");
+        index.add_document("c.md", "dog");
+        // "fox~1" matches a and b; NOT dog leaves a.
+        assert_eq!(index.boolean("fox~1 NOT dog").unwrap(), [0]);
+    }
+
+    #[test]
+    fn a_radius_past_the_cap_is_refused() {
+        let index = three_docs();
+        assert!(index.query("fox~3").is_err());
+    }
+
+    #[test]
+    fn a_tilde_with_no_radius_after_it_is_refused() {
+        let index = three_docs();
+        assert!(index.query("fox~x").is_err());
+        assert!(index.query("fox~-1").is_err());
+        assert!(index.query("fox~1~2").is_err());
+    }
+
+    #[test]
+    fn the_refusal_names_the_token() {
+        let index = three_docs();
+        assert_eq!(
+            index.query("fox~3").unwrap_err().to_string(),
+            "the fuzzy operator on \"fox~3\" needs an edit count between 0 and 2"
+        );
     }
 
     /// A scratch path in the OS temp directory. Each test picks its own
