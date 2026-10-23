@@ -90,6 +90,17 @@ impl Index {
         self.documents[id as usize].length
     }
 
+    /// The average document length in terms — the reference point BM25
+    /// measures every document against. An empty index has no average
+    /// and says 0.
+    fn average_length(&self) -> f64 {
+        if self.documents.is_empty() {
+            return 0.0;
+        }
+        let total: u32 = self.documents.iter().map(|d| d.length).sum();
+        total as f64 / self.documents.len() as f64
+    }
+
     fn documents(&self) -> usize {
         self.documents.len()
     }
@@ -108,6 +119,38 @@ impl Index {
             .collect();
         entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
         entries
+    }
+
+    /// Rank the documents containing `term` by BM25, best first. Each
+    /// result is (document, term frequency, score).
+    ///
+    /// The score is the term's weight — the inverse document frequency
+    /// from step 5 — times BM25's term-frequency component: a count that
+    /// saturates as it grows, over a length measured against the
+    /// collection average. A query with several terms sums one
+    /// contribution per term; this step asks about one at a time.
+    ///
+    /// Equal scores keep the input order, and postings arrive in
+    /// ascending document order, so ties come out in document order.
+    fn rank(&self, term: &str) -> Vec<(u32, u32, f64)> {
+        let postings = self.search(term);
+        let weight = idf(postings.len(), self.documents());
+        let avgdl = self.average_length();
+        let mut ranked: Vec<(u32, u32, f64)> = postings
+            .iter()
+            .map(|p| {
+                (
+                    p.doc,
+                    p.tf,
+                    weight * tf_score(p.tf, self.length(p.doc) as f64, avgdl, K1, B),
+                )
+            })
+            .collect();
+        // f64 is not Ord, because of NaN. total_cmp gives every float a
+        // place in a total order, and sort_by is stable, so equal scores
+        // keep the order they arrived in.
+        ranked.sort_by(|a, b| b.2.total_cmp(&a.2));
+        ranked
     }
 
     /// Write the index to `path` as one binary file: the magic and the
@@ -222,25 +265,36 @@ fn idf(df: usize, n: usize) -> f64 {
     (n as f64 / df as f64).ln()
 }
 
-/// Rank a term's postings by TF-IDF, best first. Each result is
-/// (document, term frequency, score).
+/// BM25's two constants, at the values Lucene ships. They are the only
+/// numbers in the formula that are not counted from the corpus.
 ///
-/// The score is the term's frequency in the document times the inverse
-/// of its document frequency — raw counts, with no length
-/// normalisation, which is what makes step 6 necessary. Equal scores
-/// keep their input order, and postings arrive in ascending document
-/// order, so ties come out in document order.
-fn rank(postings: &[Posting], n: usize) -> Vec<(u32, u32, f64)> {
-    let idf = idf(postings.len(), n);
-    let mut ranked: Vec<(u32, u32, f64)> = postings
-        .iter()
-        .map(|p| (p.doc, p.tf, p.tf as f64 * idf))
-        .collect();
-    // f64 is not Ord, because of NaN. total_cmp gives every float a
-    // place in a total order, and sort_by is stable, so equal scores
-    // keep the order they arrived in.
-    ranked.sort_by(|a, b| b.2.total_cmp(&a.2));
-    ranked
+/// k1 saturates term frequency: the higher it is, the longer extra
+/// mentions keep mattering, with the ceiling at k1 + 1. b divides out
+/// document length: 0 ignores length, 1 scales the whole k1 by the
+/// document's length against the average.
+const K1: f64 = 1.2;
+const B: f64 = 0.75;
+
+/// BM25's term-frequency component: how much a term's `tf` occurrences
+/// in a document of `dl` terms are worth in a collection whose average
+/// document is `avgdl` terms long.
+///
+/// The numerator grows with tf; so does the denominator, and faster —
+/// which is what saturates the curve. As tf grows the score approaches
+/// k1 + 1 and stops: at Lucene's k1 the ceiling is 2.2, so the twentieth
+/// mention of a term adds very little to the tenth. k1 = 0 makes every
+/// match worth the same, however often the term repeats.
+///
+/// b sets how much of the length difference is divided out. At b = 0
+/// length is ignored and the bias step 5 demonstrated comes straight
+/// back; at b = 1 the whole k1 scales with dl / avgdl, which punishes
+/// long documents even when the repetition is genuine.
+///
+/// `avgdl` must be positive. A posting exists because its term is in
+/// the document, so any document with a posting has length at least
+/// one, and an index with postings averages above zero.
+fn tf_score(tf: u32, dl: f64, avgdl: f64, k1: f64, b: f64) -> f64 {
+    tf as f64 * (k1 + 1.0) / (tf as f64 + k1 * (1.0 - b + b * dl / avgdl))
 }
 
 /// Append a length-prefixed UTF-8 string: a u32 byte count, then the
@@ -424,8 +478,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    println!("\nquery \"borrow\", ranked by tf * idf:");
-    for (doc, tf, score) in rank(loaded.search("borrow"), loaded.documents()) {
+    println!(
+        "\naverage document length: {:.2} terms",
+        loaded.average_length()
+    );
+
+    println!("\nquery \"borrow\", ranked by BM25:");
+    for (doc, tf, score) in loaded.rank("borrow") {
         println!(
             "  {score:>7.4}  {:<26} tf={tf}  len={}",
             loaded.path(doc),
@@ -433,8 +492,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    println!("\nquery \"owner\", ranked by tf * idf:");
-    for (doc, tf, score) in rank(loaded.search("owner"), loaded.documents()) {
+    println!("\nquery \"owner\", ranked by BM25:");
+    for (doc, tf, score) in loaded.rank("owner") {
         println!(
             "  {score:>7.4}  {:<26} tf={tf}  len={}",
             loaded.path(doc),
@@ -691,33 +750,101 @@ mod tests {
     }
 
     #[test]
-    fn rank_puts_the_highest_score_first() {
-        let postings = [Posting { doc: 0, tf: 1 }, Posting { doc: 1, tf: 5 }];
-        let ranked = rank(&postings, 6);
+    fn bm25_puts_the_highest_score_first() {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox");
+        index.add_document("b.md", "fox fox fox fox fox");
+        index.add_document("c.md", "dog");
+        let ranked = index.rank("fox");
         assert_eq!(ranked[0].0, 1);
         assert!(ranked[0].2 > ranked[1].2);
     }
 
     #[test]
-    fn rank_keeps_the_input_order_of_equal_scores() {
-        let postings = [Posting { doc: 3, tf: 1 }, Posting { doc: 1, tf: 1 }];
-        let ranked = rank(&postings, 6);
-        assert_eq!(ranked.iter().map(|r| r.0).collect::<Vec<_>>(), [3, 1]);
+    fn equal_documents_keep_document_order() {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox");
+        index.add_document("b.md", "fox");
+        let ranked = index.rank("fox");
+        // "fox" is in every document, so its weight is zero and the
+        // scores are equal — and the stable sort keeps document order.
+        assert_eq!(ranked.iter().map(|r| r.0).collect::<Vec<_>>(), [0, 1]);
+        assert!(ranked.iter().all(|(_, _, score)| *score == 0.0));
     }
 
-    /// The length bias, pinned as the behaviour the demo shows: on the
-    /// demo corpus "borrow" ranks the long style guide above the page
-    /// that is actually about borrowing, because it mentions the term
-    /// more often. Step 6 replaces the scorer, and this test with it.
+    /// The bias step 5 demonstrated, now fixed: on the demo corpus
+    /// "borrow" ranks the short page about borrowing above the long
+    /// page that mentions it in passing.
     #[test]
-    fn raw_term_frequency_lets_the_longer_document_win() {
+    fn bm25_lets_the_shorter_document_win() {
         let mut index = Index::new();
         for (path, text) in &corpus() {
             index.add_document(path, text);
         }
-        let ranked = rank(index.search("borrow"), index.documents());
-        assert_eq!(index.path(ranked[0].0), "docs/style-guide.md");
-        assert_eq!(index.path(ranked[1].0), "docs/borrow-checker.md");
+        let ranked = index.rank("borrow");
+        assert_eq!(index.path(ranked[0].0), "docs/borrow-checker.md");
+        assert_eq!(index.path(ranked[1].0), "docs/style-guide.md");
+        // The gap is not a rounding error.
+        assert!(ranked[0].2 > ranked[1].2 + 0.05);
+    }
+
+    /// Term frequency still does honest work when the more frequent
+    /// document is also the more relevant one.
+    #[test]
+    fn a_frequent_term_in_a_relevant_document_still_wins() {
+        let mut index = Index::new();
+        for (path, text) in &corpus() {
+            index.add_document(path, text);
+        }
+        let ranked = index.rank("owner");
+        assert_eq!(index.path(ranked[0].0), "docs/ownership.md");
+    }
+
+    #[test]
+    fn term_frequency_saturates() {
+        let avg = 20.0;
+        // Each doubling of the count adds less than the last...
+        let once = tf_score(1, avg, avg, K1, B);
+        let twice = tf_score(2, avg, avg, K1, B);
+        let four = tf_score(4, avg, avg, K1, B);
+        assert!(twice - once > four - twice);
+        // ...and the ceiling is k1 + 1, never above it.
+        let huge = tf_score(1_000_000, avg, avg, K1, B);
+        assert!(huge < K1 + 1.0);
+        assert!(huge > K1 + 0.99);
+    }
+
+    #[test]
+    fn k1_of_zero_makes_frequency_irrelevant() {
+        let avg = 20.0;
+        assert_eq!(tf_score(1, avg, avg, 0.0, B), 1.0);
+        assert_eq!(tf_score(50, avg, avg, 0.0, B), 1.0);
+    }
+
+    #[test]
+    fn length_normalisation_off_leaves_length_alone() {
+        // Same count, very different lengths, b = 0: equal scores.
+        let short = tf_score(3, 10.0, 20.0, K1, 0.0);
+        let long = tf_score(3, 40.0, 20.0, K1, 0.0);
+        assert_eq!(short, long);
+    }
+
+    #[test]
+    fn length_normalisation_on_favours_the_short_document() {
+        let short = tf_score(3, 10.0, 20.0, K1, 1.0);
+        let long = tf_score(3, 40.0, 20.0, K1, 1.0);
+        assert!(short > long);
+    }
+
+    #[test]
+    fn average_length_is_the_mean_of_the_document_lengths() {
+        let index = sample();
+        assert_eq!(index.average_length(), 3.5); // 3 and 4 terms
+    }
+
+    #[test]
+    fn an_empty_index_has_no_average_length() {
+        assert_eq!(Index::new().average_length(), 0.0);
     }
 
     /// A scratch path in the OS temp directory. Each test picks its own
