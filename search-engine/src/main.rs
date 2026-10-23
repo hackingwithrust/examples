@@ -1,6 +1,12 @@
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
+use std::fs;
+use std::io;
+use std::path::Path;
 
 /// An inverted index: for each term, the documents that contain it.
+#[derive(Debug)]
 struct Index {
     /// term -> document ids. Every list is ascending and duplicate-free.
     postings: HashMap<String, Vec<u32>>,
@@ -56,6 +62,251 @@ impl Index {
     fn terms(&self) -> usize {
         self.postings.len()
     }
+
+    /// Every term with its postings, in sorted order — the order `save`
+    /// writes them in.
+    fn postings(&self) -> Vec<(&str, &[u32])> {
+        let mut entries: Vec<(&str, &[u32])> = self
+            .postings
+            .iter()
+            .map(|(term, ids)| (term.as_str(), ids.as_slice()))
+            .collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        entries
+    }
+
+    /// Write the index to `path` as one binary file: the magic and the
+    /// version, the document paths, then the dictionary with its postings
+    /// lists, terms in sorted order.
+    ///
+    /// The file is built in memory and written in one call. At this size
+    /// that is cheaper than a buffered writer, and it makes the whole
+    /// file one value that can be compared, hashed or diffed.
+    fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&(self.documents.len() as u32).to_le_bytes());
+        for document in &self.documents {
+            put_str(&mut out, document);
+        }
+        out.extend_from_slice(&(self.terms() as u32).to_le_bytes());
+        for (term, ids) in self.postings() {
+            put_str(&mut out, term);
+            out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+            for id in ids {
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+        }
+        fs::write(path, out)
+    }
+
+    /// Read an index back from `path`. Reading the file and interpreting
+    /// it are two steps that fail differently: the first with an io
+    /// error, the second with a `LoadError`.
+    fn load(path: impl AsRef<Path>) -> Result<Index, LoadError> {
+        let bytes = fs::read(path).map_err(LoadError::Io)?;
+        Index::load_bytes(&bytes)
+    }
+
+    /// Parse the bytes of an index file. Every field is length-prefixed,
+    /// so the reader never has to guess where one field ends and the
+    /// next begins — and a file that ends early is a `LoadError`, not a
+    /// panic.
+    fn load_bytes(bytes: &[u8]) -> Result<Index, LoadError> {
+        let mut reader = Reader::new(bytes);
+        if reader.take(MAGIC.len())? != MAGIC {
+            return Err(LoadError::BadMagic);
+        }
+        let version = reader.u32()?;
+        if version != VERSION {
+            return Err(LoadError::BadVersion(version));
+        }
+
+        let mut index = Index::new();
+        for _ in 0..reader.u32()? {
+            index.documents.push(reader.string()?);
+        }
+        for _ in 0..reader.u32()? {
+            let term = reader.string()?;
+            let mut ids = Vec::new();
+            for _ in 0..reader.u32()? {
+                ids.push(reader.u32()?);
+            }
+            index.postings.insert(term, ids);
+        }
+        if reader.pos != reader.data.len() {
+            return Err(LoadError::TrailingBytes);
+        }
+        Ok(index)
+    }
+}
+
+/// Append a length-prefixed UTF-8 string: a u32 byte count, then the
+/// bytes. A binary file has no separator to scan for, so the length is
+/// the separator.
+fn put_str(out: &mut Vec<u8>, text: &str) {
+    out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+    out.extend_from_slice(text.as_bytes());
+}
+
+/// Everything that can be wrong with an index file. The disk it sits on
+/// is a separate concern, carried along as `Io`.
+#[derive(Debug)]
+enum LoadError {
+    /// The file does not start with the magic this engine writes.
+    BadMagic,
+    /// The magic is right, but the version is not one this build reads.
+    BadVersion(u32),
+    /// The file ends where another field was expected.
+    Truncated,
+    /// A length-prefixed field holds bytes that are not UTF-8.
+    BadUtf8,
+    /// Bytes were left over after the last field the format describes.
+    TrailingBytes,
+    /// The file could not be read at all.
+    Io(io::Error),
+}
+
+impl fmt::Display for LoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LoadError::BadMagic => write!(f, "not a haystack index: the magic bytes are wrong"),
+            LoadError::BadVersion(v) => write!(f, "unsupported index version {v}"),
+            LoadError::Truncated => write!(f, "the file ends where another field was expected"),
+            LoadError::BadUtf8 => write!(f, "a length-prefixed field is not valid UTF-8"),
+            LoadError::TrailingBytes => write!(f, "the file has bytes after the last field"),
+            LoadError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl Error for LoadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            LoadError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// A cursor over an index file's bytes. Every read checks the end first,
+/// so a truncated file is a `LoadError` instead of a panic.
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Reader { data, pos: 0 }
+    }
+
+    /// The next `len` bytes, or `Truncated` when the file ends first.
+    fn take(&mut self, len: usize) -> Result<&'a [u8], LoadError> {
+        let end = self.pos.checked_add(len).ok_or(LoadError::Truncated)?;
+        let bytes = self.data.get(self.pos..end).ok_or(LoadError::Truncated)?;
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    /// The next four bytes, as a little-endian u32.
+    fn u32(&mut self) -> Result<u32, LoadError> {
+        let bytes: [u8; 4] = self.take(4)?.try_into().unwrap();
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    /// The next length-prefixed UTF-8 string.
+    fn string(&mut self) -> Result<String, LoadError> {
+        let len = self.u32()? as usize;
+        let bytes = self.take(len)?;
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| LoadError::BadUtf8)
+    }
+}
+
+/// The first eight bytes of every index file: eight ASCII bytes that no
+/// file this engine reads by accident starts with.
+const MAGIC: &[u8] = b"haystack";
+
+/// The format version. A file announcing any other number is refused.
+const VERSION: u32 = 1;
+
+/// Where the demo writes its index. The file is output, not source: it
+/// is gitignored and rebuilt by every run.
+const INDEX_PATH: &str = "haystack.idx";
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let documents = [
+        (
+            "docs/ownership.md",
+            "Ownership and borrowing are the two ideas Rust is built on. Every value has one owner, and the owner going out of scope drops it.",
+        ),
+        (
+            "docs/borrow-checker.md",
+            "The borrow checker enforces the borrowing rules at compile time. A borrow must not outlive the owner of the borrowed value.",
+        ),
+        (
+            "docs/lifetimes.md",
+            "A lifetime is the region of code for which a reference is valid. The borrow checker uses lifetimes to keep every reference in scope.",
+        ),
+        (
+            "docs/iterators.md",
+            "Iterators are lazy: each call to next advances the iterator by one. An adapter such as map borrows the iterator it wraps.",
+        ),
+        (
+            "docs/error-handling.md",
+            "Recoverable errors are values of type Result. The question mark operator returns an error to the caller early.",
+        ),
+    ];
+
+    let mut index = Index::new();
+    for (path, text) in &documents {
+        index.add_document(path, text);
+    }
+    println!(
+        "{} documents, {} distinct terms",
+        index.documents(),
+        index.terms()
+    );
+
+    index.save(INDEX_PATH)?;
+    let written = fs::read(INDEX_PATH)?;
+    println!("\nsaved to {INDEX_PATH}: {} bytes", written.len());
+
+    // The dictionary is written in sorted order, so the same index
+    // always produces the same bytes.
+    index.save(INDEX_PATH)?;
+    let rewritten = fs::read(INDEX_PATH)?;
+    println!(
+        "saved again: {} bytes, byte-identical: {}",
+        rewritten.len(),
+        rewritten == written
+    );
+
+    let loaded = Index::load(INDEX_PATH)?;
+    println!(
+        "\nloaded back: {} documents, {} terms",
+        loaded.documents(),
+        loaded.terms()
+    );
+
+    println!("\nquery \"borrow\" against the loaded index:");
+    for id in loaded.search("borrow") {
+        println!("  {}", loaded.path(*id));
+    }
+
+    println!("\ntwo files the loader refuses:");
+    if let Err(e) = Index::load("no-such-file.idx") {
+        println!("  a file that is not there: {e}");
+    }
+    let head = &written[..20];
+    if let Err(e) = Index::load_bytes(head) {
+        println!("  the first {} bytes of the real file: {e}", head.len());
+    }
+
+    Ok(())
 }
 
 /// The stop words: terms so common that indexing them costs memory and
@@ -151,81 +402,6 @@ fn tokenize(text: &str) -> impl Iterator<Item = String> {
         .map(str::to_lowercase)
         .filter(|word| !is_stop_word(word))
         .map(|word| stem(&word))
-}
-
-fn main() {
-    let documents = [
-        (
-            "docs/ownership.md",
-            "Ownership and borrowing are the two ideas Rust is built on. Every value has one owner, and the owner going out of scope drops it.",
-        ),
-        (
-            "docs/borrow-checker.md",
-            "The borrow checker enforces the borrowing rules at compile time. A borrow must not outlive the owner of the borrowed value.",
-        ),
-        (
-            "docs/lifetimes.md",
-            "A lifetime is the region of code for which a reference is valid. The borrow checker uses lifetimes to keep every reference in scope.",
-        ),
-        (
-            "docs/iterators.md",
-            "Iterators are lazy: each call to next advances the iterator by one. An adapter such as map borrows the iterator it wraps.",
-        ),
-        (
-            "docs/error-handling.md",
-            "Recoverable errors are values of type Result. The question mark operator returns an error to the caller early.",
-        ),
-    ];
-
-    let mut index = Index::new();
-    for (path, text) in &documents {
-        index.add_document(path, text);
-    }
-    println!(
-        "{} documents, {} distinct terms",
-        index.documents(),
-        index.terms()
-    );
-
-    println!("\npostings for \"borrow\": {:?}", index.search("borrow"));
-
-    println!("\nquery \"borrow\":");
-    for id in index.search("borrow") {
-        println!("  {}", index.path(*id));
-    }
-
-    println!("\nthe same documents from a scan:");
-    for (path, text) in &documents {
-        if tokenize(text).any(|term| term == "borrow") {
-            println!("  {}", path);
-        }
-    }
-
-    println!("\nthe queries that used to miss:");
-    for query in ["ownership", "valid"] {
-        println!("  query {:?}:", query);
-        for id in index.search(query) {
-            println!("    {}", index.path(*id));
-        }
-    }
-
-    println!("\ninflections fold onto one term:");
-    for query in ["borrow", "borrowing"] {
-        let terms: Vec<String> = tokenize(query).collect();
-        println!("  query {query:?} -> terms {terms:?}");
-        for term in &terms {
-            println!("    {term:?}: {:?}", index.search(term));
-        }
-    }
-
-    println!("\nstop words are not terms:");
-    for query in ["the", "is"] {
-        println!(
-            "  query {:?}: {} documents",
-            query,
-            index.search(query).len()
-        );
-    }
 }
 
 #[cfg(test)]
@@ -328,5 +504,142 @@ mod tests {
         let mut index = Index::new();
         index.add_document("a.md", "Ärger");
         assert_eq!(index.search("ärger"), &[0]);
+    }
+
+    /// A scratch path in the OS temp directory. Each test picks its own
+    /// name, so the tests can run in parallel.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("haystack-{name}.idx"))
+    }
+
+    #[test]
+    fn a_saved_index_loads_back_identical() {
+        let index = sample();
+        let path = scratch("roundtrip");
+        index.save(&path).unwrap();
+        let loaded = Index::load(&path).unwrap();
+        assert_eq!(loaded.documents(), index.documents());
+        assert_eq!(loaded.terms(), index.terms());
+        for (term, ids) in index.postings() {
+            assert_eq!(loaded.search(term), ids, "postings for {term:?}");
+        }
+        for id in 0..index.documents() as u32 {
+            assert_eq!(loaded.path(id), index.path(id));
+        }
+    }
+
+    #[test]
+    fn saving_twice_writes_the_same_bytes() {
+        let index = sample();
+        let path = scratch("determinism");
+        index.save(&path).unwrap();
+        let first = fs::read(&path).unwrap();
+        index.save(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), first);
+    }
+
+    #[test]
+    fn the_dictionary_is_written_in_sorted_order() {
+        let index = sample();
+        let path = scratch("sorted");
+        index.save(&path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+
+        // Walk the saved file the way the loader does, collecting the
+        // terms as they appear on disk.
+        let mut reader = Reader::new(&bytes);
+        reader.take(MAGIC.len()).unwrap();
+        reader.u32().unwrap();
+        for _ in 0..reader.u32().unwrap() {
+            reader.string().unwrap();
+        }
+        let mut terms = Vec::new();
+        for _ in 0..reader.u32().unwrap() {
+            let term = reader.string().unwrap();
+            let ids = reader.u32().unwrap();
+            reader.take(ids as usize * 4).unwrap(); // the postings list
+            terms.push(term);
+        }
+        assert!(
+            terms.windows(2).all(|pair| pair[0] < pair[1]),
+            "not sorted: {terms:?}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_file_is_refused() {
+        let index = sample();
+        let path = scratch("truncated");
+        index.save(&path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let error = Index::load_bytes(&bytes[..20]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the file ends where another field was expected"
+        );
+    }
+
+    #[test]
+    fn a_wrong_magic_is_refused() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"haystacs"); // one letter off
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        let error = Index::load_bytes(&bytes).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "not a haystack index: the magic bytes are wrong"
+        );
+    }
+
+    #[test]
+    fn a_newer_version_is_refused() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        let error = Index::load_bytes(&bytes).unwrap_err();
+        assert_eq!(error.to_string(), "unsupported index version 2");
+    }
+
+    #[test]
+    fn trailing_bytes_are_refused() {
+        let index = sample();
+        let path = scratch("trailing");
+        index.save(&path).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.push(0);
+        let error = Index::load_bytes(&bytes).unwrap_err();
+        assert_eq!(error.to_string(), "the file has bytes after the last field");
+    }
+
+    #[test]
+    fn a_term_that_is_not_utf8_is_refused() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // no documents
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // one term
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // one byte long
+        bytes.push(0xFF); // and not UTF-8
+        let error = Index::load_bytes(&bytes).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "a length-prefixed field is not valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn a_missing_file_is_an_io_error() {
+        let path = scratch("never-written");
+        assert!(matches!(Index::load(&path), Err(LoadError::Io(_))));
+    }
+
+    #[test]
+    fn an_empty_index_round_trips() {
+        let index = Index::new();
+        let path = scratch("empty");
+        index.save(&path).unwrap();
+        let loaded = Index::load(&path).unwrap();
+        assert_eq!(loaded.documents(), 0);
+        assert_eq!(loaded.terms(), 0);
     }
 }
