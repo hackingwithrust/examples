@@ -1,1 +1,5 @@
 /haystack.idx
+
+# Machine-local: a registry mirror for networks where crates.io is unreachable.
+# Not part of the project.
+/.cargo/

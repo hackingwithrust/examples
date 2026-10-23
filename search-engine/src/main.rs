@@ -1,3 +1,9 @@
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::{Json, Router};
+use serde::Serialize;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::error::Error;
@@ -5,6 +11,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 /// One entry in a term's postings list: the document, and where each
 /// occurrence of the term sits in it.
@@ -533,6 +540,119 @@ impl Index {
     }
 }
 
+/// One hit in a search response: the document, and what BM25 made of
+/// the query for it.
+#[derive(Debug, Serialize)]
+struct Hit {
+    /// The path the document was indexed under.
+    path: String,
+    /// The document's BM25 score for this query.
+    score: f64,
+}
+
+/// The body of a successful search: the query as it was asked, how many
+/// documents matched, and the matches best first.
+#[derive(Debug, Serialize)]
+struct SearchResponse {
+    /// The query, echoed back the way the reader asked it.
+    query: String,
+    /// How many documents matched — the length of `results`.
+    total: usize,
+    /// The matches, best first.
+    results: Vec<Hit>,
+}
+
+/// The body of a refused search. One field, because there is one thing
+/// to say.
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    error: String,
+}
+
+/// What can be wrong with a search request. Both variants answer 400,
+/// but they say different things: a request without `q` never reached
+/// the grammar, and a `q` the grammar refuses did.
+enum ApiError {
+    /// No `q` parameter at all.
+    MissingQuery,
+    /// A `q` the grammar refuses: empty, an operator missing its
+    /// operand, a radius past the cap.
+    BadQuery(QueryError),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let message = match self {
+            ApiError::MissingQuery => "the query parameter q is required".to_string(),
+            ApiError::BadQuery(e) => e.to_string(),
+        };
+        // The status and the body travel together: a JSON API answers a
+        // bad request in JSON, not in axum's plain text.
+        (StatusCode::BAD_REQUEST, Json(ErrorBody { error: message })).into_response()
+    }
+}
+
+/// The query string of a search request: `/search?q=borrow`.
+///
+/// `q` is optional so that a request without one gets this engine's
+/// error, in this engine's JSON — axum's own rejection of a missing
+/// field is also a 400, but plain text, and it names the field in a
+/// shape the rest of the API does not use.
+#[derive(Debug, serde::Deserialize)]
+struct SearchParams {
+    q: Option<String>,
+}
+
+/// `GET /search?q=...`: run the query and rank what it matched.
+///
+/// The two extractors are the whole request: `State` is the index the
+/// router was given, `Query` is the query string. The return type is
+/// the contract — `Json<SearchResponse>` on success, `ApiError` on a
+/// request this engine refuses — and both implement `IntoResponse`,
+/// which is what lets a handler return a `Result` at all.
+async fn search(
+    State(index): State<Arc<Index>>,
+    Query(params): Query<SearchParams>,
+) -> Result<Json<SearchResponse>, ApiError> {
+    let query = params.q.ok_or(ApiError::MissingQuery)?;
+    let ranked = index.query(&query).map_err(ApiError::BadQuery)?;
+    let results: Vec<Hit> = ranked
+        .iter()
+        .map(|&(doc, score)| Hit {
+            path: index.path(doc).to_string(),
+            score,
+        })
+        .collect();
+    Ok(Json(SearchResponse {
+        query,
+        total: results.len(),
+        results,
+    }))
+}
+
+/// Load the index from `path` and serve the API until the process is
+/// killed.
+///
+/// The index is shared, not copied: every request reads the same one,
+/// and `Arc` is what makes that legal across axum's worker tasks. The
+/// listener binds localhost — this is a demo over a local corpus; a
+/// service other machines reach binds 0.0.0.0.
+async fn serve(path: &str) -> Result<(), Box<dyn Error>> {
+    let index = Index::load(path)?;
+    println!(
+        "loaded {path}: {} documents, {} terms",
+        index.documents(),
+        index.terms()
+    );
+    let app = Router::new()
+        .route("/search", get(search))
+        .with_state(Arc::new(index));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8000").await?;
+    println!("serving GET /search on http://127.0.0.1:8000");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
 /// How the next operand combines with the documents matched so far.
 /// Two operands in a row mean AND, so this is also the default.
 #[derive(Clone, Copy, PartialEq)]
@@ -903,7 +1023,22 @@ fn corpus() -> [(&'static str, &'static str); 6] {
     ]
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+/// `haystack` runs the demo; `haystack serve` serves the API.
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    match std::env::args().nth(1).as_deref() {
+        Some("serve") => serve(INDEX_PATH).await,
+        Some(other) => {
+            eprintln!("unknown command {other:?} - the only one is `serve`");
+            Ok(())
+        }
+        None => demo(),
+    }
+}
+
+/// The demo: everything the engine does, printed. `cargo run` runs it;
+/// `cargo run -- serve` starts the HTTP API instead.
+fn demo() -> Result<(), Box<dyn Error>> {
     let mut index = Index::new();
     for (path, text) in &corpus() {
         index.add_document(path, text);
@@ -1063,6 +1198,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Err(e) = Index::load_bytes(&stale) {
         println!("\na version 2 file: {e}");
     }
+
+    println!("\nquery the same index over HTTP: cargo run -- serve");
 
     Ok(())
 }
@@ -1462,7 +1599,7 @@ mod tests {
         index.add_document("a.md", "the quick brown fox");
         assert_eq!(index.phrase(&["quick", "brown"]), [0]);
         // The other order is a different phrase.
-        assert_eq!(index.phrase(&["brown", "quick"]), []);
+        assert!(index.phrase(&["brown", "quick"]).is_empty());
     }
 
     #[test]
@@ -2059,5 +2196,19 @@ mod tests {
         let loaded = Index::load(&path).unwrap();
         assert_eq!(loaded.documents(), 0);
         assert_eq!(loaded.terms(), 0);
+    }
+
+    // --- the HTTP layer ---
+
+    #[test]
+    fn a_request_without_q_is_a_bad_request() {
+        let response = ApiError::MissingQuery.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_query_the_grammar_refuses_is_a_bad_request() {
+        let error = ApiError::BadQuery(QueryError::BadFuzzy("borow~3".to_string()));
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
     }
 }
