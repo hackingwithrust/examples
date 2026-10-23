@@ -11,6 +11,7 @@ tauri-desktop-app/  — a Markdown notes app
 react-wasm/         — a Rust function compiled to WebAssembly
 embedded-stm32/     — firmware for an STM32 board
 toy-database/       — an LSM key-value store
+search-engine/      haystack — a full-text search engine over a folder of documents
 ```
 
 Clone just this repository and you have everything you need to follow along:
