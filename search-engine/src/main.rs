@@ -5,13 +5,34 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+/// One entry in a term's postings list: the document, and how many
+/// times the term appears in it.
+#[derive(Debug, PartialEq)]
+struct Posting {
+    /// The document this posting refers to.
+    doc: u32,
+    /// How many times the term occurs in that document. At least one:
+    /// a posting exists because the term is there.
+    tf: u32,
+}
+
+/// One document the index has seen: the path it was indexed under,
+/// and how many terms the tokeniser took out of it.
+#[derive(Debug)]
+struct Document {
+    path: String,
+    /// The document's length in terms, stop words excluded.
+    length: u32,
+}
+
 /// An inverted index: for each term, the documents that contain it.
 #[derive(Debug)]
 struct Index {
-    /// term -> document ids. Every list is ascending and duplicate-free.
-    postings: HashMap<String, Vec<u32>>,
-    /// document id -> the path the document was indexed under.
-    documents: Vec<String>,
+    /// term -> its postings. Each list is ascending in document id,
+    /// with one entry per document that contains the term.
+    postings: HashMap<String, Vec<Posting>>,
+    /// document id -> the document itself.
+    documents: Vec<Document>,
 }
 
 impl Index {
@@ -25,34 +46,48 @@ impl Index {
     /// Index one document. `path` is its id; `text` is its contents.
     /// Returns the id the document was given.
     fn add_document(&mut self, path: &str, text: &str) -> u32 {
-        let id = self.documents.len() as u32;
-        self.documents.push(path.to_string());
-
-        // The terms this document contributes, each at most once.
+        // The terms this document contributes, sorted so that equal
+        // terms sit next to each other and can be counted in runs.
         let mut terms: Vec<String> = tokenize(text).collect();
         terms.sort_unstable();
-        terms.dedup();
 
-        for term in terms {
-            self.postings.entry(term).or_default().push(id);
+        let id = self.documents.len() as u32;
+        self.documents.push(Document {
+            path: path.to_string(),
+            length: terms.len() as u32,
+        });
+
+        // Each distinct term becomes one posting, carrying the size of
+        // its run as the term frequency.
+        for (term, tf) in count_terms(&terms) {
+            self.postings
+                .entry(term.to_string())
+                .or_default()
+                .push(Posting { doc: id, tf });
         }
 
         id
     }
 
-    /// The ids of the documents containing `term`, in insertion order.
-    /// Empty when the index has never seen the term.
+    /// The postings for `term`. Empty when the index has never seen
+    /// the term.
     ///
     /// The term has to be normalised the way the tokeniser normalises
     /// text: `search("borrowing")` finds nothing, because the dictionary
     /// holds "borrow". Normalising the query is the caller's job.
-    fn search(&self, term: &str) -> &[u32] {
+    fn search(&self, term: &str) -> &[Posting] {
         self.postings.get(term).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// The path a document was indexed under.
     fn path(&self, id: u32) -> &str {
-        &self.documents[id as usize]
+        &self.documents[id as usize].path
+    }
+
+    /// How many terms a document holds, stop words excluded. They are
+    /// not in the index, so they are not in the length either.
+    fn length(&self, id: u32) -> u32 {
+        self.documents[id as usize].length
     }
 
     fn documents(&self) -> usize {
@@ -65,19 +100,19 @@ impl Index {
 
     /// Every term with its postings, in sorted order — the order `save`
     /// writes them in.
-    fn postings(&self) -> Vec<(&str, &[u32])> {
-        let mut entries: Vec<(&str, &[u32])> = self
+    fn postings(&self) -> Vec<(&str, &[Posting])> {
+        let mut entries: Vec<(&str, &[Posting])> = self
             .postings
             .iter()
-            .map(|(term, ids)| (term.as_str(), ids.as_slice()))
+            .map(|(term, postings)| (term.as_str(), postings.as_slice()))
             .collect();
         entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
         entries
     }
 
     /// Write the index to `path` as one binary file: the magic and the
-    /// version, the document paths, then the dictionary with its postings
-    /// lists, terms in sorted order.
+    /// version, the documents with their lengths, then the dictionary
+    /// with its postings lists, terms in sorted order.
     ///
     /// The file is built in memory and written in one call. At this size
     /// that is cheaper than a buffered writer, and it makes the whole
@@ -88,14 +123,16 @@ impl Index {
         out.extend_from_slice(&VERSION.to_le_bytes());
         out.extend_from_slice(&(self.documents.len() as u32).to_le_bytes());
         for document in &self.documents {
-            put_str(&mut out, document);
+            put_str(&mut out, &document.path);
+            out.extend_from_slice(&document.length.to_le_bytes());
         }
         out.extend_from_slice(&(self.terms() as u32).to_le_bytes());
-        for (term, ids) in self.postings() {
+        for (term, postings) in self.postings() {
             put_str(&mut out, term);
-            out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
-            for id in ids {
-                out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&(postings.len() as u32).to_le_bytes());
+            for posting in postings {
+                out.extend_from_slice(&posting.doc.to_le_bytes());
+                out.extend_from_slice(&posting.tf.to_le_bytes());
             }
         }
         fs::write(path, out)
@@ -125,21 +162,85 @@ impl Index {
 
         let mut index = Index::new();
         for _ in 0..reader.u32()? {
-            index.documents.push(reader.string()?);
+            let path = reader.string()?;
+            let length = reader.u32()?;
+            index.documents.push(Document { path, length });
         }
         for _ in 0..reader.u32()? {
             let term = reader.string()?;
-            let mut ids = Vec::new();
+            let mut postings = Vec::new();
+            let mut previous: Option<u32> = None;
             for _ in 0..reader.u32()? {
-                ids.push(reader.u32()?);
+                let doc = reader.u32()?;
+                let tf = reader.u32()?;
+                // Step 2 promised ascending, duplicate-free lists, and
+                // the ranker assumes it: a hand-edited file that breaks
+                // the order is refused here rather than trusted.
+                if previous.is_some_and(|last| doc <= last) {
+                    return Err(LoadError::BadPostings(term));
+                }
+                previous = Some(doc);
+                postings.push(Posting { doc, tf });
             }
-            index.postings.insert(term, ids);
+            index.postings.insert(term, postings);
         }
         if reader.pos != reader.data.len() {
             return Err(LoadError::TrailingBytes);
         }
         Ok(index)
     }
+}
+
+/// Count a sorted term list in runs: each distinct term once, with the
+/// number of times it occurred. ["dog", "fox", "fox", "fox"] counts
+/// "dog" once and "fox" three times.
+fn count_terms(sorted: &[String]) -> Vec<(&str, u32)> {
+    let mut counts = Vec::new();
+    let mut start = 0;
+    while start < sorted.len() {
+        let mut end = start + 1;
+        while end < sorted.len() && sorted[end] == sorted[start] {
+            end += 1;
+        }
+        counts.push((sorted[start].as_str(), (end - start) as u32));
+        start = end;
+    }
+    counts
+}
+
+/// How much information a term carries: the natural log of the document
+/// count over the number of documents containing the term.
+///
+/// A term in every document scores zero — it cannot tell two documents
+/// apart. A term in one document scores the most. The zero for an empty
+/// postings list is for callers that pass one: a term in no document is
+/// not in the dictionary at all.
+fn idf(df: usize, n: usize) -> f64 {
+    if df == 0 {
+        return 0.0;
+    }
+    (n as f64 / df as f64).ln()
+}
+
+/// Rank a term's postings by TF-IDF, best first. Each result is
+/// (document, term frequency, score).
+///
+/// The score is the term's frequency in the document times the inverse
+/// of its document frequency — raw counts, with no length
+/// normalisation, which is what makes step 6 necessary. Equal scores
+/// keep their input order, and postings arrive in ascending document
+/// order, so ties come out in document order.
+fn rank(postings: &[Posting], n: usize) -> Vec<(u32, u32, f64)> {
+    let idf = idf(postings.len(), n);
+    let mut ranked: Vec<(u32, u32, f64)> = postings
+        .iter()
+        .map(|p| (p.doc, p.tf, p.tf as f64 * idf))
+        .collect();
+    // f64 is not Ord, because of NaN. total_cmp gives every float a
+    // place in a total order, and sort_by is stable, so equal scores
+    // keep the order they arrived in.
+    ranked.sort_by(|a, b| b.2.total_cmp(&a.2));
+    ranked
 }
 
 /// Append a length-prefixed UTF-8 string: a u32 byte count, then the
@@ -164,6 +265,8 @@ enum LoadError {
     BadUtf8,
     /// Bytes were left over after the last field the format describes.
     TrailingBytes,
+    /// A postings list whose document ids are not ascending.
+    BadPostings(String),
     /// The file could not be read at all.
     Io(io::Error),
 }
@@ -176,6 +279,9 @@ impl fmt::Display for LoadError {
             LoadError::Truncated => write!(f, "the file ends where another field was expected"),
             LoadError::BadUtf8 => write!(f, "a length-prefixed field is not valid UTF-8"),
             LoadError::TrailingBytes => write!(f, "the file has bytes after the last field"),
+            LoadError::BadPostings(term) => {
+                write!(f, "the postings list for {term:?} is not in ascending document order")
+            }
             LoadError::Io(e) => write!(f, "{e}"),
         }
     }
@@ -231,14 +337,22 @@ impl<'a> Reader<'a> {
 const MAGIC: &[u8] = b"haystack";
 
 /// The format version. A file announcing any other number is refused.
-const VERSION: u32 = 1;
+/// Version 2 adds a length to every document and a term frequency to
+/// every posting; a version 1 file has neither, and this build will
+/// not guess them.
+const VERSION: u32 = 2;
 
 /// Where the demo writes its index. The file is output, not source: it
 /// is gitignored and rebuilt by every run.
 const INDEX_PATH: &str = "haystack.idx";
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let documents = [
+/// The demo corpus: one file is one document, and the path is the id.
+///
+/// The last entry is deliberately long and mentions "borrow" five times
+/// in passing. It is the document length bias in one file: more terms
+/// to say less.
+fn corpus() -> [(&'static str, &'static str); 6] {
+    [
         (
             "docs/ownership.md",
             "Ownership and borrowing are the two ideas Rust is built on. Every value has one owner, and the owner going out of scope drops it.",
@@ -259,10 +373,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             "docs/error-handling.md",
             "Recoverable errors are values of type Result. The question mark operator returns an error to the caller early.",
         ),
-    ];
+        (
+            "docs/style-guide.md",
+            "House style for these pages: prefer short sentences, and name the thing you mean. When a function borrows a value, say what it borrows and for how long. A struct that borrows from its input should say so in its name. Tests borrow fixtures from the module above them, and an example that borrows code from another chapter says where it came from. Prefer the active voice, cut words like simply and just, and keep paragraphs under six lines. One idea per paragraph, a heading every screenful, and the exception to a rule written next to the rule.",
+        ),
+    ]
+}
 
+fn main() -> Result<(), Box<dyn Error>> {
     let mut index = Index::new();
-    for (path, text) in &documents {
+    for (path, text) in &corpus() {
         index.add_document(path, text);
     }
     println!(
@@ -292,18 +412,42 @@ fn main() -> Result<(), Box<dyn Error>> {
         loaded.terms()
     );
 
-    println!("\nquery \"borrow\" against the loaded index:");
-    for id in loaded.search("borrow") {
-        println!("  {}", loaded.path(*id));
+    // What a posting carries now: the document, how often the term
+    // appears in it, and how long the document is.
+    println!("\npostings for \"borrow\" — term frequency, then document length:");
+    for posting in loaded.search("borrow") {
+        println!(
+            "  {:<26} tf={}  len={}",
+            loaded.path(posting.doc),
+            posting.tf,
+            loaded.length(posting.doc)
+        );
     }
 
-    println!("\ntwo files the loader refuses:");
-    if let Err(e) = Index::load("no-such-file.idx") {
-        println!("  a file that is not there: {e}");
+    println!("\nquery \"borrow\", ranked by tf * idf:");
+    for (doc, tf, score) in rank(loaded.search("borrow"), loaded.documents()) {
+        println!(
+            "  {score:>7.4}  {:<26} tf={tf}  len={}",
+            loaded.path(doc),
+            loaded.length(doc)
+        );
     }
-    let head = &written[..20];
-    if let Err(e) = Index::load_bytes(head) {
-        println!("  the first {} bytes of the real file: {e}", head.len());
+
+    println!("\nquery \"owner\", ranked by tf * idf:");
+    for (doc, tf, score) in rank(loaded.search("owner"), loaded.documents()) {
+        println!(
+            "  {score:>7.4}  {:<26} tf={tf}  len={}",
+            loaded.path(doc),
+            loaded.length(doc)
+        );
+    }
+
+    // The version field, doing its job: the same file with the version
+    // patched to 1 is a file this build does not read.
+    let mut stale = written.clone();
+    stale[8..12].copy_from_slice(&1u32.to_le_bytes());
+    if let Err(e) = Index::load_bytes(&stale) {
+        println!("\na version 1 file: {e}");
     }
 
     Ok(())
@@ -415,6 +559,12 @@ mod tests {
         index
     }
 
+    /// The document ids in a term's postings, for the tests that only
+    /// care which documents matched.
+    fn ids(index: &Index, term: &str) -> Vec<u32> {
+        index.search(term).iter().map(|p| p.doc).collect()
+    }
+
     #[test]
     fn add_document_returns_the_id_it_gave() {
         let mut index = Index::new();
@@ -425,14 +575,36 @@ mod tests {
     #[test]
     fn a_term_in_two_documents_lists_both() {
         let index = sample();
-        assert_eq!(index.search("quick"), &[0, 1]);
+        assert_eq!(ids(&index, "quick"), [0, 1]);
     }
 
     #[test]
     fn a_term_repeated_in_one_document_lists_it_once() {
         let mut index = Index::new();
         index.add_document("a.md", "fox fox fox");
-        assert_eq!(index.search("fox"), &[0]);
+        assert_eq!(ids(&index, "fox"), [0]);
+    }
+
+    #[test]
+    fn a_repeated_term_records_how_often_it_repeated() {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox fox fox");
+        assert_eq!(index.search("fox"), &[Posting { doc: 0, tf: 3 }]);
+    }
+
+    #[test]
+    fn distinct_terms_in_one_document_get_one_posting_each() {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox dog fox");
+        assert_eq!(index.search("fox"), &[Posting { doc: 0, tf: 2 }]);
+        assert_eq!(index.search("dog"), &[Posting { doc: 0, tf: 1 }]);
+    }
+
+    #[test]
+    fn document_length_counts_the_terms_the_tokeniser_kept() {
+        let mut index = Index::new();
+        index.add_document("a.md", "The Quick Brown Fox");
+        assert_eq!(index.length(0), 3); // "the" is a stop word
     }
 
     #[test]
@@ -440,7 +612,7 @@ mod tests {
         let index = sample();
         assert_eq!(index.path(0), "a.md");
         assert_eq!(index.path(1), "b.md");
-        assert_eq!(index.search("dog"), &[1]);
+        assert_eq!(ids(&index, "dog"), [1]);
     }
 
     #[test]
@@ -452,15 +624,15 @@ mod tests {
     #[test]
     fn casing_and_punctuation_are_folded_away() {
         let index = sample();
-        assert_eq!(index.search("fox"), &[0]);
-        assert_eq!(index.search("dog"), &[1]);
+        assert_eq!(ids(&index, "fox"), [0]);
+        assert_eq!(ids(&index, "dog"), [1]);
     }
 
     #[test]
     fn stop_words_are_not_indexed() {
         let index = sample();
         assert!(index.search("the").is_empty());
-        assert_eq!(index.search("quick"), &[0, 1]);
+        assert_eq!(ids(&index, "quick"), [0, 1]);
     }
 
     #[test]
@@ -469,15 +641,15 @@ mod tests {
         index.add_document("a.md", "borrowing");
         index.add_document("b.md", "borrowed");
         index.add_document("c.md", "borrows");
-        assert_eq!(index.search("borrow"), &[0, 1, 2]);
+        assert_eq!(ids(&index, "borrow"), [0, 1, 2]);
     }
 
     #[test]
     fn a_doubled_consonant_from_the_suffix_is_collapsed() {
         let mut index = Index::new();
         index.add_document("a.md", "running dropped");
-        assert_eq!(index.search("run"), &[0]);
-        assert_eq!(index.search("drop"), &[0]);
+        assert_eq!(ids(&index, "run"), [0]);
+        assert_eq!(ids(&index, "drop"), [0]);
     }
 
     #[test]
@@ -486,16 +658,16 @@ mod tests {
         index.add_document("a.md", "classes");
         index.add_document("b.md", "boxes");
         index.add_document("c.md", "buzzes");
-        assert_eq!(index.search("class"), &[0]);
-        assert_eq!(index.search("box"), &[1]);
-        assert_eq!(index.search("buzz"), &[2]);
+        assert_eq!(ids(&index, "class"), [0]);
+        assert_eq!(ids(&index, "box"), [1]);
+        assert_eq!(ids(&index, "buzz"), [2]);
     }
 
     #[test]
     fn a_stem_needs_three_characters() {
         let mut index = Index::new();
         index.add_document("a.md", "ring");
-        assert_eq!(index.search("ring"), &[0]);
+        assert_eq!(ids(&index, "ring"), [0]);
         assert!(index.search("r").is_empty());
     }
 
@@ -503,7 +675,49 @@ mod tests {
     fn case_folding_is_unicode_aware() {
         let mut index = Index::new();
         index.add_document("a.md", "Ärger");
-        assert_eq!(index.search("ärger"), &[0]);
+        assert_eq!(ids(&index, "ärger"), [0]);
+    }
+
+    #[test]
+    fn idf_is_zero_for_a_term_in_every_document() {
+        assert_eq!(idf(2, 2), 0.0);
+    }
+
+    #[test]
+    fn idf_falls_as_the_document_frequency_rises() {
+        assert!(idf(1, 6) > idf(2, 6));
+        assert!(idf(2, 6) > idf(5, 6));
+        assert_eq!(idf(1, 6), 6.0f64.ln());
+    }
+
+    #[test]
+    fn rank_puts_the_highest_score_first() {
+        let postings = [Posting { doc: 0, tf: 1 }, Posting { doc: 1, tf: 5 }];
+        let ranked = rank(&postings, 6);
+        assert_eq!(ranked[0].0, 1);
+        assert!(ranked[0].2 > ranked[1].2);
+    }
+
+    #[test]
+    fn rank_keeps_the_input_order_of_equal_scores() {
+        let postings = [Posting { doc: 3, tf: 1 }, Posting { doc: 1, tf: 1 }];
+        let ranked = rank(&postings, 6);
+        assert_eq!(ranked.iter().map(|r| r.0).collect::<Vec<_>>(), [3, 1]);
+    }
+
+    /// The length bias, pinned as the behaviour the demo shows: on the
+    /// demo corpus "borrow" ranks the long style guide above the page
+    /// that is actually about borrowing, because it mentions the term
+    /// more often. Step 6 replaces the scorer, and this test with it.
+    #[test]
+    fn raw_term_frequency_lets_the_longer_document_win() {
+        let mut index = Index::new();
+        for (path, text) in &corpus() {
+            index.add_document(path, text);
+        }
+        let ranked = rank(index.search("borrow"), index.documents());
+        assert_eq!(index.path(ranked[0].0), "docs/style-guide.md");
+        assert_eq!(index.path(ranked[1].0), "docs/borrow-checker.md");
     }
 
     /// A scratch path in the OS temp directory. Each test picks its own
@@ -520,12 +734,29 @@ mod tests {
         let loaded = Index::load(&path).unwrap();
         assert_eq!(loaded.documents(), index.documents());
         assert_eq!(loaded.terms(), index.terms());
-        for (term, ids) in index.postings() {
-            assert_eq!(loaded.search(term), ids, "postings for {term:?}");
+        for (term, postings) in index.postings() {
+            assert_eq!(loaded.search(term), postings, "postings for {term:?}");
         }
         for id in 0..index.documents() as u32 {
             assert_eq!(loaded.path(id), index.path(id));
+            assert_eq!(loaded.length(id), index.length(id));
         }
+    }
+
+    #[test]
+    fn a_terms_frequency_survives_a_reload() {
+        let mut index = Index::new();
+        index.add_document("a.md", "fox fox fox");
+        index.add_document("b.md", "fox");
+        let path = scratch("frequencies");
+        index.save(&path).unwrap();
+        let loaded = Index::load(&path).unwrap();
+        assert_eq!(
+            loaded.search("fox"),
+            &[Posting { doc: 0, tf: 3 }, Posting { doc: 1, tf: 1 }]
+        );
+        assert_eq!(loaded.length(0), 3);
+        assert_eq!(loaded.length(1), 1);
     }
 
     #[test]
@@ -552,12 +783,13 @@ mod tests {
         reader.u32().unwrap();
         for _ in 0..reader.u32().unwrap() {
             reader.string().unwrap();
+            reader.u32().unwrap(); // the document's length
         }
         let mut terms = Vec::new();
         for _ in 0..reader.u32().unwrap() {
             let term = reader.string().unwrap();
             let ids = reader.u32().unwrap();
-            reader.take(ids as usize * 4).unwrap(); // the postings list
+            reader.take(ids as usize * 8).unwrap(); // doc and tf, four bytes each
             terms.push(term);
         }
         assert!(
@@ -595,9 +827,39 @@ mod tests {
     fn a_newer_version_is_refused() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
         let error = Index::load_bytes(&bytes).unwrap_err();
-        assert_eq!(error.to_string(), "unsupported index version 2");
+        assert_eq!(error.to_string(), "unsupported index version 3");
+    }
+
+    #[test]
+    fn a_version_1_file_is_refused() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        let error = Index::load_bytes(&bytes).unwrap_err();
+        assert_eq!(error.to_string(), "unsupported index version 1");
+    }
+
+    #[test]
+    fn a_postings_list_that_is_not_ascending_is_refused() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // no documents
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // one term
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // one byte long
+        bytes.push(b'x');
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // two postings
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // document 2
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // term frequency 1
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // document 1 — out of order
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // term frequency 1
+        let error = Index::load_bytes(&bytes).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the postings list for \"x\" is not in ascending document order"
+        );
     }
 
     #[test]
