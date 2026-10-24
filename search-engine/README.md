@@ -2,7 +2,7 @@
 
 Track: <https://hackingwithrust.com/projects/search-engine/>
 
-**Status: step 11 of 12 published.**
+**Status: step 12 of 12 published.**
 
 Tags: `search-ch02` … `search-ch12`. See [`../README.md`](../README.md) for what the tags mean.
 
@@ -74,3 +74,9 @@ file's size against the text it was built from. The corpus is generated,
 not gathered — what it has is the shape that matters for the
 measurement, and ground truth that is exact. Numbers and their limits
 are in the article.
+
+Since step 12, the engine's code has not moved: the last article puts
+the finished project next to Lucene — segments, compression, and the
+ranking models — using the measurements above as the baseline. The
+engine's final state is tag `search-ch11`; `search-ch12` adds only this
+file.
