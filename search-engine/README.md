@@ -2,7 +2,7 @@
 
 Track: <https://hackingwithrust.com/projects/search-engine/>
 
-**Status: step 10 of 12 published.**
+**Status: step 11 of 12 published.**
 
 Tags: `search-ch02` … `search-ch12`. See [`../README.md`](../README.md) for what the tags mean.
 
@@ -14,6 +14,7 @@ fetches dependencies the first time:
 cargo run          # the demo
 cargo test
 cargo run -- serve # the HTTP API on http://127.0.0.1:8000
+cargo bench        # the benchmark (step 11)
 ```
 
 The engine itself is unchanged: `serve` loads the same index file the demo
@@ -54,3 +55,22 @@ the old index whole. Readers see a consistent snapshot while a writer
 adds: the demo runs three reader threads against the same index behind
 an `RwLock` while the writer adds three documents. Two processes
 writing one index file is still out of scope — nothing locks the file.
+
+Since step 11, the engine is a library and the binary is a thin command
+line. The split exists because a benchmark is a separate crate and a
+benchmark needs to import the engine: `src/lib.rs` holds the index, the
+ranker and the query grammar; `src/main.rs` holds the demo, `serve` and
+`add`. `cargo bench` runs `benches/benchmark.rs` — criterion as a
+dev-dependency, never in the shipped binary.
+
+The benchmark grows a deterministic corpus of two thousand documents
+with a Zipf term distribution and twenty-four queries whose relevant
+documents are known by construction, then measures three things: the
+latency of building the index and of each query kind against two
+brute-force baselines (one handed pre-tokenised terms, one that pays the
+tokeniser on every query); recall against the labelled answers,
+including the same queries with a one-character typo; and the index
+file's size against the text it was built from. The corpus is generated,
+not gathered — what it has is the shape that matters for the
+measurement, and ground truth that is exact. Numbers and their limits
+are in the article.

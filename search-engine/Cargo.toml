@@ -7,3 +7,10 @@ edition = "2024"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "benchmark"
+harness = false
