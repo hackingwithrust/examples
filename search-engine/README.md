@@ -2,7 +2,7 @@
 
 Track: <https://hackingwithrust.com/projects/search-engine/>
 
-**Status: step 9 of 12 published.**
+**Status: step 10 of 12 published.**
 
 Tags: `search-ch02` … `search-ch12`. See [`../README.md`](../README.md) for what the tags mean.
 
@@ -44,3 +44,13 @@ Since step 9, `GET /search?q=...` answers the same queries as JSON:
 `{"query": "...", "total": n, "results": [{"path": "...", "score": ...}]}`.
 A request without `q`, or a `q` the grammar refuses, is a 400 with
 `{"error": "..."}` — the grammar's own message, not a framework default.
+
+Since step 10, the index can grow after it is written. `cargo run -- add
+<file>...` loads `haystack.idx`, indexes each file under its path, and
+saves — a path already in the index is re-indexed in place, not
+duplicated, so an edited document keeps its id. Saving writes a
+temporary file and renames it into place, so an interrupted save leaves
+the old index whole. Readers see a consistent snapshot while a writer
+adds: the demo runs three reader threads against the same index behind
+an `RwLock` while the writer adds three documents. Two processes
+writing one index file is still out of scope — nothing locks the file.

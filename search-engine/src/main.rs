@@ -11,7 +11,8 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::thread;
 
 /// One entry in a term's postings list: the document, and where each
 /// occurrence of the term sits in it.
@@ -42,6 +43,12 @@ struct Index {
     postings: HashMap<String, Vec<Posting>>,
     /// document id -> the document itself.
     documents: Vec<Document>,
+    /// path -> document id. The reverse lookup `documents` cannot
+    /// answer without a scan, and the one question incremental
+    /// indexing asks over and over is "is this path already here?".
+    /// It is derived state: rebuilt from `documents` on load, never
+    /// written to the file.
+    paths: HashMap<String, u32>,
 }
 
 impl Index {
@@ -49,12 +56,27 @@ impl Index {
         Index {
             postings: HashMap::new(),
             documents: Vec::new(),
+            paths: HashMap::new(),
         }
     }
 
     /// Index one document. `path` is its id; `text` is its contents.
-    /// Returns the id the document was given.
+    /// Returns the id the document has.
+    ///
+    /// A path the index has seen before is a new version of that
+    /// document, not a second copy: the old postings are removed and
+    /// the new text takes the same id. Everything derived — the
+    /// document count, the lengths, the frequencies — moves with it,
+    /// because it is all counted from what the index holds rather
+    /// than accumulated alongside it.
     fn add_document(&mut self, path: &str, text: &str) -> u32 {
+        // A known path is replaced: its old postings leave first, so
+        // what comes back carries only the new text's terms.
+        let existing = self.paths.get(path).copied();
+        if let Some(id) = existing {
+            self.remove_postings(id);
+        }
+
         // The terms this document contributes, each tagged with its
         // position: the index of the term in the sequence the
         // tokeniser produced. Positions are attached before the sort,
@@ -68,25 +90,64 @@ impl Index {
         // next to each other in position order.
         terms.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
-        let id = self.documents.len() as u32;
-        self.documents.push(Document {
-            path: path.to_string(),
-            length: terms.len() as u32,
-        });
+        // The id: the one this document already had, or the next free
+        // one — which is the largest id in the index, so a new
+        // document's postings append to lists that are already
+        // ascending and stay that way.
+        let id = match existing {
+            Some(id) => {
+                self.documents[id as usize] = Document {
+                    path: path.to_string(),
+                    length: terms.len() as u32,
+                };
+                id
+            }
+            None => {
+                let id = self.documents.len() as u32;
+                self.documents.push(Document {
+                    path: path.to_string(),
+                    length: terms.len() as u32,
+                });
+                id
+            }
+        };
 
         // Each distinct term becomes one posting, carrying its run's
-        // positions — the count of which is the term frequency.
+        // positions — the count of which is the term frequency. The
+        // insert keeps the list ascending, whether the document is
+        // new (its id is the largest) or replaced (its old posting was
+        // just removed, and the rest of the list is in order).
         for (term, run) in count_terms(&terms) {
-            self.postings
-                .entry(term.to_string())
-                .or_default()
-                .push(Posting {
+            insert_posting(
+                self.postings.entry(term.to_string()).or_default(),
+                Posting {
                     doc: id,
                     positions: run,
-                });
+                },
+            );
         }
 
+        self.paths.insert(path.to_string(), id);
         id
+    }
+
+    /// Remove every posting that belongs to document `id`, and the
+    /// terms left with no postings at all.
+    ///
+    /// A term whose last posting goes is a term the index has stopped
+    /// knowing, so it leaves the dictionary: `terms` counts what the
+    /// index can answer questions about, not what it once could.
+    fn remove_postings(&mut self, id: u32) {
+        let mut emptied: Vec<String> = Vec::new();
+        for (term, postings) in self.postings.iter_mut() {
+            postings.retain(|p| p.doc != id);
+            if postings.is_empty() {
+                emptied.push(term.clone());
+            }
+        }
+        for term in emptied {
+            self.postings.remove(&term);
+        }
     }
 
     /// The postings for `term`. Empty when the index has never seen
@@ -452,14 +513,14 @@ impl Index {
         Ok(self.score(&matches.docs, &refs))
     }
 
-    /// Write the index to `path` as one binary file: the magic and the
-    /// version, the documents with their lengths, then the dictionary
-    /// with its postings lists, terms in sorted order.
+    /// The bytes of the index file: the magic and the version, the
+    /// documents with their lengths, then the dictionary with its
+    /// postings lists, terms in sorted order.
     ///
-    /// The file is built in memory and written in one call. At this size
-    /// that is cheaper than a buffered writer, and it makes the whole
-    /// file one value that can be compared, hashed or diffed.
-    fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+    /// The file is built in memory in one piece. At this size that is
+    /// cheaper than a buffered writer, and it makes the whole file one
+    /// value that can be compared, hashed or diffed.
+    fn save_bytes(&self) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::new();
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
@@ -480,7 +541,21 @@ impl Index {
                 }
             }
         }
-        fs::write(path, out)
+        out
+    }
+
+    /// Write the index to `path` as one binary file.
+    ///
+    /// The bytes are written beside the target and renamed into
+    /// place: a rename inside one directory is atomic, so a crash
+    /// mid-write leaves the old file whole instead of half of the new
+    /// one. That matters more once saving is incremental — every
+    /// added document saves the whole index again.
+    fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let path = path.as_ref();
+        let temporary = path.with_extension("tmp");
+        fs::write(&temporary, self.save_bytes())?;
+        fs::rename(&temporary, path)
     }
 
     /// Read an index back from `path`. Reading the file and interpreting
@@ -509,6 +584,11 @@ impl Index {
         for _ in 0..reader.u32()? {
             let path = reader.string()?;
             let length = reader.u32()?;
+            // The reverse lookup is rebuilt here rather than read from
+            // the file: it is derived from the document list, and a
+            // file that carried it could disagree with the list.
+            let id = index.documents.len() as u32;
+            index.paths.insert(path.clone(), id);
             index.documents.push(Document { path, length });
         }
         for _ in 0..reader.u32()? {
@@ -839,6 +919,22 @@ fn count_terms(sorted: &[(u32, String)]) -> Vec<(&str, Vec<u32>)> {
     counts
 }
 
+/// Put a posting into its document's slot in an ascending list, found
+/// by binary search. A document the list does not hold yet is
+/// inserted at that point; one it already holds is replaced there.
+///
+/// This is what keeps the step-2 promise — every postings list
+/// ascending in document id — true of an index that grew after it was
+/// written to disk. A new document's id is larger than every id in
+/// the list, so its slot is the end: an append. A replaced document's
+/// slot is the one its old posting just left.
+fn insert_posting(postings: &mut Vec<Posting>, posting: Posting) {
+    match postings.binary_search_by_key(&posting.doc, |p| p.doc) {
+        Ok(at) => postings[at] = posting,
+        Err(at) => postings.insert(at, posting),
+    }
+}
+
 /// How much information a term carries: the natural log of the document
 /// count over the number of documents containing the term.
 ///
@@ -1023,185 +1119,208 @@ fn corpus() -> [(&'static str, &'static str); 6] {
     ]
 }
 
-/// `haystack` runs the demo; `haystack serve` serves the API.
+/// `haystack` runs the demo; `haystack serve` serves the API;
+/// `haystack add <file>...` indexes files into the index on disk.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("serve") => serve(INDEX_PATH).await,
+        Some("add") => {
+            let files: Vec<String> = std::env::args().skip(2).collect();
+            add(INDEX_PATH, &files)
+        }
         Some(other) => {
-            eprintln!("unknown command {other:?} - the only one is `serve`");
+            eprintln!("unknown command {other:?} - the commands are `serve` and `add`");
             Ok(())
         }
         None => demo(),
     }
 }
 
-/// The demo: everything the engine does, printed. `cargo run` runs it;
-/// `cargo run -- serve` starts the HTTP API instead.
+/// Index files into the index on disk: read each file, add it under
+/// its path, save. This is the incremental path the demo walks by
+/// hand — load, add, save — with the file reading a real run needs.
+///
+/// A file that is already in the index is re-indexed in place: the
+/// path is the document's id, so the same path is a new version of
+/// the same document rather than a second copy.
+fn add(index_path: &str, files: &[String]) -> Result<(), Box<dyn Error>> {
+    if files.is_empty() {
+        eprintln!("usage: haystack add <file>...");
+        return Ok(());
+    }
+    let mut index = Index::load(index_path).map_err(|e| {
+        format!("cannot load {index_path}: {e} - run `cargo run` first to create it")
+    })?;
+    for file in files {
+        let text = fs::read_to_string(file)?;
+        let id = index.add_document(file, &text);
+        println!(
+            "indexed {file} as document {id} — {} documents, {} terms",
+            index.documents(),
+            index.terms()
+        );
+    }
+    index.save(index_path)?;
+    println!("saved {index_path}");
+    Ok(())
+}
+
+/// The demo: build the corpus index and save it, then do what this
+/// step is about — add a document to the index on disk, replace one,
+/// and read while a writer writes. `cargo run` runs it; `cargo run --
+/// serve` starts the HTTP API; `cargo run -- add <file>...` indexes
+/// new files into the saved index.
 fn demo() -> Result<(), Box<dyn Error>> {
     let mut index = Index::new();
     for (path, text) in &corpus() {
         index.add_document(path, text);
     }
     println!(
-        "{} documents, {} distinct terms",
+        "built the corpus: {} documents, {} distinct terms",
         index.documents(),
         index.terms()
     );
-
     index.save(INDEX_PATH)?;
     let written = fs::read(INDEX_PATH)?;
-    println!("\nsaved to {INDEX_PATH}: {} bytes", written.len());
+    println!("saved to {INDEX_PATH}: {} bytes", written.len());
 
-    // The dictionary is written in sorted order, so the same index
-    // always produces the same bytes.
-    index.save(INDEX_PATH)?;
-    let rewritten = fs::read(INDEX_PATH)?;
-    println!(
-        "saved again: {} bytes, byte-identical: {}",
-        rewritten.len(),
-        rewritten == written
-    );
-
-    let loaded = Index::load(INDEX_PATH)?;
+    // The state every later run starts from: the index is on disk,
+    // and the texts that built it are not. A new document arrives.
+    let mut index = Index::load(INDEX_PATH)?;
     println!(
         "\nloaded back: {} documents, {} terms",
-        loaded.documents(),
-        loaded.terms()
+        index.documents(),
+        index.terms()
+    );
+    let id = index.add_document(
+        "docs/testing.md",
+        "A test that asserts one property at a time is easier to trust than a test that asserts ten. Unit tests need no network.",
+    );
+    println!("added docs/testing.md as document {id}");
+    index.save(INDEX_PATH)?;
+    let mut index = Index::load(INDEX_PATH)?;
+    println!(
+        "saved and reloaded: {} documents, {} terms",
+        index.documents(),
+        index.terms()
+    );
+    println!("query \"test\":");
+    for (doc, score) in index.query("test")? {
+        println!("  {score:>7.4}  {}", index.path(doc));
+    }
+
+    // The same path again. Not a second copy — a new version of the
+    // same document, under the same id.
+    let id = index.add_document(
+        "docs/testing.md",
+        "A test that asserts one property at a time is easier to trust. Integration tests exercise the whole path.",
+    );
+    println!("\nre-indexed docs/testing.md, still document {id}");
+    index.save(INDEX_PATH)?;
+    let index = Index::load(INDEX_PATH)?;
+    println!(
+        "saved and reloaded: {} documents, {} terms",
+        index.documents(),
+        index.terms()
+    );
+    println!(
+        "  length now {}, \"integration\" at {:?}",
+        index.length(id),
+        index.positions("integration", id)
     );
 
-    // What a posting carries now: the document, and where each
-    // occurrence sits in it.
-    println!("\npostings for \"borrow\" — count, then positions:");
-    for posting in loaded.search("borrow") {
-        println!(
-            "  {:<26} tf={}  positions={:?}",
-            loaded.path(posting.doc),
-            posting.positions.len(),
-            posting.positions
-        );
-    }
-
-    // The single-term ranker from step 6, unchanged: the scores are
-    // the same, now read off the position counts.
-    println!("\nquery \"borrow\", ranked by BM25:");
-    for (doc, tf, score) in loaded.rank("borrow") {
-        println!(
-            "  {score:>7.4}  {:<26} tf={tf}  len={}",
-            loaded.path(doc),
-            loaded.length(doc)
-        );
-    }
-
-    // A phrase is a different question from its terms: the words have
-    // to be next to each other, in order.
-    println!("\nphrase \"borrow checker\":");
-    for doc in loaded.phrase(&["borrow", "checker"]) {
-        println!("  {}", loaded.path(doc));
-    }
-    println!("phrase \"checker borrow\" — the other order:");
-    if loaded.phrase(&["checker", "borrow"]).is_empty() {
-        println!("  no documents");
-    }
-
-    // AND only asks whether both terms are there. The phrase also
-    // asks where: "value" and "owner" share two documents, but sit
-    // next to each other in neither.
-    println!("\n\"value AND owner\":");
-    for doc in loaded.boolean("value AND owner").unwrap() {
-        println!("  {}", loaded.path(doc));
-    }
-    println!("phrase \"value owner\":");
-    if loaded.phrase(&["value", "owner"]).is_empty() {
-        println!("  no documents");
-    }
-
-    for query in ["borrow AND checker", "borrow OR value", "borrow NOT lifetime"] {
-        println!("\nquery \"{query}\":");
-        match loaded.query(query) {
-            Ok(ranked) => {
-                for (doc, score) in ranked {
-                    println!("  {score:>7.4}  {}", loaded.path(doc));
+    // One writer, several readers, one index behind a lock: every
+    // reader sees the index whole — never documents without their
+    // postings, never postings without their documents.
+    let shared = Arc::new(RwLock::new(Index::load(INDEX_PATH)?));
+    let base = shared.read().unwrap().documents();
+    let mut readers = Vec::new();
+    for _ in 0..3 {
+        let shared = Arc::clone(&shared);
+        readers.push(thread::spawn(move || {
+            let mut queries = 0;
+            for _ in 0..50 {
+                let index = shared.read().unwrap();
+                let documents = index.documents();
+                // What a query matched is inside the collection, and
+                // every document in it can be looked up.
+                for (doc, _) in index.query("test OR borrow").unwrap() {
+                    assert!((doc as usize) < documents);
                 }
+                // A document the writer has added is searchable in
+                // the same snapshot that counts it.
+                if documents > base {
+                    assert!(!index.query("test").unwrap().is_empty());
+                }
+                queries += 1;
             }
-            Err(e) => println!("  {e}"),
+            queries
+        }));
+    }
+    for (path, text) in &late() {
+        shared.write().unwrap().add_document(path, text);
+    }
+    let mut total = 0;
+    let mut consistent = true;
+    for reader in readers {
+        match reader.join() {
+            Ok(queries) => total += queries,
+            Err(_) => consistent = false,
         }
     }
-
-    // Step 8: a typo in a query used to miss, because the dictionary
-    // has no such key. Now the dictionary itself is searched by edit
-    // distance.
-    println!("\nfuzzy \"borow\" within 1 edit:");
-    for (term, distance) in loaded.fuzzy("borow", 1) {
-        println!("  {term:<12} distance {distance}");
-    }
-    println!("fuzzy \"liefetime\" within 2 edits:");
-    for (term, distance) in loaded.fuzzy("liefetime", 2) {
-        println!("  {term:<12} distance {distance}");
-    }
-    println!("fuzzy \"valu\" within 2 edits — the radius reaches further than you would think:");
-    for (term, distance) in loaded.fuzzy("valu", 2) {
-        println!("  {term:<12} distance {distance}");
-    }
-    println!("fuzzy \"zzzzz\" within 2 edits:");
-    if loaded.fuzzy("zzzzz", 2).is_empty() {
-        println!("  no terms");
-    }
-
-    // The typo'd query answers what the reader meant, and ranks it
-    // the way the correct spelling does: "borrow" is the only variant
-    // within reach, so it is the only term it scores by.
-    println!("\n\"borow~\" and \"borrow\" answer the same:");
     println!(
-        "  {}",
-        loaded.query("borow~").unwrap() == loaded.query("borrow").unwrap()
+        "\n{total} queries across 3 readers while 3 documents were added; consistent: {consistent}"
     );
 
-    // A radius that reaches two terms scores by both, the way an OR
-    // does: "valu" is one edit from "value" and two from "valid", and
-    // each document scores by the one it holds.
-    println!("\nquery \"valu~2\":");
-    for (doc, score) in loaded.query("valu~2").unwrap() {
-        println!("  {score:>7.4}  {}", loaded.path(doc));
+    // The engine answers the questions it answered before, off the
+    // index the writer left behind.
+    let index = shared.read().unwrap();
+    println!("\nquery \"borrow\", ranked by BM25:");
+    for (doc, tf, score) in index.rank("borrow") {
+        println!(
+            "  {score:>7.4}  {:<26} tf={tf}  len={}",
+            index.path(doc),
+            index.length(doc)
+        );
+    }
+    println!("\n\"value AND owner\":");
+    for doc in index.boolean("value AND owner").unwrap() {
+        println!("  {}", index.path(doc));
     }
 
-    // What the operator refuses to guess at.
-    println!("\nquery \"the~\" — a stop word:");
-    if loaded.query("the~").unwrap().is_empty() {
-        println!("  no documents");
-    }
-    println!("query \"borrow-checker~\" — a hyphenated word:");
-    if loaded.query("borrow-checker~").unwrap().is_empty() {
-        println!("  no documents");
-    }
-    println!("\nquery \"borow~3\" — a radius past the cap:");
-    if let Err(e) = loaded.query("borow~3") {
-        println!("  {e}");
-    }
-    println!("query \"borow~x\" — not a radius at all:");
-    if let Err(e) = loaded.query("borow~x") {
-        println!("  {e}");
-    }
+    // What the writer added is on disk now as well: saving is just
+    // another write of the same bytes, and the next process — a
+    // query, the API, another `add` — picks up from there.
+    index.save(INDEX_PATH)?;
+    println!(
+        "\nsaved: {} documents in {INDEX_PATH}",
+        index.documents()
+    );
 
-    // The query grammar refuses an operator with nothing on one side
-    // of it, rather than guessing what was meant.
-    println!("\nquery \"borrow AND\":");
-    if let Err(e) = loaded.query("borrow AND") {
-        println!("  {e}");
-    }
-
-    // The version field, doing its job: the same file with the version
-    // patched to 2 — the format this step replaced — is a file this
-    // build does not read.
-    let mut stale = written.clone();
-    stale[8..12].copy_from_slice(&2u32.to_le_bytes());
-    if let Err(e) = Index::load_bytes(&stale) {
-        println!("\na version 2 file: {e}");
-    }
-
-    println!("\nquery the same index over HTTP: cargo run -- serve");
+    println!("\nadd a file: cargo run -- add docs/notes.md");
+    println!("query the same index over HTTP: cargo run -- serve");
 
     Ok(())
+}
+
+/// The documents that arrive after the index was built: what the
+/// writer adds while the readers read.
+fn late() -> [(&'static str, &'static str); 3] {
+    [
+        (
+            "docs/traits.md",
+            "A trait is a contract: every type that implements it answers the same questions. A trait object dispatches at runtime.",
+        ),
+        (
+            "docs/closures.md",
+            "A closure captures its environment by reference, by mutable reference, or by move. The compiler picks the least it can.",
+        ),
+        (
+            "docs/concurrency.md",
+            "Threads share nothing by default. A channel moves messages between them, and ownership travels with the message.",
+        ),
+    ]
 }
 
 /// The stop words: terms so common that indexing them costs memory and
@@ -2210,5 +2329,109 @@ mod tests {
     fn a_query_the_grammar_refuses_is_a_bad_request() {
         let error = ApiError::BadQuery(QueryError::BadFuzzy("borow~3".to_string()));
         assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    // --- incremental indexing ---
+
+    #[test]
+    fn a_loaded_index_takes_a_new_document() {
+        let mut loaded = Index::load_bytes(&sample().save_bytes()).unwrap();
+        assert_eq!(loaded.documents(), 2);
+        // The new document gets the next id — the largest so far.
+        assert_eq!(loaded.add_document("c.md", "fox bird"), 2);
+        assert_eq!(loaded.documents(), 3);
+        assert_eq!(ids(&loaded, "fox"), [0, 2]);
+        assert_eq!(ids(&loaded, "bird"), [2]);
+        // The documents that were already there are untouched.
+        assert_eq!(ids(&loaded, "quick"), [0, 1]);
+    }
+
+    #[test]
+    fn an_added_documents_postings_stay_in_order() {
+        let mut loaded = Index::load_bytes(&sample().save_bytes()).unwrap();
+        loaded.add_document("c.md", "quick fox cat");
+        for term in ["quick", "fox", "cat"] {
+            let docs: Vec<u32> = loaded.search(term).iter().map(|p| p.doc).collect();
+            assert!(
+                docs.windows(2).all(|pair| pair[0] < pair[1]),
+                "{term}: {docs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_known_path_is_reindexed_not_duplicated() {
+        let mut loaded = Index::load_bytes(&sample().save_bytes()).unwrap();
+        // a.md comes back with different text: same id, new contents.
+        assert_eq!(loaded.add_document("a.md", "red fox"), 0);
+        assert_eq!(loaded.documents(), 2);
+        assert_eq!(loaded.path(0), "a.md");
+        assert_eq!(loaded.path(1), "b.md");
+        assert_eq!(ids(&loaded, "fox"), [0]);
+        assert_eq!(loaded.positions("fox", 0), [1]);
+        // "quick" was in a.md and b.md; it survives in b.md only.
+        assert_eq!(ids(&loaded, "quick"), [1]);
+        // No query answers with the same path twice.
+        let ranked = loaded.query("fox").unwrap();
+        let paths: Vec<&str> = ranked.iter().map(|&(doc, _)| loaded.path(doc)).collect();
+        assert_eq!(paths, ["a.md"]);
+    }
+
+    #[test]
+    fn a_replaced_documents_terms_leave_when_they_go() {
+        let mut index = Index::new();
+        index.add_document("a.md", "alpha beta");
+        index.add_document("b.md", "beta gamma");
+        assert_eq!(index.terms(), 3);
+        // b.md loses "gamma" and gains "delta".
+        index.add_document("b.md", "beta delta");
+        assert_eq!(index.terms(), 3);
+        assert!(index.search("gamma").is_empty());
+        assert_eq!(ids(&index, "delta"), [1]);
+        assert_eq!(ids(&index, "beta"), [0, 1]);
+    }
+
+    #[test]
+    fn a_saved_and_loaded_index_survives_adding_byte_for_byte() {
+        let mut loaded = Index::load_bytes(&sample().save_bytes()).unwrap();
+        loaded.add_document("c.md", "fox bird");
+        // Saving what was just loaded writes the same bytes the
+        // in-memory index would have: the round trip loses nothing.
+        let mut grown = sample();
+        grown.add_document("c.md", "fox bird");
+        assert_eq!(loaded.save_bytes(), grown.save_bytes());
+    }
+
+    #[test]
+    fn average_length_moves_with_the_documents() {
+        let mut loaded = Index::load_bytes(&sample().save_bytes()).unwrap();
+        assert_eq!(loaded.average_length(), 3.5); // 3 and 4 terms
+        loaded.add_document("c.md", "one two three four five six"); // 6 terms
+        assert_eq!(loaded.average_length(), 13.0 / 3.0);
+        // Replacing a document moves the average too.
+        loaded.add_document("a.md", "fox"); // 3 terms -> 1
+        assert_eq!(loaded.average_length(), 11.0 / 3.0);
+    }
+
+    #[test]
+    fn a_new_document_can_top_the_ranking() {
+        let mut loaded = Index::load_bytes(&sample().save_bytes()).unwrap();
+        loaded.add_document("c.md", "fox fox fox fox fox");
+        let ranked = loaded.rank("fox");
+        assert_eq!(loaded.path(ranked[0].0), "c.md");
+    }
+
+    #[test]
+    fn reindexing_a_document_leaves_the_others_alone() {
+        let mut loaded = Index::load_bytes(&sample().save_bytes()).unwrap();
+        assert_eq!(ids(&loaded, "quick"), [0, 1]);
+        loaded.add_document("c.md", "quick");
+        assert_eq!(ids(&loaded, "quick"), [0, 1, 2]);
+        // Now replace c.md: quick's list loses document 2 and nothing
+        // else, and b.md's own postings never moved.
+        loaded.add_document("c.md", "slow");
+        assert_eq!(ids(&loaded, "quick"), [0, 1]);
+        assert_eq!(loaded.search("slow")[0].doc, 2);
+        assert_eq!(loaded.positions("quick", 1), [2]);
     }
 }
