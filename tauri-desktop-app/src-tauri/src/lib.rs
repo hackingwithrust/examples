@@ -39,6 +39,13 @@ async fn export_note(
     })
 }
 
+/// The preview and the HTML export share one renderer, so what the window shows and what the
+/// file contains cannot drift apart.
+#[tauri::command]
+fn render_note(body: String) -> String {
+    render_markdown(&body)
+}
+
 #[derive(Serialize)]
 pub struct Stats {
     count: usize,
@@ -357,8 +364,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            add, divide, stats, create_note, list_notes, update_note, search_notes, export_note,
-            print_main
+            add, divide, stats, create_note, list_notes, update_note, search_notes, render_note,
+            export_note, print_main
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -6,12 +6,11 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import "./App.css";
 
-type Stats = { count: number; total: number; mean: number };
 type Note = { id: number; title: string; body: string; created_at: number };
 type SearchHit = { id: number; title: string; snippet: string };
 
-const SAMPLE = [3, 1, 4, 1, 5, 9, 2, 6];
-
+/** A hit arrives with its matches wrapped in «», which is the only markup SQLite's snippet()
+ *  gives us; anything else in the string is the note's own text and must stay escaped. */
 function Highlighted({ text }: { text: string }) {
   const parts = text.split(/(«[^»]*»)/g);
   return (
@@ -28,9 +27,6 @@ function Highlighted({ text }: { text: string }) {
 }
 
 function App() {
-  const [a, setA] = useState("42");
-  const [b, setB] = useState("7");
-  const [result, setResult] = useState("");
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -38,47 +34,9 @@ function App() {
   const [notes, setNotes] = useState<Note[]>([]);
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<SearchHit[] | null>(null);
+  const [preview, setPreview] = useState("");
   const [printHtml, setPrintHtml] = useState("");
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  async function add() {
-    try {
-      const value = await invoke<number>("add", {
-        firstNumber: Number(a),
-        secondNumber: Number(b),
-      });
-      setResult(String(value));
-    } catch (e) {
-      setResult(`Error: ${e}`);
-    }
-  }
-
-  async function divide() {
-    try {
-      const value = await invoke<number>("divide", {
-        dividend: Number(a),
-        divisor: Number(b),
-      });
-      setResult(String(value));
-    } catch (e) {
-      setResult(`Error: ${e}`);
-    }
-  }
-
-  async function summarise() {
-    const s = await invoke<Stats>("stats", { numbers: SAMPLE });
-    setResult(`${s.count} numbers, total ${s.total}, mean ${s.mean.toFixed(3)}`);
-  }
-
-  async function saveNote() {
-    try {
-      const id = await invoke<number>("create_note", { title });
-      setSaved(`saved note #${id}`);
-      await loadNotes();
-    } catch (e) {
-      setSaved(`Error: ${e}`);
-    }
-  }
 
   async function loadNotes() {
     try {
@@ -91,18 +49,6 @@ function App() {
   useEffect(() => {
     loadNotes();
   }, []);
-
-  async function search() {
-    try {
-      if (query.trim() === "") {
-        setHits(null);
-        return;
-      }
-      setHits(await invoke<SearchHit[]>("search_notes", { query }));
-    } catch (e) {
-      setSaved(`Error: ${e}`);
-    }
-  }
 
   function startEdit(note: Note) {
     setEditingId(note.id);
@@ -124,13 +70,56 @@ function App() {
     saveTimer.current = setTimeout(async () => {
       try {
         await invoke("update_note", { id, title: nextTitle, body: nextBody });
-        setSaved(`saved note #${id}`);
+        setSaved("saved just now");
         await loadNotes();
       } catch (e) {
         setSaved(`Error: ${e}`);
       }
     }, 500);
   }
+
+  async function saveNote() {
+    try {
+      const id = await invoke<number>("create_note", { title });
+      setEditingId(id);
+      setSaved(`saved note #${id}`);
+      await loadNotes();
+    } catch (e) {
+      setSaved(`Error: ${e}`);
+    }
+  }
+
+  /** The preview is rendered by the same pulldown-cmark path the HTML export uses, one
+   *  debounce behind the keyboard: a keystroke is cheap, a round trip through IPC is not. */
+  useEffect(() => {
+    if (body.trim() === "") {
+      setPreview("");
+      return;
+    }
+    const timer = setTimeout(() => {
+      invoke<string>("render_note", { body })
+        .then(setPreview)
+        .catch((e) => setSaved(`Error: ${e}`));
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [body]);
+
+  /** Type and the list narrows. FTS5 wants the whole string on each call, so the debounce is
+   *  what keeps this from querying once per character. */
+  useEffect(() => {
+    if (query.trim() === "") {
+      setHits(null);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      try {
+        setHits(await invoke<SearchHit[]>("search_notes", { query }));
+      } catch (e) {
+        setSaved(`Error: ${e}`);
+      }
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [query]);
 
   async function importNote(path: string) {
     try {
@@ -218,121 +207,119 @@ function App() {
     };
   }, []);
 
+  const listing = hits ?? null;
+
   return (
-    <main className="container">
-      <h1>rustnote</h1>
-      <p>
-        Commands registered in <code>generate_handler!</code> and called with{" "}
-        <code>invoke()</code>.
-      </p>
-      <div className="row">
+    <div className="app">
+      <aside className="sidebar">
+        <div className="sidebar-top">
+          <span className="brand">rustnote</span>
+          <span className="count">{notes.length} notes</span>
+        </div>
         <input
-          value={a}
-          onChange={(e) => setA(e.currentTarget.value)}
-          aria-label="first number"
+          className="search"
+          value={query}
+          placeholder="Search notes"
+          aria-label="search notes"
+          onChange={(e) => setQuery(e.currentTarget.value)}
         />
+        <button className="new-note" onClick={newNote}>
+          + new note
+        </button>
+        <ul className="notes">
+          {listing !== null
+            ? listing.map((hit) => (
+                <li
+                  key={hit.id}
+                  className={hit.id === editingId ? "active" : ""}
+                  onClick={() => {
+                    const note = notes.find((n) => n.id === hit.id);
+                    if (note) startEdit(note);
+                  }}
+                >
+                  <span className="note-title">
+                    <Highlighted text={hit.title} />
+                  </span>
+                  <span className="note-meta">
+                    <Highlighted text={hit.snippet} />
+                  </span>
+                </li>
+              ))
+            : notes.map((note) => (
+                <li
+                  key={note.id}
+                  className={note.id === editingId ? "active" : ""}
+                  onClick={() => startEdit(note)}
+                >
+                  <span className="note-title">{note.title}</span>
+                  <span className="note-meta">
+                    {new Date(note.created_at * 1000).toLocaleDateString()}
+                  </span>
+                </li>
+              ))}
+          {listing !== null && listing.length === 0 && (
+            <li className="empty">no matches</li>
+          )}
+          {listing === null && notes.length === 0 && (
+            <li className="empty">no notes yet — write one on the right</li>
+          )}
+        </ul>
+      </aside>
+
+      <main className="editor">
         <input
-          value={b}
-          onChange={(e) => setB(e.currentTarget.value)}
-          aria-label="second number"
-        />
-      </div>
-      <div className="row">
-        <button onClick={add}>Add</button>
-        <button onClick={divide}>Divide</button>
-        <button onClick={summarise}>Summarise the sample</button>
-      </div>
-      <p>{result}</p>
-      <div className="row">
-        <input
+          className="note-title-input"
           value={title}
+          placeholder="Note title"
+          aria-label="note title"
           onChange={(e) => {
             const next = e.currentTarget.value;
             setTitle(next);
             if (editingId !== null) scheduleSave(editingId, next, body);
           }}
-          aria-label="note title"
         />
-        {editingId === null ? (
-          <button onClick={saveNote}>Save note</button>
+        <textarea
+          className="note-body"
+          value={body}
+          disabled={editingId === null}
+          placeholder={
+            editingId === null
+              ? "Press “+ new note” to start writing"
+              : "Write in Markdown — the preview follows along"
+          }
+          aria-label="note body"
+          onChange={(e) => {
+            const next = e.currentTarget.value;
+            setBody(next);
+            if (editingId !== null) scheduleSave(editingId, title, next);
+          }}
+        />
+        <div className="editor-foot">
+          <span className="status">{saved}</span>
+          <div className="actions">
+            {editingId === null && (
+              <button onClick={saveNote} disabled={title.trim() === ""}>
+                Save note
+              </button>
+            )}
+            <button onClick={importFile}>Import .md</button>
+            {editingId !== null && <button onClick={exportHtml}>Export HTML</button>}
+            {editingId !== null && <button onClick={printNote}>Print</button>}
+          </div>
+        </div>
+      </main>
+
+      <section className="preview">
+        <div className="preview-head">Preview</div>
+        {preview === "" ? (
+          <p className="preview-empty">Nothing to preview yet.</p>
         ) : (
-          <button onClick={newNote}>New note</button>
+          <div className="preview-body" dangerouslySetInnerHTML={{ __html: preview }} />
         )}
-      </div>
-      <textarea
-        value={body}
-        rows={6}
-        cols={40}
-        disabled={editingId === null}
-        onChange={(e) => {
-          const next = e.currentTarget.value;
-          setBody(next);
-          if (editingId !== null) scheduleSave(editingId, title, next);
-        }}
-        aria-label="note body"
-      />
-      <p>{saved}</p>
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          search();
-        }}
-      >
-        <input
-          value={query}
-          onChange={(e) => setQuery(e.currentTarget.value)}
-          aria-label="search notes"
-        />
-        <button type="submit">Search</button>
-        {hits !== null && (
-          <button
-            type="button"
-            onClick={() => {
-              setHits(null);
-              setQuery("");
-            }}
-          >
-            Clear
-          </button>
-        )}
-      </form>
-      {hits !== null && (
-        <ul className="hits">
-          {hits.map((hit) => (
-            <li
-              key={hit.id}
-              onClick={() => {
-                const note = notes.find((n) => n.id === hit.id);
-                if (note) startEdit(note);
-              }}
-            >
-              <Highlighted text={hit.title} />
-              <br />
-              <small>
-                <Highlighted text={hit.snippet} />
-              </small>
-            </li>
-          ))}
-          {hits.length === 0 && <li>no matches</li>}
-        </ul>
-      )}
-      <div className="row">
-        <button onClick={importFile}>Import .md</button>
-        {editingId !== null && <button onClick={exportHtml}>Export HTML</button>}
-        {editingId !== null && <button onClick={printNote}>Print</button>}
-        <span>or drag a .md file into the window</span>
-      </div>
-      <ul>
-        {notes.map((note) => (
-          <li key={note.id} onClick={() => startEdit(note)}>
-            {note.title}{" "}
-            <small>{new Date(note.created_at * 1000).toLocaleDateString()}</small>
-          </li>
-        ))}
-      </ul>
+      </section>
+
       <div className="print-root" dangerouslySetInnerHTML={{ __html: printHtml }} />
-    </main>
+    </div>
   );
 }
 
