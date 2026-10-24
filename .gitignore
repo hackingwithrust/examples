@@ -1,2 +1,4 @@
 target/
 .DS_Store
+# Machine-local build-cache redirect (see the file itself); never shipped to the repo.
+/.cargo/config.toml
