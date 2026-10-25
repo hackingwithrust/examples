@@ -2,21 +2,23 @@
 
 Track: <https://hackingwithrust.com/projects/tui-ratatui/>
 
-**Status: step 7 of 8 published.**
+**Status: step 8 of 8 published. The track is complete.**
 
-Tags: `tui-ch02` … `tui-ch07` (one per article). See [`../README.md`](../README.md) for what the tags mean.
+Tags: `tui-ch02` … `tui-ch08` (one per article). See [`../README.md`](../README.md) for what the tags mean.
 
-Step 7 adds the bottom pane: every refresh records one CPU sample per process
-into a bounded ring buffer (60 samples, one per second), and the pane draws the
-selected process's window as a sparkline. The subject is a pid, so the pane
-follows the selection while the table reorders underneath it. `?` overlays the
-key list, `t` cycles three colour themes, and `space` freezes the tail — the
-key step 1 promised and this step finally builds.
+Step 8 is the release pass. The program gained the one check a terminal
+application owes its user — stdout has to be a terminal, because that is where
+the frame goes, and the errno that comes back without the check names no
+program and suggests no fix — and `Cargo.toml` gained a release profile tuned
+for a binary that leaves the machine: `strip`, `lto`, one codegen unit, and
+`panic = "abort"` (the panic hook still restores the terminal before the
+abort). The article measures what each line is worth and builds the same
+source for both Apple architectures and for Linux.
 
 ```sh
-cargo run -- ./app.log   # follow a file; q quits
-cargo run                # the same, with the default path
-cargo test               # history, themes, overlay, pause, sort, tail, render sweep
+cargo run --release -- ./app.log   # follow a file; q quits
+cargo test                          # 36 tests
+cargo build --release --target x86_64-unknown-linux-musl   # needs a linker stanza, see the article
 ```
 
 Keys: `q` quit · `/` filter (enter keeps it, esc clears) · `j`/`k` or the arrows

@@ -9,3 +9,18 @@ ratatui = "0.30"
 sysinfo = "0.39"
 tui-input = "0.15"
 nucleo = "0.5"
+
+# A release build is one that leaves this machine, so the profile is tuned for
+# the recipient: smaller, and built as one unit.
+[profile.release]
+# Drop the symbols. Nobody debugs a shipped rlog, and this is a fifth of the
+# file.
+strip = true
+# Inline across crate boundaries, and compile the whole graph as one unit
+# instead of the default sixteen. Slower to build; the payoff is size.
+lto = true
+codegen-units = 1
+# A panic in a TUI means the terminal is already in a state worth leaving, and
+# the panic hook restores it before the abort. Tests are unaffected: they run
+# in the test profile, which keeps unwinding.
+panic = "abort"

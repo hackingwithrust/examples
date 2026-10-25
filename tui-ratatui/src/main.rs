@@ -1,17 +1,15 @@
 //! rlog — a terminal UI that follows a log file and watches the process table.
 //!
-//! Step 7 of the track: the frame grows a bottom pane. Every process refresh
-//! now records one CPU sample per process into a bounded ring buffer, and the
-//! pane draws the selected process's window as a sparkline — the pane step 1
-//! sketched. `?` overlays the key list, `t` cycles three colour themes, and
-//! `space` pauses the tail, which step 1 also promised and steps 5 and 6 did
-//! not build. The history, the overlay and the themes are plain state: `draw`
-//! borrows them and changes nothing.
+//! Step 8 of the track: the release pass. The program gained the one check a
+//! terminal application owes its user — stdout has to be a terminal, because
+//! that is where the frame goes — and the release profile in `Cargo.toml` is
+//! tuned for a binary that gets shipped rather than one that gets run from
+//! `target/`. The interface is step 7's.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::File;
-use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
+use std::io::{self, ErrorKind, IsTerminal, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -269,6 +267,19 @@ struct App {
 }
 
 fn main() -> io::Result<()> {
+    // The frame has to land somewhere it can be seen. `crossterm` asks the
+    // controlling terminal for raw mode and the alternate screen — `/dev/tty`
+    // on unix — and paints through stdout, so a run whose stdout is a pipe, a
+    // file or a cron job's mail has no screen to paint on. The errno that
+    // comes back without this check names no program and suggests no fix, so
+    // say what is wrong and exit 2: a wrapper can tell that from a crash,
+    // which is 101.
+    if !io::stdout().is_terminal() {
+        eprintln!("rlog needs a terminal, and stdout is not one");
+        eprintln!("run it in a terminal window; redirecting its output leaves nothing to see");
+        std::process::exit(2);
+    }
+
     // The file to follow is the first argument; `./app.log` is the default so
     // a bare `cargo run` has something to tail.
     let log_path = env::args()
@@ -2144,7 +2155,7 @@ mod tests {
 
     #[test]
     fn the_history_pane_says_so_when_nothing_is_selected() {
-        let mut app = app(scratch("history-empty"));
+        let app = app(scratch("history-empty"));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let buffer = terminal.backend().buffer();
