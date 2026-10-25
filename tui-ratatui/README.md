@@ -2,20 +2,24 @@
 
 Track: <https://hackingwithrust.com/projects/tui-ratatui/>
 
-**Status: step 4 of 8 published.**
+**Status: step 5 of 8 published.**
 
-Tags: `tui-ch02` … `tui-ch04` (one per article). See [`../README.md`](../README.md) for what the tags mean.
+Tags: `tui-ch02` … `tui-ch05` (one per article). See [`../README.md`](../README.md) for what the tags mean.
 
-Step 4 splits the single box into panes: a process `Table` on one side, a log
-`List` on the other, and a one-row status line. The layout is responsive —
-side by side at 80 columns and above, stacked below — and the mouse wheel
-scrolls whichever pane the pointer is over. Both panes hold fixed demo data;
-step 5 replaces it with live data.
+Step 5 makes the log pane live. `rlog` follows the file given on the command
+line (`./app.log` by default): it remembers its offset, reads whatever grew,
+joins a line a writer left half-finished, starts over when the file is
+truncated, and waits for a file that does not exist yet. The loop runs on two
+schedules — a 250 ms tick for events, a 250 ms poll for the file — and a dirty
+flag gates the redraw, so an idle program draws its first frame and then writes
+nothing to the terminal at all. The process table is still the fourteen demo
+rows; step 6 reads the real one.
 
 ```sh
-cargo run    # panes at the terminal's current size; q quits
-cargo test   # the scroll clamp and the layout rects
+cargo run -- ./app.log   # follow a file; q quits
+cargo run                # the same, with the default path
+cargo test               # the tail, the offset clamp, the dirty flag, the layout
 ```
 
-Nothing is read from disk yet — the log tail and the real process table arrive
-in step 5.
+In another terminal, `echo 'another line' >> app.log` appends and
+`printf 'fresh start\n' > app.log` truncates.
