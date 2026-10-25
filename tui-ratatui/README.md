@@ -2,28 +2,27 @@
 
 Track: <https://hackingwithrust.com/projects/tui-ratatui/>
 
-**Status: step 6 of 8 published.**
+**Status: step 7 of 8 published.**
 
-Tags: `tui-ch02` … `tui-ch06` (one per article). See [`../README.md`](../README.md) for what the tags mean.
+Tags: `tui-ch02` … `tui-ch07` (one per article). See [`../README.md`](../README.md) for what the tags mean.
 
-Step 6 reads the real process table. `sysinfo` walks the machine once a
-second, the snapshot is sorted by CPU (descending) with `s` cycling the sort
-column and `r` flipping the direction, and a selected row is highlighted — the
-selection is stored as a pid, so it stays on the same process while the table
-reorders underneath it. `/` opens a fuzzy filter built on `tui-input` and
-`nucleo` that narrows the process table and the log pane at once: `ngx` finds
-nginx, `1042` finds a pid. `Enter` closes the editor and keeps the filter
-active; `Esc` clears it. The log pane is still the live tail of step 5.
+Step 7 adds the bottom pane: every refresh records one CPU sample per process
+into a bounded ring buffer (60 samples, one per second), and the pane draws the
+selected process's window as a sparkline. The subject is a pid, so the pane
+follows the selection while the table reorders underneath it. `?` overlays the
+key list, `t` cycles three colour themes, and `space` freezes the tail — the
+key step 1 promised and this step finally builds.
 
 ```sh
 cargo run -- ./app.log   # follow a file; q quits
 cargo run                # the same, with the default path
-cargo test               # sort, selection, filter, tail, layout, render sweep
+cargo test               # history, themes, overlay, pause, sort, tail, render sweep
 ```
 
-Keys: `q` quit · `/` filter · `j`/`k` or the arrows move the selection · `s`
-sort · `r` reverse · `PgUp`/`PgDn` scroll the log pane · the wheel scrolls the
-pane under the pointer.
+Keys: `q` quit · `/` filter (enter keeps it, esc clears) · `j`/`k` or the arrows
+move the selection · `s` sort · `r` reverse · `space` pause the tail ·
+`PgUp`/`PgDn` scroll the log pane · `t` next colour theme · `?` help · the wheel
+scrolls the pane under the pointer.
 
 In another terminal, `echo 'another line' >> app.log` appends and
 `printf 'fresh start\n' > app.log` truncates.
