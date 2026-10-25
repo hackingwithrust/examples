@@ -1,11 +1,13 @@
 //! rlog — a terminal UI that follows a log file and watches the process table.
 //!
-//! Step 5 of the track: the fixed demo data is gone. The log pane tails a real
-//! file — it remembers its offset, picks up whatever grew, and starts over when
-//! the file is truncated underneath it — and the loop runs on schedules: one
-//! tick for events, one for the file, and a dirty flag so the screen is redrawn
-//! only when something actually changed. The process table is still the demo
-//! rows of step 4; step 6 reads the real one.
+//! Step 6 of the track: the demo process rows are gone. The table is read from
+//! the machine with `sysinfo` on a slow one-second schedule, a selected row is
+//! highlighted, `s` and `r` choose and flip the sort column, and `/` opens a
+//! fuzzy filter built on `tui-input` and `nucleo` that narrows the process
+//! table and the log pane at once. The selection is stored as a pid, so it
+//! survives the refresh that reorders the table; the sort, the selection and
+//! the filter are pure functions of the state, and that is where this step's
+//! tests live.
 
 use std::collections::VecDeque;
 use std::env;
@@ -22,20 +24,28 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use nucleo::{Config, Matcher, Utf32Str};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState};
+use sysinfo::{ProcessesToUpdate, System};
+use tui_input::backend::crossterm::EventHandler;
+use tui_input::Input;
 
 /// How long the loop waits for an event before going around again. One tick of
 /// the program's clock: short enough that a keypress feels immediate, long
 /// enough that an idle program wakes four times a second instead of spinning.
 const TICK: Duration = Duration::from_millis(250);
 
-/// How often the log file is re-read. It matches the tick here, but it is its
-/// own constant because it is its own decision: a log is cheap to poll (one
-/// `stat`, one short read) and a line that appears a quarter of a second late
-/// is still live. The process table of step 6 gets a slower schedule, because
-/// reading it costs real work.
+/// How often the log file is re-read. A log is cheap to poll (one `stat`, one
+/// short read) and a line that appears a quarter of a second late is still
+/// live.
 const LOG_POLL: Duration = Duration::from_millis(250);
+
+/// How often the process table is re-read. This is the expensive data: every
+/// process on the machine is walked, and CPU usage is a delta between two
+/// refreshes, so a once-a-second schedule is both the floor `sysinfo` wants
+/// and the fastest rate a reader can read a changing table at.
+const PROCESS_REFRESH: Duration = Duration::from_secs(1);
 
 /// The most bytes one poll reads out of the file. A log that grew by gigabytes
 /// since the last look is drained over several polls rather than pulled into
@@ -60,28 +70,52 @@ const SCROLL_STEP: isize = 3;
 /// The file `rlog` follows when no path is given.
 const DEFAULT_LOG: &str = "./app.log";
 
-/// The process table until step 6 reads the real one: pid, command, cpu
-/// percent, resident memory percent. Fourteen rows on purpose — more than the
-/// stacked layout can show at once, so the table has something to scroll.
-const PROCESSES: &[(&str, &str, f64, f64)] = &[
-    ("1", "systemd", 0.0, 0.3),
-    ("381", "launchd", 0.2, 0.5),
-    ("742", "WindowServer", 3.1, 2.4),
-    ("1204", "rlog", 1.4, 0.9),
-    ("1583", "cargo", 12.7, 1.1),
-    ("1590", "rustc", 41.3, 3.8),
-    ("1602", "rustc", 38.9, 3.6),
-    ("1711", "firefox", 8.2, 12.4),
-    ("1890", "Code Helper", 2.0, 6.1),
-    ("2044", "node", 0.9, 4.2),
-    ("2287", "tmux", 0.0, 0.2),
-    ("2410", "zsh", 0.0, 0.1),
-    ("2533", "ssh", 0.1, 0.2),
-    ("2680", "top", 0.0, 0.1),
-];
+/// One row of the process table. Everything the table shows about a process,
+/// copied out of `sysinfo` at refresh time: the snapshot is owned data, so
+/// `draw` borrows it and the tests can build one without touching the machine.
+#[derive(Debug, Clone)]
+struct ProcessRow {
+    /// The process id. It is also the selection's identity: the row order
+    /// changes every refresh, and the pid is what stays put.
+    pid: u32,
+    name: String,
+    /// Percent of one CPU, as `sysinfo` computes it between two refreshes.
+    /// A multi-threaded process can exceed 100.
+    cpu: f32,
+    /// Resident set size in bytes.
+    rss: u64,
+}
 
-/// The whole state of the program. Steps 6 and 7 grow it — the real process
-/// table, the selection, the history — and `draw` stays a pure function of it.
+/// Which column the table is sorted by. `s` cycles through them in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortColumn {
+    Pid,
+    Cpu,
+    Mem,
+}
+
+impl SortColumn {
+    /// The next column in the cycle.
+    fn next(self) -> Self {
+        match self {
+            SortColumn::Pid => SortColumn::Cpu,
+            SortColumn::Cpu => SortColumn::Mem,
+            SortColumn::Mem => SortColumn::Pid,
+        }
+    }
+
+    /// The column's name, as the pane title spells it.
+    fn label(self) -> &'static str {
+        match self {
+            SortColumn::Pid => "pid",
+            SortColumn::Cpu => "cpu",
+            SortColumn::Mem => "mem",
+        }
+    }
+}
+
+/// The whole state of the program. `draw` stays a pure function of it: the
+/// render borrows the state back and changes nothing.
 struct App {
     /// Frames actually sent to the terminal. Not the same as the number of
     /// loop passes: an idle program makes thousands of those and one of these.
@@ -107,12 +141,37 @@ struct App {
     /// The file could not be opened on the last poll. Not an error — a log
     /// that has not been created yet is a normal thing to wait for.
     log_missing: bool,
-    /// The first log line on screen. `ListState` also carries a selection,
-    /// which stays `None` until step 6.
+    /// Which log lines the pane shows: indices into `log_lines`, in order.
+    /// Every line when no filter is active, the matching ones when it is.
+    log_view: Vec<usize>,
+    /// The first log line on screen.
     log: ListState,
-    /// The first process row on screen. `TableState` likewise has no
-    /// selection yet — step 6 adds one.
+    /// The `sysinfo` handle. It owns no snapshot of its own — `processes`
+    /// below is the snapshot — but it owns the state CPU usage is computed
+    /// from, which is why it lives for the whole run.
+    system: System,
+    /// The last process snapshot, kept in the current sort order.
+    processes: Vec<ProcessRow>,
+    /// Which processes the pane shows: indices into `processes`, in order.
+    /// All of them when no filter is active, the matching ones when it is.
+    view: Vec<usize>,
+    /// The selected process, by pid. The first refresh already selects the
+    /// top row, so the highlight is on screen before the first keypress.
+    selected: Option<u32>,
+    /// The first process row on screen.
     table: TableState,
+    /// Which column sorts the table, and which way.
+    sort: SortColumn,
+    sort_desc: bool,
+    /// The filter editor, `Some` while `/` is open. Closing it keeps the
+    /// value: the filter stays active until it is cleared.
+    filter: Option<Input>,
+    /// The fuzzy matcher, and the two scratch buffers `Utf32Str` borrows.
+    /// They live in the state because a matcher is expensive to build and the
+    /// filter runs on every row of every refresh.
+    matcher: Matcher,
+    needle_buf: Vec<char>,
+    haystack_buf: Vec<char>,
 }
 
 fn main() -> io::Result<()> {
@@ -150,9 +209,26 @@ fn main() -> io::Result<()> {
         log_offset: 0,
         log_truncations: 0,
         log_missing: false,
+        log_view: Vec::new(),
         log: ListState::default(),
+        system: System::new(),
+        processes: Vec::new(),
+        view: Vec::new(),
+        selected: None,
         table: TableState::default(),
+        sort: SortColumn::Cpu,
+        sort_desc: true,
+        filter: None,
+        matcher: Matcher::new(Config::DEFAULT),
+        needle_buf: Vec::new(),
+        haystack_buf: Vec::new(),
     };
+
+    // The baseline refresh. `sysinfo` computes CPU usage as a delta between
+    // two refreshes, so the first frame shows 0.0% everywhere and the real
+    // numbers arrive with the first scheduled refresh a second later.
+    refresh_processes(&mut app);
+
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let result = run(&mut terminal, &mut app);
 
@@ -172,19 +248,25 @@ fn leave_full_screen() -> io::Result<()> {
     disable_raw_mode()
 }
 
-/// The render loop. Three things happen each pass, in this order: the log file
-/// is polled if its interval has come around, the frame is drawn if anything is
-/// dirty, and then the loop waits one tick for an event. `q`, `Esc` and
-/// `Ctrl-C` end the loop and give the terminal back; every other event lands
-/// in the state, where the next frame reports it.
+/// The render loop. Each pass, in order: poll the log file if its interval has
+/// come around, refresh the process table if its slower one has, draw if
+/// anything is dirty, then wait one tick for an event. `q`, `Esc` and `Ctrl-C`
+/// end the loop and give the terminal back; every other event lands in the
+/// state, where the next frame reports it.
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
-    // Due immediately, so the first frame already shows the file as it stands.
+    // Both due immediately: the first frame already shows the file and the
+    // process table as they stand.
     let mut log_due = Instant::now();
+    let mut process_due = Instant::now();
 
     loop {
         if Instant::now() >= log_due {
             poll_log(app)?;
             log_due = Instant::now() + LOG_POLL;
+        }
+        if Instant::now() >= process_due {
+            refresh_processes(app);
+            process_due = Instant::now() + PROCESS_REFRESH;
         }
 
         if app.dirty {
@@ -206,17 +288,84 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 /// ends the program, so the caller can break out of the loop.
 ///
 /// Every arm that a reader can see sets `dirty`: the status line reports the
-/// last key and mouse event, and a resize reflows every pane. An event that
+/// last key and mouse event, a resize reflows every pane, a keypress moves the
+/// selection or the sort, and a wheel notch moves an offset. An event that
 /// changes nothing visible — a key release, say — leaves the flag alone.
 fn apply(app: &mut App, event: Event) -> bool {
+    // While the filter editor is open, keys belong to it: `q` is a letter, not
+    // a quit. `Ctrl-C` still ends the program — it arrives as a key event in
+    // raw mode, and a user who presses it means it.
+    if app.filter.is_some() {
+        if let Event::Key(key) = &event {
+            if key.kind == KeyEventKind::Press {
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    return false;
+                }
+                match key.code {
+                    // Enter closes the editor and keeps the filter active.
+                    KeyCode::Enter => {
+                        close_filter(app, false);
+                        return true;
+                    }
+                    // Esc closes the editor and clears the filter.
+                    KeyCode::Esc => {
+                        close_filter(app, true);
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(input) = app.filter.as_mut() {
+            let changed = input.handle_event(&event).map(|s| s.value).unwrap_or(false);
+            if changed {
+                rebuild_view(app);
+                rebuild_log_view(app);
+                app.dirty = true;
+            }
+        }
+        return true;
+    }
+
     match event {
         Event::Key(key) => {
             if key.kind == KeyEventKind::Press {
                 if is_quit(key) {
                     return false;
                 }
-                app.last_key = Some(key);
-                app.dirty = true;
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        move_selection(app, 1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        move_selection(app, -1);
+                    }
+                    KeyCode::Char('s') => {
+                        app.sort = app.sort.next();
+                        sort_processes(&mut app.processes, app.sort, app.sort_desc);
+                        rebuild_view(app);
+                        app.dirty = true;
+                    }
+                    KeyCode::Char('r') => {
+                        app.sort_desc = !app.sort_desc;
+                        sort_processes(&mut app.processes, app.sort, app.sort_desc);
+                        rebuild_view(app);
+                        app.dirty = true;
+                    }
+                    KeyCode::Char('/') => {
+                        open_filter(app);
+                    }
+                    KeyCode::PageUp => {
+                        scroll_log(app, -page_step(app));
+                    }
+                    KeyCode::PageDown => {
+                        scroll_log(app, page_step(app));
+                    }
+                    _ => {
+                        app.last_key = Some(key);
+                        app.dirty = true;
+                    }
+                }
             }
         }
         Event::Mouse(mouse) => {
@@ -234,6 +383,198 @@ fn apply(app: &mut App, event: Event) -> bool {
         _ => {}
     }
     true
+}
+
+/// Read the whole process table into the snapshot, sort it, and rebuild the
+/// view. This is the expensive read, and it runs on the slow schedule.
+fn refresh_processes(app: &mut App) {
+    app.system.refresh_processes(ProcessesToUpdate::All, true);
+    app.system.refresh_memory();
+    app.processes = app
+        .system
+        .processes()
+        .values()
+        .map(|process| ProcessRow {
+            pid: process.pid().as_u32(),
+            name: process.name().to_string_lossy().into_owned(),
+            cpu: process.cpu_usage(),
+            rss: process.memory(),
+        })
+        .collect();
+    sort_processes(&mut app.processes, app.sort, app.sort_desc);
+    rebuild_view(app);
+
+    // The selection is a pid, and a refresh is exactly when a pid can stop
+    // existing. A process that exited leaves the selection pointing at
+    // nothing, and the top row takes over. A process that is still alive but
+    // hidden by the filter keeps its selection: it comes back when the filter
+    // is cleared.
+    let alive = app
+        .selected
+        .is_some_and(|pid| app.processes.iter().any(|row| row.pid == pid));
+    if !alive {
+        app.selected = app.view.first().map(|&i| app.processes[i].pid);
+    }
+    app.dirty = true;
+}
+
+/// Sort the snapshot in place. The primary key is the chosen column; the pid
+/// breaks every tie, so two processes with the same CPU keep a stable,
+/// reproducible order instead of one that depends on hash-map iteration.
+fn sort_processes(rows: &mut [ProcessRow], column: SortColumn, descending: bool) {
+    rows.sort_by(|a, b| {
+        let primary = match column {
+            SortColumn::Pid => a.pid.cmp(&b.pid),
+            SortColumn::Cpu => a.cpu.total_cmp(&b.cpu),
+            SortColumn::Mem => a.rss.cmp(&b.rss),
+        };
+        let primary = if descending { primary.reverse() } else { primary };
+        primary.then(a.pid.cmp(&b.pid))
+    });
+}
+
+/// Rebuild the process view: the indices of the rows that pass the filter, in
+/// the order the table shows them. An empty filter keeps everything.
+fn rebuild_view(app: &mut App) {
+    let needle = filter_needle(app);
+    let App {
+        matcher,
+        needle_buf,
+        haystack_buf,
+        processes,
+        view,
+        ..
+    } = app;
+    *view = (0..processes.len())
+        .filter(|&i| {
+            fuzzy_match(
+                matcher,
+                needle_buf,
+                haystack_buf,
+                &needle,
+                &row_haystack(&processes[i]),
+            )
+        })
+        .collect();
+    clamp_table(app);
+}
+
+/// What a process row is matched against: the pid and the name, joined by a
+/// space, so a needle can be either — `ngx` finds nginx, `1042` finds a pid.
+fn row_haystack(row: &ProcessRow) -> String {
+    format!("{} {}", row.pid, row.name)
+}
+
+/// The active needle, or the empty string when no filter is set. An empty
+/// needle matches everything, which is what "no filter" means.
+fn filter_needle(app: &App) -> String {
+    app.filter
+        .as_ref()
+        .map(|input| input.value().to_string())
+        .unwrap_or_default()
+}
+
+/// One fuzzy match. `needle` is the query, `haystack` is the row or line.
+///
+/// `nucleo`'s matcher works on UTF-32 strings it borrows, so the two buffers
+/// are scratch space owned by the caller and reused across calls — building a
+/// matcher allocates a large matrix, and running a filter over a thousand rows
+/// should not mean building anything per row.
+fn fuzzy_match(
+    matcher: &mut Matcher,
+    needle_buf: &mut Vec<char>,
+    haystack_buf: &mut Vec<char>,
+    needle: &str,
+    haystack: &str,
+) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let needle = Utf32Str::new(needle, needle_buf);
+    let haystack = Utf32Str::new(haystack, haystack_buf);
+    matcher.fuzzy_match(haystack, needle).is_some()
+}
+
+/// Open the filter editor. The value starts empty, so opening it shows
+/// everything until the first character arrives.
+fn open_filter(app: &mut App) {
+    app.filter = Some(Input::default());
+    app.dirty = true;
+}
+
+/// Close the filter editor. `clear` also empties the value, which is what
+/// `Esc` does; `Enter` keeps the filter active so a narrowed table stays
+/// narrowed while the keyboard goes back to moving the selection.
+fn close_filter(app: &mut App, clear: bool) {
+    app.filter = None;
+    if clear {
+        rebuild_view(app);
+        rebuild_log_view(app);
+    }
+    app.dirty = true;
+}
+
+/// Move the selection by `delta` rows in the current view, clamped at both
+/// ends. The selection is a pid, not an index: the table reorders itself under
+/// the cursor every second, and a pid is what keeps the same process
+/// highlighted while its CPU percentage moves.
+fn move_selection(app: &mut App, delta: isize) {
+    if app.view.is_empty() {
+        app.selected = None;
+        app.dirty = true;
+        return;
+    }
+    // No selection yet: `j` starts at the top, `k` at the bottom.
+    let start = selection_index(app)
+        .map(|index| index as isize)
+        .unwrap_or(if delta < 0 {
+            app.view.len() as isize
+        } else {
+            -1
+        });
+    let target = (start + delta).clamp(0, app.view.len() as isize - 1) as usize;
+    app.selected = Some(app.processes[app.view[target]].pid);
+    keep_selection_visible(app);
+    app.dirty = true;
+}
+
+/// Where the selected process sits in the current view, if it is in it.
+fn selection_index(app: &App) -> Option<usize> {
+    let pid = app.selected?;
+    app.view.iter().position(|&i| app.processes[i].pid == pid)
+}
+
+/// Pull the scroll offset to the selection after it moved. A selection below
+/// the window scrolls down by the fewest rows that bring it into view; one
+/// above scrolls back up to it.
+fn keep_selection_visible(app: &mut App) {
+    let Some(index) = selection_index(app) else {
+        return;
+    };
+    let visible = table_visible(app.size);
+    if visible == 0 {
+        return;
+    }
+    let offset = app.table.offset_mut();
+    if index < *offset {
+        *offset = index;
+    } else if index >= *offset + visible {
+        *offset = index + 1 - visible;
+    }
+}
+
+/// Pull the table's scroll offset back into range after the view changed.
+/// A filter that hides the rows below a scrolled pane would otherwise leave
+/// the offset pointing past the end.
+fn clamp_table(app: &mut App) {
+    let visible = table_visible(app.size);
+    let last = app.view.len().saturating_sub(visible);
+    let offset = app.table.offset_mut();
+    if *offset > last {
+        *offset = last;
+        app.dirty = true;
+    }
+    keep_selection_visible(app);
 }
 
 /// Read whatever the file has grown by since the last poll, and notice the two
@@ -268,12 +609,11 @@ fn poll_log(app: &mut App) -> io::Result<()> {
     let len = file.metadata()?.len();
     if len < app.log_offset {
         // Shorter than where the tail stopped reading: the file was truncated
-        // (or replaced by a shorter one). Start over from the beginning, and
-        // pull the scroll offset back with the emptied tail.
+        // (or replaced by a shorter one). Start over from the beginning.
         app.log_offset = 0;
         app.log_lines.clear();
         app.log_truncations += 1;
-        clamp_log(app);
+        rebuild_log_view(app);
         app.dirty = true;
     }
     if len == app.log_offset {
@@ -295,10 +635,7 @@ fn poll_log(app: &mut App) -> io::Result<()> {
     for line in String::from_utf8_lossy(&chunk[..usable]).lines() {
         push_log(app, line.to_string());
     }
-    if usable > 0 {
-        app.dirty = true;
-    }
-    clamp_log(app);
+    rebuild_log_view(app);
     Ok(())
 }
 
@@ -322,12 +659,24 @@ fn push_log(app: &mut App, line: String) {
     app.log_lines.push_back(line);
 }
 
-/// Pull the log's scroll offset back into range after its contents changed.
-/// Truncating the file empties the tail, and a tail that shrank underneath a
-/// scrolled pane would otherwise leave the offset pointing past the end.
-fn clamp_log(app: &mut App) {
+/// Rebuild the log view: the indices of the lines the pane shows, and pull the
+/// scroll offset back into range. The filter runs over the whole line, because
+/// a log line is one string and there is no field boundary to match against.
+fn rebuild_log_view(app: &mut App) {
+    let needle = filter_needle(app);
+    let App {
+        matcher,
+        needle_buf,
+        haystack_buf,
+        log_lines,
+        log_view,
+        ..
+    } = app;
+    *log_view = (0..log_lines.len())
+        .filter(|&i| fuzzy_match(matcher, needle_buf, haystack_buf, &needle, &log_lines[i]))
+        .collect();
     let visible = log_visible(app.size);
-    let last = app.log_lines.len().saturating_sub(visible);
+    let last = log_view.len().saturating_sub(visible);
     let offset = app.log.offset_mut();
     if *offset > last {
         *offset = last;
@@ -335,19 +684,25 @@ fn clamp_log(app: &mut App) {
     }
 }
 
-/// Split the screen into the three panes: the process table, the log list and
-/// the one-row status line. Wide terminals put the two panes side by side;
+/// Split the screen into the frame: a one-row header, the two panes, the
+/// filter line and the status line. Wide terminals put the panes side by side;
 /// narrow ones stack them, the table above the log.
 ///
-/// The status line is `Length(1)`: it takes its row first, and the panes share
-/// what is left, so a squeezed pane can never push it off the screen.
-fn layout(area: Rect) -> [Rect; 3] {
-    let [main, status] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+/// The header, the filter line and the status line are `Length(1)`: they take
+/// their rows first, and the panes share what is left, so a squeezed pane can
+/// never push them off the screen.
+fn layout(area: Rect) -> [Rect; 5] {
+    let [header, main, filter, status] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
     if area.width >= WIDE {
         let [table, log] =
             Layout::horizontal([Constraint::Percentage(38), Constraint::Fill(1)]).areas(main);
-        [table, log, status]
+        [header, table, log, filter, status]
     } else {
         // The table is `Length(11)` — header, eight processes and the border —
         // and the log takes the rest. A `Min(11)` floor would not do here: the
@@ -355,15 +710,36 @@ fn layout(area: Rect) -> [Rect; 3] {
         // the table would keep growing as the terminal grows taller.
         let [table, log] =
             Layout::vertical([Constraint::Length(11), Constraint::Fill(1)]).areas(main);
-        [table, log, status]
+        [header, table, log, filter, status]
     }
 }
 
 /// How many log lines the pane can show at the current size: the border takes
 /// a row off the top and one off the bottom.
 fn log_visible(size: (u16, u16)) -> usize {
-    let [_, log_area, _] = layout(Rect::new(0, 0, size.0, size.1));
+    let [_, _, log_area, _, _] = layout(Rect::new(0, 0, size.0, size.1));
     log_area.height.saturating_sub(2) as usize
+}
+
+/// How many process rows the pane can show at the current size: the border
+/// takes a row off the top and one off the bottom, and the header row takes
+/// one more.
+fn table_visible(size: (u16, u16)) -> usize {
+    let [_, table_area, _, _, _] = layout(Rect::new(0, 0, size.0, size.1));
+    table_area.height.saturating_sub(3) as usize
+}
+
+/// How many lines one `PgUp`/`PgDn` scrolls: a screenful, less the row that
+/// stays put so the reader keeps their place.
+fn page_step(app: &App) -> isize {
+    log_visible(app.size).saturating_sub(1) as isize
+}
+
+/// Scroll the log pane by `delta` lines, clamped at both ends.
+fn scroll_log(app: &mut App, delta: isize) {
+    let visible = log_visible(app.size);
+    scroll_offset(app.log.offset_mut(), app.log_view.len(), visible, delta);
+    app.dirty = true;
 }
 
 /// A wheel notch scrolls the pane the pointer is over. The layout is the hit
@@ -375,16 +751,16 @@ fn scroll_wheel(app: &mut App, mouse: MouseEvent) {
         MouseEventKind::ScrollDown => SCROLL_STEP,
         _ => return,
     };
-    let [table_area, log_area, _] = layout(Rect::new(0, 0, app.size.0, app.size.1));
+    let [_, table_area, log_area, _, _] = layout(Rect::new(0, 0, app.size.0, app.size.1));
     let at = Position::new(mouse.column, mouse.row);
     if table_area.contains(at) {
         // The table spends its first inner row on the header, so the rows
         // that fit are three fewer than the pane is tall.
         let visible = table_area.height.saturating_sub(3) as usize;
-        scroll_offset(app.table.offset_mut(), PROCESSES.len(), visible, delta);
+        scroll_offset(app.table.offset_mut(), app.view.len(), visible, delta);
     } else {
         let visible = log_area.height.saturating_sub(2) as usize;
-        scroll_offset(app.log.offset_mut(), app.log_lines.len(), visible, delta);
+        scroll_offset(app.log.offset_mut(), app.log_view.len(), visible, delta);
     }
 }
 
@@ -397,26 +773,44 @@ fn scroll_offset(offset: &mut usize, len: usize, visible: usize, delta: isize) {
     *offset = (*offset as isize + delta).clamp(0, last) as usize;
 }
 
-/// The whole frame: three panes and the status line, laid out from the
-/// terminal's current size. Both states are `Copy`, so `draw` takes the app by
-/// shared reference and renders from copies — the offset the widget writes
-/// back while rendering lands on the copy, and the state changes only when an
-/// event says so.
+/// The whole frame: header, two panes, the filter line and the status line,
+/// laid out from the terminal's current size. Both states are `Copy`, so
+/// `draw` takes the app by shared reference and renders from copies — the
+/// offset and selection the widgets write back while rendering land on the
+/// copies, and the state changes only when an event says so.
 fn draw(frame: &mut Frame, app: &App) {
-    let [table_area, log_area, status_area] = layout(frame.area());
+    let [header_area, table_area, log_area, filter_area, status_area] = layout(frame.area());
 
-    let rows = PROCESSES.iter().map(|(pid, command, cpu, mem)| {
+    // The header answers "is this box busy?" before anything is selected:
+    // how many processes there are, and how much of the memory they hold.
+    let gib = |bytes: u64| bytes as f64 / (1024 * 1024 * 1024) as f64;
+    let used = gib(app.system.used_memory());
+    let total = gib(app.system.total_memory());
+    frame.render_widget(
+        Paragraph::new(Line::from(format!(
+            " rlog · {} processes · {used:.1}/{total:.1} GB resident",
+            app.processes.len()
+        )))
+        .style(Style::new().add_modifier(Modifier::BOLD)),
+        header_area,
+    );
+
+    let rows = app.view.iter().map(|&i| {
+        let process = &app.processes[i];
         Row::new(vec![
-            Cell::from(*pid),
-            Cell::from(*command),
-            Cell::from(Line::from(format!("{cpu:.1}")).alignment(Alignment::Right)),
-            Cell::from(Line::from(format!("{mem:.1}")).alignment(Alignment::Right)),
+            Cell::from(process.pid.to_string()),
+            Cell::from(process.name.as_str()),
+            Cell::from(Line::from(format!("{:.1}", process.cpu)).alignment(Alignment::Right)),
+            Cell::from(
+                Line::from(format!("{:.1}", percent(process.rss, app.system.total_memory())))
+                    .alignment(Alignment::Right),
+            ),
         ])
     });
     let table = Table::new(
         rows,
         [
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Min(8),
             Constraint::Length(5),
             Constraint::Length(5),
@@ -428,19 +822,25 @@ fn draw(frame: &mut Frame, app: &App) {
         Cell::from(Line::from("CPU%").alignment(Alignment::Right)),
         Cell::from(Line::from("MEM%").alignment(Alignment::Right)),
     ]))
-    .block(Block::bordered().title(format!(
-        " processes [{}/{}] ",
-        app.table.offset() + 1,
-        PROCESSES.len()
-    )));
+    .block(Block::bordered().title(format!(" processes {} ", table_title(app))))
+    // The selection is drawn by the widget: a marker in front of the row and
+    // the row reversed, so the eye finds it without reading the numbers.
+    .highlight_symbol("▸")
+    .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     let mut table_state = app.table;
+    table_state.select(selection_index(app));
     frame.render_stateful_widget(table, table_area, &mut table_state);
 
-    let log = List::new(app.log_lines.iter().map(|line| ListItem::new(line.as_str()))).block(
-        Block::bordered().title(format!(" log {} ", log_title(app))),
-    );
+    let log = List::new(
+        app.log_view
+            .iter()
+            .map(|&i| ListItem::new(app.log_lines[i].as_str())),
+    )
+    .block(Block::bordered().title(format!(" log {} ", log_title(app))));
     let mut log_state = app.log;
     frame.render_stateful_widget(log, log_area, &mut log_state);
+
+    draw_filter(frame, filter_area, app);
 
     frame.render_widget(
         Paragraph::new(Line::from(format!(
@@ -456,17 +856,68 @@ fn draw(frame: &mut Frame, app: &App) {
     );
 }
 
-/// The log pane's title: where the tail stands, and how many times it has been
-/// restarted. An empty tail says so rather than claiming a first line.
-fn log_title(app: &App) -> String {
-    if app.log_lines.is_empty() {
+/// The filter line. Closed, it is a dim hint that says what `/` does; open, it
+/// shows the value with the cursor after it, and the terminal cursor is placed
+/// there so typing looks like typing.
+fn draw_filter(frame: &mut Frame, area: Rect, app: &App) {
+    let (text, style) = match &app.filter {
+        Some(input) => (
+            format!("/ {}", input.value()),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+        None => (
+            "press / to filter".to_string(),
+            Style::new().add_modifier(Modifier::DIM),
+        ),
+    };
+    frame.render_widget(Paragraph::new(Line::from(text)).style(style), area);
+
+    if let Some(input) = &app.filter {
+        // The row holds "/ " plus the value. `visual_scroll` says how much of
+        // the value is scrolled off to the left at this width; the cursor is
+        // drawn where it falls inside the visible part.
+        let width = area.width.saturating_sub(3) as usize;
+        let scroll = input.visual_scroll(width);
+        let x = input.visual_cursor().max(scroll) - scroll + 2;
+        frame.set_cursor_position((area.x + x as u16, area.y));
+    }
+}
+
+/// The process pane's title: where the top row stands, how many rows the view
+/// holds, and which column sorts and which way.
+fn table_title(app: &App) -> String {
+    if app.view.is_empty() {
         return "empty".to_string();
     }
-    let mut title = format!("[{}/{}]", app.log.offset() + 1, app.log_lines.len());
+    format!(
+        "[{}/{}] · {} {}",
+        app.table.offset() + 1,
+        app.view.len(),
+        app.sort.label(),
+        if app.sort_desc { "desc" } else { "asc" }
+    )
+}
+
+/// The log pane's title: where the tail stands, and how many times it has been
+/// restarted. An empty view says so rather than claiming a first line — which
+/// includes the case of a filter that matches nothing.
+fn log_title(app: &App) -> String {
+    if app.log_view.is_empty() {
+        return "empty".to_string();
+    }
+    let mut title = format!("[{}/{}]", app.log.offset() + 1, app.log_view.len());
     if app.log_truncations > 0 {
         title.push_str(&format!(" trunc {}", app.log_truncations));
     }
     title
+}
+
+/// Resident bytes as a percentage of the machine's total memory.
+fn percent(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        return 0.0;
+    }
+    part as f64 / whole as f64 * 100.0
 }
 
 /// Name the log pane for the status line: where the tail stands, or that the
@@ -475,7 +926,7 @@ fn describe_log(app: &App) -> String {
     if app.log_missing {
         "log missing".to_string()
     } else {
-        format!("log {}@{}B", app.log_lines.len(), app.log_offset)
+        format!("log {}@{}B", app.log_view.len(), app.log_offset)
     }
 }
 
@@ -551,10 +1002,11 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+    use tui_input::InputRequest;
 
     /// An app pointed at a scratch file, the state `main` builds at startup.
     fn app(log_path: PathBuf) -> App {
-        App {
+        let mut app = App {
             draws: 0,
             dirty: true,
             last_key: None,
@@ -565,14 +1017,316 @@ mod tests {
             log_offset: 0,
             log_truncations: 0,
             log_missing: false,
+            log_view: Vec::new(),
             log: ListState::default(),
+            system: System::new(),
+            processes: Vec::new(),
+            view: Vec::new(),
+            selected: None,
             table: TableState::default(),
-        }
+            sort: SortColumn::Cpu,
+            sort_desc: true,
+            filter: None,
+            matcher: Matcher::new(Config::DEFAULT),
+            needle_buf: Vec::new(),
+            haystack_buf: Vec::new(),
+        };
+        refresh_processes(&mut app);
+        // The baseline refresh above reads the real machine; the tests that
+        // install their own snapshot start from the startup state instead,
+        // so nothing the test machine happens to be running leaks in.
+        app.processes.clear();
+        app.view.clear();
+        app.selected = None;
+        app.table = TableState::default();
+        app.dirty = false;
+        app
     }
 
     /// A scratch file with its own name, so parallel tests do not share one.
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rlog-test-{name}.log"))
+    }
+
+    /// A fixed snapshot, so the sort and selection tests do not read the
+    /// machine the test happens to run on.
+    fn rows() -> Vec<ProcessRow> {
+        vec![
+            ProcessRow { pid: 1042, name: "rlog".into(), cpu: 8.1, rss: 40_000_000 },
+            ProcessRow { pid: 988, name: "nvim".into(), cpu: 6.4, rss: 20_000_000 },
+            ProcessRow { pid: 812, name: "node".into(), cpu: 3.0, rss: 60_000_000 },
+            ProcessRow { pid: 381, name: "nginx".into(), cpu: 0.0, rss: 5_000_000 },
+        ]
+    }
+
+    /// The same rows in a different order, as a refresh would leave them:
+    /// node got busy, the rest kept their numbers.
+    fn refreshed() -> Vec<ProcessRow> {
+        vec![
+            ProcessRow { pid: 812, name: "node".into(), cpu: 61.0, rss: 60_000_000 },
+            ProcessRow { pid: 1042, name: "rlog".into(), cpu: 8.1, rss: 40_000_000 },
+            ProcessRow { pid: 988, name: "nvim".into(), cpu: 6.4, rss: 20_000_000 },
+            ProcessRow { pid: 381, name: "nginx".into(), cpu: 0.0, rss: 5_000_000 },
+        ]
+    }
+
+    #[test]
+    fn sorting_puts_the_busiest_process_first() {
+        let mut table = rows();
+        // The default: CPU, descending.
+        sort_processes(&mut table, SortColumn::Cpu, true);
+        let names: Vec<&str> = table.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["rlog", "nvim", "node", "nginx"]);
+
+        // `r` flips it without touching the column.
+        sort_processes(&mut table, SortColumn::Cpu, false);
+        let names: Vec<&str> = table.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["nginx", "node", "nvim", "rlog"]);
+
+        // `s` moves to the next column, and the direction survives the move.
+        sort_processes(&mut table, SortColumn::Mem, true);
+        let pids: Vec<u32> = table.iter().map(|row| row.pid).collect();
+        assert_eq!(pids, [812, 1042, 988, 381]);
+
+        // pid sorts ascending, and the pid breaks every tie, so the order
+        // never depends on anything but the data.
+        sort_processes(&mut table, SortColumn::Pid, false);
+        let pids: Vec<u32> = table.iter().map(|row| row.pid).collect();
+        assert_eq!(pids, [381, 812, 988, 1042]);
+    }
+
+    #[test]
+    fn equal_keys_keep_the_pid_order() {
+        let mut table = vec![
+            ProcessRow { pid: 40, name: "b".into(), cpu: 1.0, rss: 1 },
+            ProcessRow { pid: 10, name: "a".into(), cpu: 1.0, rss: 1 },
+            ProcessRow { pid: 20, name: "c".into(), cpu: 1.0, rss: 1 },
+        ];
+        sort_processes(&mut table, SortColumn::Cpu, true);
+        let pids: Vec<u32> = table.iter().map(|row| row.pid).collect();
+        assert_eq!(pids, [10, 20, 40]);
+    }
+
+    #[test]
+    fn the_selection_follows_the_pid_not_the_row() {
+        let mut app = app(scratch("selection"));
+        app.processes = rows();
+        sort_processes(&mut app.processes, app.sort, app.sort_desc);
+        rebuild_view(&mut app);
+
+        // nvim is the second row: two presses from no selection reach it.
+        move_selection(&mut app, 1);
+        move_selection(&mut app, 1);
+        assert_eq!(app.selected, Some(988));
+        assert_eq!(selection_index(&app), Some(1));
+
+        app.processes = refreshed();
+        sort_processes(&mut app.processes, app.sort, app.sort_desc);
+        rebuild_view(&mut app);
+        assert_eq!(app.selected, Some(988));
+        // nvim dropped from second to third, and the index followed the pid.
+        assert_eq!(selection_index(&app), Some(2));
+    }
+
+    #[test]
+    fn a_process_that_exits_hands_the_selection_to_the_top_row() {
+        let mut app = app(scratch("exited"));
+        app.processes = rows();
+        sort_processes(&mut app.processes, app.sort, app.sort_desc);
+        rebuild_view(&mut app);
+        move_selection(&mut app, 1);
+        move_selection(&mut app, 1);
+        move_selection(&mut app, 1);
+        assert_eq!(app.selected, Some(812));
+
+        // node (812) is gone from the next snapshot; the top row takes over.
+        app.processes = rows().into_iter().filter(|row| row.pid != 812).collect();
+        sort_processes(&mut app.processes, app.sort, app.sort_desc);
+        rebuild_view(&mut app);
+        let alive = app
+            .selected
+            .is_some_and(|pid| app.processes.iter().any(|row| row.pid == pid));
+        assert!(!alive);
+        app.selected = app.view.first().map(|&i| app.processes[i].pid);
+        assert_eq!(app.selected, Some(1042));
+    }
+
+    #[test]
+    fn moving_the_selection_clamps_at_both_ends() {
+        let mut app = app(scratch("clamp-move"));
+        app.processes = rows();
+        sort_processes(&mut app.processes, app.sort, app.sort_desc);
+        rebuild_view(&mut app);
+
+        // No selection yet: the first `j` lands on the first row, and `k`
+        // from there has nowhere to go.
+        move_selection(&mut app, 1);
+        assert_eq!(app.selected, Some(1042));
+        move_selection(&mut app, -1);
+        assert_eq!(app.selected, Some(1042));
+
+        // `j` walks down: rlog (8.1), nvim (6.4), node (3.0), nginx (0.0),
+        // and one more press has nowhere to go either.
+        move_selection(&mut app, 3);
+        assert_eq!(app.selected, Some(381));
+        move_selection(&mut app, 1);
+        assert_eq!(app.selected, Some(381));
+
+        // An empty view leaves nothing selected.
+        app.view.clear();
+        move_selection(&mut app, 1);
+        assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn the_selection_stays_visible_when_the_table_scrolls() {
+        let mut app = app(scratch("visible"));
+        // Thirty rows, of which the pane shows 24 at 100x30: a 27-row table
+        // minus the border pair and the header.
+        for i in 1..=30u32 {
+            app.processes.push(ProcessRow {
+                pid: 1000 + i,
+                name: format!("worker{i}"),
+                cpu: i as f32,
+                rss: 1,
+            });
+        }
+        sort_processes(&mut app.processes, app.sort, app.sort_desc);
+        rebuild_view(&mut app);
+        assert_eq!(table_visible(app.size), 24);
+
+        // Select the last row — worker1, pid 1001, because CPU sorts
+        // descending: the offset jumps so it is on screen.
+        move_selection(&mut app, 100);
+        assert_eq!(app.selected, Some(1001));
+        assert_eq!(app.table.offset(), 30 - table_visible(app.size));
+        assert!(selection_index(&app).unwrap() >= app.table.offset());
+
+        // Selecting the first row scrolls back to the top.
+        move_selection(&mut app, -100);
+        assert_eq!(app.selected, Some(1030));
+        assert_eq!(app.table.offset(), 0);
+    }
+
+    #[test]
+    fn the_filter_matches_names_and_pids_fuzzily() {
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        let mut needle_buf = Vec::new();
+        let mut haystack_buf = Vec::new();
+
+        // The step 1 example: `ngx` finds nginx.
+        assert!(fuzzy_match(
+            &mut matcher,
+            &mut needle_buf,
+            &mut haystack_buf,
+            "ngx",
+            "381 nginx"
+        ));
+        // A needle that is not in the row does not.
+        assert!(!fuzzy_match(
+            &mut matcher,
+            &mut needle_buf,
+            &mut haystack_buf,
+            "nginx",
+            "381 ngin"
+        ));
+        // The pid is part of the haystack, so a number works too.
+        assert!(fuzzy_match(
+            &mut matcher,
+            &mut needle_buf,
+            &mut haystack_buf,
+            "1042",
+            "1042 rlog"
+        ));
+        // No filter keeps everything.
+        assert!(fuzzy_match(
+            &mut matcher,
+            &mut needle_buf,
+            &mut haystack_buf,
+            "",
+            "anything at all"
+        ));
+    }
+
+    #[test]
+    fn the_filter_narrows_both_panes_at_once() {
+        let mut app = app(scratch("filter"));
+        app.processes = rows();
+        sort_processes(&mut app.processes, app.sort, app.sort_desc);
+        rebuild_view(&mut app);
+        for i in 1..=6 {
+            app.log_lines.push_back(format!("line {i}"));
+        }
+        rebuild_log_view(&mut app);
+
+        // No filter: every row and every line is in view.
+        assert_eq!(app.view.len(), 4);
+        assert_eq!(app.log_view.len(), 6);
+
+        app.filter = Some(Input::from("vim"));
+        rebuild_view(&mut app);
+        rebuild_log_view(&mut app);
+        // nvim, and nothing else, in the table; no log line matches "vim".
+        let names: Vec<&str> = app.view.iter().map(|&i| app.processes[i].name.as_str()).collect();
+        assert_eq!(names, ["nvim"]);
+        assert!(app.log_view.is_empty());
+
+        // A needle that matches log lines: the pane narrows to them.
+        app.filter = Some(Input::from("line 3"));
+        rebuild_view(&mut app);
+        rebuild_log_view(&mut app);
+        assert!(app.view.is_empty());
+        assert_eq!(app.log_view.len(), 1);
+        assert_eq!(app.log_lines[app.log_view[0]], "line 3");
+    }
+
+    #[test]
+    fn closing_the_filter_with_esc_clears_it_and_enter_keeps_it() {
+        let mut app = app(scratch("close"));
+        app.processes = rows();
+        sort_processes(&mut app.processes, app.sort, app.sort_desc);
+        open_filter(&mut app);
+        if let Some(input) = app.filter.as_mut() {
+            input.handle(InputRequest::InsertChar('v'));
+            input.handle(InputRequest::InsertChar('i'));
+            input.handle(InputRequest::InsertChar('m'));
+        }
+        rebuild_view(&mut app);
+        assert_eq!(app.view.len(), 1);
+
+        // Enter: the editor closes, the narrowed table stays narrowed.
+        close_filter(&mut app, false);
+        assert!(app.filter.is_none());
+        assert_eq!(app.view.len(), 1);
+
+        // Esc: the value goes, and everything is back.
+        open_filter(&mut app);
+        if let Some(input) = app.filter.as_mut() {
+            input.handle(InputRequest::InsertChar('n'));
+        }
+        close_filter(&mut app, true);
+        assert!(app.filter.is_none());
+        rebuild_view(&mut app);
+        assert_eq!(app.view.len(), 4);
+    }
+
+    #[test]
+    fn the_sort_keys_move_through_the_columns() {
+        let mut app = app(scratch("sort-keys"));
+        app.processes = rows();
+        assert_eq!(app.sort, SortColumn::Cpu);
+        assert!(app.sort_desc);
+        // `s` cycles cpu → mem → pid → cpu, and `r` flips the direction.
+        let event = |code: KeyCode| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        assert!(apply(&mut app, event(KeyCode::Char('s'))));
+        assert_eq!(app.sort, SortColumn::Mem);
+        assert!(apply(&mut app, event(KeyCode::Char('s'))));
+        assert_eq!(app.sort, SortColumn::Pid);
+        assert!(apply(&mut app, event(KeyCode::Char('r'))));
+        assert!(!app.sort_desc);
+        // And a keypress is still reported by the status line.
+        assert!(apply(&mut app, event(KeyCode::Char('x'))));
+        assert_eq!(app.last_key.unwrap().code, KeyCode::Char('x'));
     }
 
     #[test]
@@ -589,7 +1343,7 @@ mod tests {
         let mut app = app(scratch("partial"));
         std::fs::write(&app.log_path, b"whole line\nhalf a li").unwrap();
         poll_log(&mut app).unwrap();
-        assert_eq!(app.log_lines.len(), 1);
+        assert_eq!(app.log_view.len(), 1);
         assert_eq!(app.log_offset, 11);
 
         // The rest of the line arrives on the next poll and the halves join.
@@ -599,7 +1353,7 @@ mod tests {
             .unwrap();
         file.write_all(b"ne\n").unwrap();
         poll_log(&mut app).unwrap();
-        assert_eq!(app.log_lines.len(), 2);
+        assert_eq!(app.log_view.len(), 2);
         assert_eq!(app.log_offset, 23);
         assert_eq!(app.log_lines[1], "half a line");
         std::fs::remove_file(&app.log_path).unwrap();
@@ -611,13 +1365,13 @@ mod tests {
         std::fs::write(&path, b"first\n").unwrap();
         let mut app = app(path.clone());
         poll_log(&mut app).unwrap();
-        assert_eq!(app.log_lines.len(), 1);
+        assert_eq!(app.log_view.len(), 1);
         assert_eq!(app.log_offset, 6);
 
         let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(b"second\nthird\n").unwrap();
         poll_log(&mut app).unwrap();
-        assert_eq!(app.log_lines.len(), 3);
+        assert_eq!(app.log_view.len(), 3);
         assert_eq!(app.log_offset, 19);
         assert_eq!(app.log_lines[2], "third");
         std::fs::remove_file(&path).unwrap();
@@ -629,13 +1383,13 @@ mod tests {
         std::fs::write(&path, b"alpha\nbeta\n").unwrap();
         let mut app = app(path.clone());
         poll_log(&mut app).unwrap();
-        assert_eq!(app.log_lines.len(), 2);
+        assert_eq!(app.log_view.len(), 2);
 
         // The file is emptied and refilled with something shorter: the tail
         // notices the length went backwards and reads from the top again.
         std::fs::write(&path, b"gamma\n").unwrap();
         poll_log(&mut app).unwrap();
-        assert_eq!(app.log_lines.len(), 1);
+        assert_eq!(app.log_view.len(), 1);
         assert_eq!(app.log_lines[0], "gamma");
         assert_eq!(app.log_offset, 6);
         assert_eq!(app.log_truncations, 1);
@@ -648,13 +1402,13 @@ mod tests {
         poll_log(&mut app).unwrap();
         assert!(app.log_missing);
         assert!(app.dirty);
-        assert_eq!(app.log_lines.len(), 0);
+        assert_eq!(app.log_view.len(), 0);
 
         // The file appears with contents: the next poll picks them up.
         std::fs::write(&app.log_path, b"late line\n").unwrap();
         poll_log(&mut app).unwrap();
         assert!(!app.log_missing);
-        assert_eq!(app.log_lines.len(), 1);
+        assert_eq!(app.log_view.len(), 1);
         std::fs::remove_file(&app.log_path).unwrap();
     }
 
@@ -681,18 +1435,18 @@ mod tests {
         for i in 1..=30 {
             push_log(&mut app, format!("line {i}"));
         }
-        // At 100x30 the pane shows 27 of the 30 lines, so an offset of 2 is
+        // At 100x30 the pane shows 25 of the 30 lines, so an offset of 2 is
         // legal and stays put.
         *app.log.offset_mut() = 2;
         app.dirty = false;
-        clamp_log(&mut app);
+        rebuild_log_view(&mut app);
         assert_eq!(app.log.offset(), 2);
         assert!(!app.dirty);
 
         // A truncation empties the tail: the offset comes back with it, and
         // that is a change the frame has to show.
         app.log_lines.clear();
-        clamp_log(&mut app);
+        rebuild_log_view(&mut app);
         assert_eq!(app.log.offset(), 0);
         assert!(app.dirty);
     }
@@ -700,13 +1454,26 @@ mod tests {
     #[test]
     fn a_keypress_leaves_the_frame_dirty_and_q_ends_the_loop() {
         let mut app = app(scratch("apply-key"));
+        app.processes = rows();
+        sort_processes(&mut app.processes, app.sort, app.sort_desc);
+        rebuild_view(&mut app);
         app.dirty = false;
+        // `j` moves the selection, and that is a change the frame shows.
         assert!(apply(
             &mut app,
             Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
         ));
         assert!(app.dirty);
-        assert_eq!(app.last_key.unwrap().code, KeyCode::Char('j'));
+        assert!(app.selected.is_some());
+
+        // Any other keypress is reported by the status line.
+        app.dirty = false;
+        assert!(apply(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+        ));
+        assert!(app.dirty);
+        assert_eq!(app.last_key.unwrap().code, KeyCode::Char('x'));
 
         // Quitting returns false without needing another frame: everything
         // the final state has to say has already been drawn.
@@ -719,11 +1486,29 @@ mod tests {
     }
 
     #[test]
+    fn a_key_pressed_while_the_filter_is_open_types_instead_of_quitting() {
+        let mut app = app(scratch("apply-filter"));
+        open_filter(&mut app);
+        // `q` is a letter now, not a quit.
+        assert!(apply(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        ));
+        assert_eq!(app.filter.as_ref().unwrap().value(), "q");
+        // Ctrl-C still ends the program.
+        assert!(!apply(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        ));
+    }
+
+    #[test]
     fn a_wheel_notch_scrolls_the_log_pane() {
         let mut app = app(scratch("apply-wheel"));
         for i in 1..=30 {
             push_log(&mut app, format!("line {i}"));
         }
+        rebuild_log_view(&mut app);
         app.dirty = false;
         // At 100x30 the log pane starts at column 38; a notch there moves the
         // log's offset, not the table's.
@@ -750,28 +1535,36 @@ mod tests {
 
     #[test]
     fn a_wide_terminal_puts_the_panes_side_by_side() {
-        let [table, log, status] = layout(Rect::new(0, 0, 100, 30));
-        assert_eq!(table, Rect::new(0, 0, 38, 29));
-        assert_eq!(log, Rect::new(38, 0, 62, 29));
+        let [header, table, log, filter, status] = layout(Rect::new(0, 0, 100, 30));
+        assert_eq!(header, Rect::new(0, 0, 100, 1));
+        assert_eq!(table, Rect::new(0, 1, 38, 27));
+        assert_eq!(log, Rect::new(38, 1, 62, 27));
+        assert_eq!(filter, Rect::new(0, 28, 100, 1));
         assert_eq!(status, Rect::new(0, 29, 100, 1));
     }
 
     #[test]
     fn a_narrow_terminal_stacks_the_panes() {
-        let [table, log, status] = layout(Rect::new(0, 0, 60, 24));
-        assert_eq!(table, Rect::new(0, 0, 60, 11));
-        assert_eq!(log, Rect::new(0, 11, 60, 12));
+        let [header, table, log, filter, status] = layout(Rect::new(0, 0, 60, 24));
+        assert_eq!(header, Rect::new(0, 0, 60, 1));
+        assert_eq!(table, Rect::new(0, 1, 60, 11));
+        assert_eq!(log, Rect::new(0, 12, 60, 10));
+        assert_eq!(filter, Rect::new(0, 22, 60, 1));
         assert_eq!(status, Rect::new(0, 23, 60, 1));
     }
 
     #[test]
     fn a_pane_too_small_for_the_log_takes_nothing() {
-        // Twelve rows leave the table its eleven after the status line takes
-        // its one; the log's rect is empty, and rendering an empty rect draws
-        // nothing rather than complaining.
-        let [table, log, _] = layout(Rect::new(0, 0, 40, 12));
-        assert_eq!(table, Rect::new(0, 0, 40, 11));
-        assert_eq!(log, Rect::new(0, 11, 40, 0));
+        // Six rows leave the panes three after the header, the filter line
+        // and the status line take theirs; the table takes all three and the
+        // log's rect is empty, and rendering an empty rect draws nothing
+        // rather than complaining.
+        let [header, table, log, filter, status] = layout(Rect::new(0, 0, 40, 6));
+        assert_eq!(header, Rect::new(0, 0, 40, 1));
+        assert_eq!(table, Rect::new(0, 1, 40, 3));
+        assert_eq!(log, Rect::new(0, 4, 40, 0));
+        assert_eq!(filter, Rect::new(0, 4, 40, 1));
+        assert_eq!(status, Rect::new(0, 5, 40, 1));
     }
 
     #[test]
@@ -781,6 +1574,10 @@ mod tests {
         // a full tail and with an empty one, because a pane with no lines yet
         // is the state the program starts in.
         let mut app = app(scratch("render"));
+        app.processes = rows();
+        sort_processes(&mut app.processes, app.sort, app.sort_desc);
+        rebuild_view(&mut app);
+        move_selection(&mut app, 1);
         for filled in [false, true] {
             app.log_lines.clear();
             if filled {
@@ -788,6 +1585,7 @@ mod tests {
                     app.log_lines.push_back(format!("line {i}"));
                 }
             }
+            rebuild_log_view(&mut app);
             for (w, h) in [
                 (100, 30),
                 (80, 24),
@@ -795,6 +1593,7 @@ mod tests {
                 (46, 18),
                 (40, 12),
                 (40, 11),
+                (40, 6),
                 (20, 6),
                 (20, 4),
                 (10, 3),
@@ -814,21 +1613,24 @@ mod tests {
             app.log_lines
                 .push_back(format!("2026-10-24T21:00:{i:02}Z INFO  line {i}"));
         }
+        rebuild_log_view(&mut app);
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let buffer = terminal.backend().buffer();
+        // The log pane's top border is row 1; the pane titles sit on it.
         let top: String = (0..buffer.area.width)
-            .map(|x| buffer[(x, 0)].symbol())
+            .map(|x| buffer[(x, 1)].symbol())
             .collect();
         assert!(top.contains("log [1/30]"), "pane title was {top:?}");
 
-        // An empty tail says so instead of claiming a first line.
+        // An empty view says so instead of claiming a first line.
         app.log_lines.clear();
+        rebuild_log_view(&mut app);
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let buffer = terminal.backend().buffer();
         let top: String = (0..buffer.area.width)
-            .map(|x| buffer[(x, 0)].symbol())
+            .map(|x| buffer[(x, 1)].symbol())
             .collect();
         assert!(top.contains("log empty"), "pane title was {top:?}");
     }
