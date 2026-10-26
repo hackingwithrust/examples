@@ -1,8 +1,9 @@
 # mini-redis
 
-A Redis clone in Rust, built one article step at a time. This is step 2: the
-RESP2 protocol written by hand — encode a frame, decode a frame — and a
-server that answers `PING`.
+A Redis clone in Rust, built one article step at a time. This is step 3: the
+RESP2 codec behind a connection buffer — a frame split across two packets is
+reassembled instead of refused, a second frame in the same read is answered
+instead of dropped — and a server that answers `PING` and `ECHO`.
 
 ## Build and run
 
@@ -11,11 +12,11 @@ cargo run
 ```
 
 The server listens on 127.0.0.1:6379, the port real Redis uses, and answers
-`PING`. With the real `redis-cli` installed:
+`PING` and `ECHO`. With the real `redis-cli` installed:
 
 ```sh
 redis-cli ping        # PONG
-redis-cli ping hello  # "hello"
+redis-cli echo hello  # "hello"
 ```
 
 ## Test
@@ -24,12 +25,14 @@ redis-cli ping hello  # "hello"
 cargo test
 ```
 
-Seven tests: every frame type round-trips, the exact bytes the real
+Thirteen tests: every frame type round-trips, the exact bytes the real
 redis-cli sends for `PING` decode to the expected frame, a frame cut in half
-is `Incomplete` rather than invalid, and one connection carries a real
-socket round trip.
+is `Incomplete` rather than invalid, a frame split across two reads is
+reassembled over a real socket, pipelined commands are all answered, a
+buffered second frame needs no read, and a protocol error closes the
+connection without a reply.
 
 ## Tags
 
-Each step of the series is a tag. `mini-ch02` is this state; every later
-step grows from it, so `git checkout mini-ch03` is a server that runs.
+Each step of the series is a tag. `mini-ch03` is this state; every later
+step grows from it, so `git checkout mini-ch04` is a server that runs.
