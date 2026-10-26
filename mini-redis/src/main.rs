@@ -1,16 +1,17 @@
-//! mini-redis, step 4: Tokio, one task per connection, a shared store, and
-//! the first commands that touch it.
+//! mini-redis, step 5: a deadline on every key, `EXPIRE` and `TTL`, and
+//! the sweeper that reclaims what has expired.
 //!
-//! Start state: the tag `mini-ch03` — a blocking server that answers one
-//! connection at a time, with `PING` and `ECHO` and nothing else. End
-//! state: the tag `mini-ch04` — an accept loop that spawns a task per
-//! client, one `Arc<Db>` shared between them, and `SET`, `GET`, `DEL`,
-//! `LPUSH` and `LRANGE` on top of it.
+//! Start state: the tag `mini-ch04` — one task per connection, a shared
+//! store, and `SET`, `GET`, `DEL`, `LPUSH` and `LRANGE`. End state: the
+//! tag `mini-ch05` — every key can carry a time to live, `EXPIRE` and
+//! `TTL` answer for it, the read path expires keys lazily, and a
+//! background task sweeps the ones nobody reads again.
 
-use std::collections::hash_map::Entry;
+use std::collections::hash_map::Entry as Slot;
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -22,7 +23,7 @@ enum Frame {
     Simple(String),
     /// `-ERR ...\r\n` — an error, the same shape as a simple string.
     Error(String),
-    /// `:42\r\n` — signed, because `TTL` answers -1 and -2 (step 5).
+    /// `:42\r\n` — signed, because `TTL` answers -1 and -2.
     Integer(i64),
     /// `$5\r\nhello\r\n` — length-prefixed bytes. Bytes, not text: a bulk
     /// string may hold anything, CRLF included.
@@ -240,11 +241,24 @@ impl Connection {
     }
 }
 
-/// What a key holds: a string, or a list of strings. The real server's
-/// values can also carry a time to live; that arrives in step 5.
+/// What a key holds: a string, or a list of strings.
 enum Value {
     String(Vec<u8>),
     List(VecDeque<Vec<u8>>),
+}
+
+/// One key in the store: the value, and the instant it stops being
+/// there.
+///
+/// The deadline is an `Instant`, not a wall-clock time. It is monotonic,
+/// so adjusting the system clock cannot move a key's expiry, and it is
+/// process-relative, so a deadline has to become something else on its
+/// way to disk — that is step 6's problem.
+struct Entry {
+    value: Value,
+    /// `None` is a key with no deadline: it lives until it is
+    /// overwritten or deleted, which is what `SET` leaves behind.
+    expires_at: Option<Instant>,
 }
 
 /// The store, shared by every connection's task.
@@ -256,10 +270,45 @@ enum Value {
 /// statement here makes the future non-`Send`, and `tokio::spawn` refuses
 /// it at compile time. The failure mode of a long critical section is
 /// different: it blocks the worker thread, and every task on it.
-type Db = Arc<Mutex<HashMap<Vec<u8>, Value>>>;
+type Db = Arc<Mutex<HashMap<Vec<u8>, Entry>>>;
 
 fn new_db() -> Db {
     Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Whether `entry`'s deadline has arrived. A deadline of exactly `now`
+/// counts as arrived, the way the real server treats a key whose
+/// millisecond timestamp has passed.
+fn expired(entry: &Entry, now: Instant) -> bool {
+    matches!(entry.expires_at, Some(at) if now >= at)
+}
+
+/// Drop `key` if its deadline has passed.
+///
+/// This is lazy expiry, and the real server does it on every read: a key
+/// that has expired is gone whether or not the sweeper has reached it.
+/// Captured on redis-server 7.2.4 — `GET` on an expired key answers
+/// nil, and a `TTL` afterwards answers -2.
+fn expire_if_needed(store: &mut HashMap<Vec<u8>, Entry>, key: &[u8], now: Instant) {
+    if let Some(entry) = store.get(key) {
+        if expired(entry, now) {
+            store.remove(key);
+        }
+    }
+}
+
+/// The seconds left on `entry`, the way `TTL` reports them: the
+/// remaining time rounded to the nearest second. `None` is a key with
+/// no deadline at all.
+///
+/// The rounding is the real server's — a key with 100 seconds left
+/// answers 100, and one with under half a second left answers 0, which
+/// is not "expired": -2 is what that is for. Captured on redis-server
+/// 7.2.4.
+fn ttl_of(entry: &Entry, now: Instant) -> Option<i64> {
+    let at = entry.expires_at?;
+    let left = at.saturating_duration_since(now).as_millis() as i64;
+    Some((left + 500) / 1000)
 }
 
 /// One command, parsed out of its frame. Parsing looks at the frame only;
@@ -272,6 +321,8 @@ enum Command {
     Del(Vec<Vec<u8>>),
     LPush(Vec<u8>, Vec<Vec<u8>>),
     LRange(Vec<u8>, i64, i64),
+    Expire(Vec<u8>, i64),
+    Ttl(Vec<u8>),
 }
 
 impl Command {
@@ -334,6 +385,31 @@ impl Command {
                     let stop = parse_int(stop).ok_or_else(not_an_integer)?;
                     Ok(Command::LRange(key.to_vec(), start, stop))
                 }
+                _ => Err(wrong_args(name)),
+            },
+            b"EXPIRE" => match args {
+                [key, seconds] => {
+                    let seconds = parse_int(seconds).ok_or_else(not_an_integer)?;
+                    // The range check belongs to the argument, and it
+                    // runs before the key is looked at: the real server
+                    // answers the range error for a missing key too,
+                    // and refuses both ends — `EXPIRE k -9223372036854775808`
+                    // is the error, not a delete. Captured on
+                    // redis-server 7.2.4.
+                    if seconds.unsigned_abs() > MAX_EXPIRE_SECONDS as u64 {
+                        return Err(invalid_expire_time());
+                    }
+                    Ok(Command::Expire(key.to_vec(), seconds))
+                }
+                // Extra arguments are a divergence, not an oversight:
+                // the real server reads them as NX/XX/GT/LT options and
+                // answers `Unsupported option <arg>`. The clone has no
+                // SET-style flags, so it answers the arity error.
+                // Captured on redis-server 7.2.4.
+                _ => Err(wrong_args(name)),
+            },
+            b"TTL" => match args {
+                [key] => Ok(Command::Ttl(key.to_vec())),
                 _ => Err(wrong_args(name)),
             },
             _ => Err(unknown_command(name, args)),
@@ -399,6 +475,19 @@ fn not_an_integer() -> Frame {
     Frame::Error("ERR value is not an integer or out of range".to_string())
 }
 
+/// The largest `EXPIRE` argument the clone takes, in either direction:
+/// `i64::MAX / 1000` seconds, the point where `seconds × 1000` stops
+/// fitting in an i64. The real server's cutoff is the same idea one
+/// layer up — a value whose millisecond form would not fit beside the
+/// current time — and it moves with the server's clock: measured here
+/// at 9223370243862175 seconds, accepted, with one more refused.
+/// Captured on redis-server 7.2.4.
+const MAX_EXPIRE_SECONDS: i64 = i64::MAX / 1000;
+
+fn invalid_expire_time() -> Frame {
+    Frame::Error("ERR invalid expire time in 'expire' command".to_string())
+}
+
 fn wrong_type() -> Frame {
     Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
 }
@@ -452,19 +541,40 @@ fn execute(db: &Db, frame: &Frame) -> Frame {
         Command::Echo(message) => Frame::Bulk(message),
         Command::Set(key, value) => {
             // SET replaces whatever was there, a list included: the real
-            // server answers +OK, not WRONGTYPE. Captured on 7.2.4.
-            db.lock().unwrap().insert(key, Value::String(value));
+            // server answers +OK, not WRONGTYPE. It also drops any
+            // deadline the key had — without KEEPTTL, an overwrite is a
+            // new value with no time to live. Captured on 7.2.4.
+            db.lock().unwrap().insert(
+                key,
+                Entry {
+                    value: Value::String(value),
+                    expires_at: None,
+                },
+            );
             Frame::Simple("OK".to_string())
         }
         Command::Get(key) => {
-            let store = db.lock().unwrap();
+            let mut store = db.lock().unwrap();
+            let now = Instant::now();
+            // Lazy expiry: the deadline is checked on the read, so a key
+            // that has expired answers nil even if the sweeper has not
+            // run yet. The real server does the same.
+            expire_if_needed(&mut store, &key, now);
             match store.get(&key) {
-                Some(Value::String(value)) => Frame::Bulk(value.clone()),
-                Some(Value::List(_)) => wrong_type(),
+                Some(entry) => match &entry.value {
+                    Value::String(value) => Frame::Bulk(value.clone()),
+                    Value::List(_) => wrong_type(),
+                },
                 None => Frame::Null,
             }
         }
         Command::Del(keys) => {
+            // No lazy expiry here, and the difference is a window: a key
+            // whose deadline has passed but which the sweeper has not
+            // reached yet is still counted, where the real server's
+            // active cycle has usually reclaimed it already. Captured on
+            // redis-server 7.2.4 — `DEL` on a key one second past its
+            // deadline answered :0 there.
             let mut store = db.lock().unwrap();
             let mut removed = 0i64;
             for key in keys {
@@ -476,17 +586,26 @@ fn execute(db: &Db, frame: &Frame) -> Frame {
         }
         Command::LPush(key, values) => {
             let mut store = db.lock().unwrap();
+            let now = Instant::now();
+            // Lazy expiry here too: pushing onto a key whose deadline
+            // has passed starts a new list, exactly as it does on a key
+            // that was never there — the real server answers :1, not
+            // WRONGTYPE. Captured on redis-server 7.2.4.
+            expire_if_needed(&mut store, &key, now);
             let length = match store.entry(key) {
-                Entry::Vacant(slot) => {
+                Slot::Vacant(slot) => {
                     let mut list = VecDeque::new();
                     for value in values {
                         list.push_front(value);
                     }
                     let length = list.len();
-                    slot.insert(Value::List(list));
+                    slot.insert(Entry {
+                        value: Value::List(list),
+                        expires_at: None,
+                    });
                     length
                 }
-                Entry::Occupied(mut slot) => match slot.get_mut() {
+                Slot::Occupied(mut slot) => match &mut slot.get_mut().value {
                     Value::List(list) => {
                         // Each value goes to the head, so the last
                         // argument pushed is the first one read back.
@@ -503,18 +622,62 @@ fn execute(db: &Db, frame: &Frame) -> Frame {
         Command::LRange(key, start, stop) => {
             let store = db.lock().unwrap();
             match store.get(&key) {
-                Some(Value::List(list)) => match range(list.len(), start, stop) {
-                    Some((first, last)) => Frame::Array(
-                        list.iter()
-                            .skip(first)
-                            .take(last - first + 1)
-                            .map(|value| Frame::Bulk(value.clone()))
-                            .collect(),
-                    ),
-                    None => Frame::Array(Vec::new()),
+                Some(entry) => match &entry.value {
+                    Value::List(list) => match range(list.len(), start, stop) {
+                        Some((first, last)) => Frame::Array(
+                            list.iter()
+                                .skip(first)
+                                .take(last - first + 1)
+                                .map(|value| Frame::Bulk(value.clone()))
+                                .collect(),
+                        ),
+                        None => Frame::Array(Vec::new()),
+                    },
+                    Value::String(_) => wrong_type(),
                 },
-                Some(Value::String(_)) => wrong_type(),
                 None => Frame::Array(Vec::new()),
+            }
+        }
+        Command::Expire(key, seconds) => {
+            let now = Instant::now();
+            let mut store = db.lock().unwrap();
+            // Lazy expiry first, so the :1/:0 answer is about the key as
+            // it is now, not as it was when the client asked.
+            expire_if_needed(&mut store, &key, now);
+            if seconds <= 0 {
+                // A non-positive TTL is a delete, not a deadline in the
+                // past: the real server answers :1 and the key is gone,
+                // and :0 when there was nothing to delete. Captured on
+                // redis-server 7.2.4.
+                return match store.remove(&key) {
+                    Some(_) => Frame::Integer(1),
+                    None => Frame::Integer(0),
+                };
+            }
+            // The argument's range check ran in `from_frame`, so this
+            // addition cannot overflow the clock.
+            let deadline = now + Duration::from_secs(seconds as u64);
+            match store.get_mut(&key) {
+                Some(entry) => {
+                    entry.expires_at = Some(deadline);
+                    Frame::Integer(1)
+                }
+                None => Frame::Integer(0),
+            }
+        }
+        Command::Ttl(key) => {
+            let now = Instant::now();
+            let mut store = db.lock().unwrap();
+            expire_if_needed(&mut store, &key, now);
+            match store.get(&key) {
+                // -2 is a key that is not there, whether it never was or
+                // its deadline has passed; -1 is a key with no deadline.
+                // Captured on redis-server 7.2.4.
+                None => Frame::Integer(-2),
+                Some(entry) => match ttl_of(entry, now) {
+                    Some(seconds) => Frame::Integer(seconds),
+                    None => Frame::Integer(-1),
+                },
             }
         }
     }
@@ -533,11 +696,50 @@ async fn serve(stream: TcpStream, db: Db) -> std::io::Result<()> {
     Ok(())
 }
 
+/// How often the sweeper runs. Once a second is coarse next to the real
+/// server's active-expiry cycle, which runs ten times a second and
+/// samples the keyspace rather than reading all of it.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// One pass of the sweeper: every key whose deadline has passed, out.
+/// Returns how many went.
+///
+/// The lock is taken and dropped inside, like every command's: a guard
+/// held across the `interval.tick().await` below would make this future
+/// non-`Send`, and `tokio::spawn` refuses those.
+fn sweep(db: &Db, now: Instant) -> usize {
+    let mut store = db.lock().unwrap();
+    let before = store.len();
+    store.retain(|_, entry| !expired(entry, now));
+    before - store.len()
+}
+
+/// The active half of expiry. Lazy expiry on the read path only
+/// reclaims keys that somebody reads again; this is the task that
+/// reclaims the rest, once a second, for as long as the server runs.
+///
+/// `tokio::time::interval`'s first tick completes immediately, so the
+/// first pass runs at startup — against an empty store, which costs
+/// nothing.
+async fn sweeper(db: Db) {
+    let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+    loop {
+        interval.tick().await;
+        let removed = sweep(&db, Instant::now());
+        if removed > 0 {
+            println!("swept {removed} expired key(s)");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:6379").await?;
     println!("listening on 127.0.0.1:6379");
     let db = new_db();
+    // The sweeper is one more owner of the store, like every connection
+    // task: what moves into it is a clone of the `Arc`.
+    tokio::spawn(sweeper(db.clone()));
     loop {
         let (stream, _) = listener.accept().await?;
         // One clone per task. What moves is the reference count, not the
@@ -1053,6 +1255,358 @@ mod tests {
             ask(&mut two, b"*2\r\n$3\r\nget\r\n$8\r\ngreeting\r\n").await,
             Frame::Bulk(b"hello".to_vec())
         );
+    }
+
+    /// A deadline that has already arrived, set directly: the next read
+    /// must find the key gone without waiting for the sweeper.
+    fn mark_expired(db: &Db, key: &str) {
+        db.lock()
+            .unwrap()
+            .get_mut(key.as_bytes())
+            .expect("the key is there")
+            .expires_at = Some(Instant::now());
+    }
+
+    #[test]
+    fn a_key_with_no_deadline_answers_minus_one() {
+        let db = new_db();
+        let set = decode(b"*3\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n")
+            .expect("decodes")
+            .0;
+        execute(&db, &set);
+        let ttl = decode(b"*2\r\n$3\r\nttl\r\n$1\r\nk\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&db, &ttl), Frame::Integer(-1));
+    }
+
+    #[test]
+    fn ttl_on_a_missing_key_answers_minus_two() {
+        let ttl = decode(b"*2\r\n$3\r\nttl\r\n$1\r\nk\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&new_db(), &ttl), Frame::Integer(-2));
+    }
+
+    #[test]
+    fn expire_then_ttl_reports_the_seconds_left() {
+        let db = new_db();
+        let set = decode(b"*3\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n")
+            .expect("decodes")
+            .0;
+        execute(&db, &set);
+        let expire = decode(b"*3\r\n$6\r\nexpire\r\n$1\r\nk\r\n$3\r\n100\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&db, &expire), Frame::Integer(1));
+        let ttl = decode(b"*2\r\n$3\r\nttl\r\n$1\r\nk\r\n")
+            .expect("decodes")
+            .0;
+        // 100 seconds, give or take the milliseconds the test took.
+        match execute(&db, &ttl) {
+            Frame::Integer(n) => assert!((99..=100).contains(&n), "ttl was {n}"),
+            other => panic!("ttl answered {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expire_replaces_an_earlier_deadline() {
+        let db = new_db();
+        let set = decode(b"*3\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n")
+            .expect("decodes")
+            .0;
+        execute(&db, &set);
+        let first = decode(b"*3\r\n$6\r\nexpire\r\n$1\r\nk\r\n$2\r\n50\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&db, &first), Frame::Integer(1));
+        let second = decode(b"*3\r\n$6\r\nexpire\r\n$1\r\nk\r\n$3\r\n100\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&db, &second), Frame::Integer(1));
+        let ttl = decode(b"*2\r\n$3\r\nttl\r\n$1\r\nk\r\n")
+            .expect("decodes")
+            .0;
+        match execute(&db, &ttl) {
+            Frame::Integer(n) => assert!((99..=100).contains(&n), "ttl was {n}"),
+            other => panic!("ttl answered {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expire_on_a_missing_key_answers_zero() {
+        let expire = decode(b"*3\r\n$6\r\nexpire\r\n$1\r\nk\r\n$3\r\n100\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&new_db(), &expire), Frame::Integer(0));
+    }
+
+    #[test]
+    fn a_non_positive_ttl_deletes_the_key() {
+        for seconds in ["0", "-1"] {
+            let db = new_db();
+            let set = decode(b"*3\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n")
+                .expect("decodes")
+                .0;
+            execute(&db, &set);
+            let wire = format!(
+                "*3\r\n$6\r\nexpire\r\n$1\r\nk\r\n${}\r\n{seconds}\r\n",
+                seconds.len()
+            );
+            let expire = decode(wire.as_bytes()).expect("decodes").0;
+            // A delete, not a deadline in the past: :1, and the key is
+            // gone. Captured on redis-server 7.2.4.
+            assert_eq!(execute(&db, &expire), Frame::Integer(1));
+            let get = decode(b"*2\r\n$3\r\nget\r\n$1\r\nk\r\n")
+                .expect("decodes")
+                .0;
+            assert_eq!(execute(&db, &get), Frame::Null);
+            let ttl = decode(b"*2\r\n$3\r\nttl\r\n$1\r\nk\r\n")
+                .expect("decodes")
+                .0;
+            assert_eq!(execute(&db, &ttl), Frame::Integer(-2));
+        }
+    }
+
+    #[test]
+    fn a_non_positive_ttl_on_a_missing_key_answers_zero() {
+        let expire = decode(b"*3\r\n$6\r\nexpire\r\n$1\r\nk\r\n$1\r\n0\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&new_db(), &expire), Frame::Integer(0));
+    }
+
+    #[test]
+    fn set_clears_the_deadline() {
+        let db = new_db();
+        let set = decode(b"*3\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n")
+            .expect("decodes")
+            .0;
+        execute(&db, &set);
+        let expire = decode(b"*3\r\n$6\r\nexpire\r\n$1\r\nk\r\n$3\r\n100\r\n")
+            .expect("decodes")
+            .0;
+        execute(&db, &expire);
+        // The overwrite is a new value with no time to live, the same
+        // as on the real server. Captured on redis-server 7.2.4.
+        let again = decode(b"*3\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nw\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&db, &again), Frame::Simple("OK".to_string()));
+        let ttl = decode(b"*2\r\n$3\r\nttl\r\n$1\r\nk\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&db, &ttl), Frame::Integer(-1));
+    }
+
+    #[test]
+    fn expire_reads_its_argument_the_way_the_real_server_does() {
+        for text in ["abc", "+5", "007", "", " 5", "0x10", "9999999999999999999999"] {
+            let wire = format!(
+                "*3\r\n$6\r\nexpire\r\n$1\r\nk\r\n${}\r\n{text}\r\n",
+                text.len()
+            );
+            let frame = decode(wire.as_bytes()).expect("decodes").0;
+            assert_eq!(
+                execute(&new_db(), &frame),
+                not_an_integer(),
+                "{text:?} is not an integer the real server would take"
+            );
+        }
+    }
+
+    #[test]
+    fn an_expire_time_past_the_cutoff_is_refused() {
+        // Both ends: the real server refuses a value whose millisecond
+        // form would not fit beside the current time, and the clone
+        // refuses one whose seconds form would not fit in an i64
+        // millisecond count. The replies match at both absurd ends.
+        // Captured on redis-server 7.2.4.
+        for text in ["9223372036854776", "-9223372036854775808"] {
+            let wire = format!(
+                "*3\r\n$6\r\nexpire\r\n$1\r\nk\r\n${}\r\n{text}\r\n",
+                text.len()
+            );
+            let frame = decode(wire.as_bytes()).expect("decodes").0;
+            assert_eq!(
+                execute(&new_db(), &frame),
+                invalid_expire_time(),
+                "{text:?} is past the clone's cutoff"
+            );
+        }
+        // The one value the two cutoffs disagree about. The real
+        // server's line moves with its clock and refused
+        // 9223372036854775 here; the clone's is fixed at i64::MAX / 1000
+        // and takes it — the key is not there, so the answer is :0.
+        let wire = b"*3\r\n$6\r\nexpire\r\n$1\r\nk\r\n$16\r\n9223372036854775\r\n";
+        let frame = decode(wire).expect("decodes").0;
+        assert_eq!(execute(&new_db(), &frame), Frame::Integer(0));
+    }
+
+    #[test]
+    fn expire_with_the_wrong_number_of_arguments_is_refused() {
+        let none = decode(b"*1\r\n$6\r\nexpire\r\n").expect("decodes").0;
+        assert_eq!(execute(&new_db(), &none), wrong_args(b"expire"));
+        let one = decode(b"*2\r\n$6\r\nexpire\r\n$1\r\nk\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&new_db(), &one), wrong_args(b"expire"));
+        // Extra arguments are the one place the clone and the real
+        // server part ways: the real server reads them as NX/XX/GT/LT
+        // options and answers `Unsupported option 2`.
+        let three = decode(b"*4\r\n$6\r\nexpire\r\n$1\r\nk\r\n$1\r\n1\r\n$1\r\n2\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&new_db(), &three), wrong_args(b"expire"));
+    }
+
+    #[test]
+    fn ttl_with_the_wrong_number_of_arguments_is_refused() {
+        let none = decode(b"*1\r\n$3\r\nttl\r\n").expect("decodes").0;
+        assert_eq!(execute(&new_db(), &none), wrong_args(b"ttl"));
+        let two = decode(b"*3\r\n$3\r\nttl\r\n$1\r\nk\r\n$1\r\n1\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&new_db(), &two), wrong_args(b"ttl"));
+    }
+
+    #[test]
+    fn expire_works_on_a_list_key() {
+        let db = new_db();
+        let push = decode(b"*3\r\n$5\r\nlpush\r\n$1\r\nk\r\n$1\r\nv\r\n")
+            .expect("decodes")
+            .0;
+        execute(&db, &push);
+        let expire = decode(b"*3\r\n$6\r\nexpire\r\n$1\r\nk\r\n$3\r\n100\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&db, &expire), Frame::Integer(1));
+        let ttl = decode(b"*2\r\n$3\r\nttl\r\n$1\r\nk\r\n")
+            .expect("decodes")
+            .0;
+        match execute(&db, &ttl) {
+            Frame::Integer(n) => assert!((99..=100).contains(&n), "ttl was {n}"),
+            other => panic!("ttl answered {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_deadline_that_has_arrived_expires_the_key_on_read() {
+        let db = new_db();
+        let set = decode(b"*3\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n")
+            .expect("decodes")
+            .0;
+        execute(&db, &set);
+        mark_expired(&db, "k");
+        let get = decode(b"*2\r\n$3\r\nget\r\n$1\r\nk\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&db, &get), Frame::Null);
+        let ttl = decode(b"*2\r\n$3\r\nttl\r\n$1\r\nk\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&db, &ttl), Frame::Integer(-2));
+    }
+
+    #[test]
+    fn lpush_on_an_expired_key_starts_a_new_list() {
+        // The real server answers :1 here, not WRONGTYPE: the deadline
+        // has passed, so there is no string to push onto. Captured on
+        // redis-server 7.2.4.
+        let db = new_db();
+        let set = decode(b"*3\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n")
+            .expect("decodes")
+            .0;
+        execute(&db, &set);
+        mark_expired(&db, "k");
+        let push = decode(b"*3\r\n$5\r\nlpush\r\n$1\r\nk\r\n$1\r\nx\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&db, &push), Frame::Integer(1));
+        let range = decode(b"*4\r\n$6\r\nlrange\r\n$1\r\nk\r\n$1\r\n0\r\n$2\r\n-1\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(
+            execute(&db, &range),
+            Frame::Array(vec![Frame::Bulk(b"x".to_vec())])
+        );
+    }
+
+    #[test]
+    fn ttl_rounds_to_the_nearest_second() {
+        // Under half a second left answers 0, and 100 seconds answers
+        // 100 — the real server's own rounding. Captured on
+        // redis-server 7.2.4.
+        let db = new_db();
+        let set = decode(b"*3\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n")
+            .expect("decodes")
+            .0;
+        execute(&db, &set);
+        let ttl = decode(b"*2\r\n$3\r\nttl\r\n$1\r\nk\r\n")
+            .expect("decodes")
+            .0;
+        for (millis, expected) in [(400, 0), (600, 1)] {
+            db.lock()
+                .unwrap()
+                .get_mut(b"k".as_slice())
+                .expect("the key is there")
+                .expires_at = Some(Instant::now() + Duration::from_millis(millis));
+            assert_eq!(execute(&db, &ttl), Frame::Integer(expected));
+        }
+        db.lock()
+            .unwrap()
+            .get_mut(b"k".as_slice())
+            .expect("the key is there")
+            .expires_at = Some(Instant::now() + Duration::from_secs(100));
+        assert_eq!(execute(&db, &ttl), Frame::Integer(100));
+    }
+
+    #[test]
+    fn the_sweeper_removes_only_the_keys_whose_deadline_has_passed() {
+        let now = Instant::now();
+        let db = new_db();
+        {
+            let mut store = db.lock().unwrap();
+            let value = |expires_at| Entry {
+                value: Value::String(b"v".to_vec()),
+                expires_at,
+            };
+            store.insert(b"forever".to_vec(), value(None));
+            store.insert(b"session".to_vec(), value(Some(now + Duration::from_secs(100))));
+            store.insert(b"cache".to_vec(), value(Some(now + Duration::from_secs(1))));
+            store.insert(b"flash".to_vec(), value(Some(now + Duration::from_millis(400))));
+            store.insert(b"stale".to_vec(), value(Some(now - Duration::from_secs(1))));
+        }
+        // One pass, taken a second later than the deadlines above:
+        // cache and flash have passed, stale passed long ago.
+        let removed = sweep(&db, now + Duration::from_secs(2));
+        assert_eq!(removed, 3);
+        let mut remaining: Vec<String> = db
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|key| String::from_utf8_lossy(key).into_owned())
+            .collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec!["forever".to_string(), "session".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sweeper_task_reclaims_an_expired_key_on_its_own() {
+        let db = new_db();
+        let set = decode(b"*3\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n")
+            .expect("decodes")
+            .0;
+        execute(&db, &set);
+        mark_expired(&db, "k");
+        // The interval's first tick is immediate, so the pass runs
+        // without waiting a second for it.
+        tokio::spawn(sweeper(db.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(db.lock().unwrap().is_empty(), "the sweeper reclaimed it");
     }
 
     #[tokio::test]
