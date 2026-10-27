@@ -1,15 +1,14 @@
-//! mini-redis, step 5: a deadline on every key, `EXPIRE` and `TTL`, and
-//! the sweeper that reclaims what has expired.
+//! mini-redis, step 7: subscribers, channels, and fan-out.
 //!
-//! Start state: the tag `mini-ch04` — one task per connection, a shared
-//! store, and `SET`, `GET`, `DEL`, `LPUSH` and `LRANGE`. End state: the
-//! tag `mini-ch05` — every key can carry a time to live, `EXPIRE` and
-//! `TTL` answer for it, the read path expires keys lazily, and a
-//! background task sweeps the ones nobody reads again.
+//! Start state: the tag `mini-ch06` — `SAVE`, a snapshot file, and the
+//! store loaded back at startup. End state: the tag `mini-ch07` —
+//! `SUBSCRIBE`, `UNSUBSCRIBE` and `PUBLISH`, one mailbox per connection,
+//! and every publish fanned out to each live subscriber.
 
 use std::collections::hash_map::Entry as Slot;
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -279,6 +278,58 @@ fn new_db() -> Db {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// One message on its way to a subscriber: the channel it was published
+/// on, and the payload. The channel rides along because a connection can
+/// subscribe to several and must be told which one a message came from.
+type Push = (Vec<u8>, Vec<u8>);
+
+/// A connection's mailbox: the sending half of the queue its messages
+/// land on. Unbounded on purpose — a publish must never block on a slow
+/// reader — and dropped by the connection task when the connection ends.
+type Mailbox = tokio::sync::mpsc::UnboundedSender<Push>;
+
+/// Every channel that has subscribers, and each subscriber's mailbox,
+/// tagged with the connection's id so an unsubscribe can find exactly its
+/// own entry. Same shape as `Db`: the map lives behind one shared lock,
+/// one clone of the `Arc` per owner.
+type Hub = Arc<Mutex<HashMap<Vec<u8>, Vec<(u64, Mailbox)>>>>;
+
+fn new_hub() -> Hub {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// One connection's pub/sub state: its id in the hub, its mailbox, and
+/// the channels it is subscribed to, in subscription order — the order an
+/// argument-less `UNSUBSCRIBE` confirms them in. A `Vec`, not a `HashSet`:
+/// a connection has a handful of channels at most, and order is part of
+/// what the real server's replies show.
+struct Sub {
+    id: u64,
+    mail: Mailbox,
+    channels: Vec<Vec<u8>>,
+}
+
+/// The reply a subscribe or unsubscribe is confirmed with: the kind, the
+/// channel, and how many channels the connection is on afterwards. Three
+/// bulks and an integer, on the wire. Captured on redis-server 7.2.4.
+fn confirmation(kind: &str, channel: &[u8], count: usize) -> Frame {
+    Frame::Array(vec![
+        Frame::Bulk(kind.as_bytes().to_vec()),
+        Frame::Bulk(channel.to_vec()),
+        Frame::Integer(count as i64),
+    ])
+}
+
+/// The frame a subscriber is pushed: `message`, the channel, the payload.
+/// Captured on redis-server 7.2.4.
+fn message_frame(channel: &[u8], payload: &[u8]) -> Frame {
+    Frame::Array(vec![
+        Frame::Bulk(b"message".to_vec()),
+        Frame::Bulk(channel.to_vec()),
+        Frame::Bulk(payload.to_vec()),
+    ])
+}
+
 /// Whether `entry`'s deadline has arrived. A deadline of exactly `now`
 /// counts as arrived, the way the real server treats a key whose
 /// millisecond timestamp has passed.
@@ -327,6 +378,9 @@ enum Command {
     Expire(Vec<u8>, i64),
     Ttl(Vec<u8>),
     Save,
+    Subscribe(Vec<Vec<u8>>),
+    Unsubscribe(Vec<Vec<u8>>),
+    Publish(Vec<u8>, Vec<u8>),
 }
 
 impl Command {
@@ -421,6 +475,28 @@ impl Command {
             // `SAVE` with an argument answers the wrong-arity error.
             b"SAVE" => match args {
                 [] => Ok(Command::Save),
+                _ => Err(wrong_args(name)),
+            },
+            // At least one channel. Captured on redis-server 7.2.4 —
+            // `SUBSCRIBE` with none answers the wrong-arity error.
+            b"SUBSCRIBE" => match args {
+                [] => Err(wrong_args(name)),
+                channels => Ok(Command::Subscribe(
+                    channels.iter().map(|channel| channel.to_vec()).collect(),
+                )),
+            },
+            // No arguments means every channel this connection is
+            // subscribed to — the real server confirms each one, in
+            // subscription order. Captured on 7.2.4.
+            b"UNSUBSCRIBE" => Ok(Command::Unsubscribe(
+                args.iter().map(|channel| channel.to_vec()).collect(),
+            )),
+            // Exactly a channel and a payload. Captured on 7.2.4 —
+            // `PUBLISH` with one argument answers the wrong-arity error.
+            b"PUBLISH" => match args {
+                [channel, message] => {
+                    Ok(Command::Publish(channel.to_vec(), message.to_vec()))
+                }
                 _ => Err(wrong_args(name)),
             },
             _ => Err(unknown_command(name, args)),
@@ -548,6 +624,12 @@ fn execute(db: &Db, frame: &Frame) -> Frame {
         Err(reply) => return reply,
     };
     match command {
+        // Pub/sub commands are answered in `execute_pubsub`, before the
+        // store is ever consulted; a frame that reaches this arm would
+        // mean a routing bug upstream.
+        Command::Subscribe(..) | Command::Unsubscribe(..) | Command::Publish(..) => {
+            Frame::Error("ERR internal: pub/sub command reached the store".to_string())
+        }
         Command::Ping => Frame::Simple("PONG".to_string()),
         Command::Echo(message) => Frame::Bulk(message),
         Command::Set(key, value) => {
@@ -711,13 +793,183 @@ fn execute(db: &Db, frame: &Frame) -> Frame {
 /// One connection, from the first frame to the hangup. The task that owns
 /// it ends when this returns, and the `Db` clone the task holds is
 /// dropped with it.
-async fn serve(stream: TcpStream, db: Db) -> std::io::Result<()> {
-    let mut conn = Connection::new(stream);
-    while let Some(frame) = conn.read_frame().await? {
-        let mut reply = Vec::new();
-        execute(&db, &frame).encode(&mut reply);
-        conn.stream.write_all(&reply).await?;
+/// Run a pub/sub command, or say there was none.
+///
+/// An empty `Vec` means "this frame is not mine" and the caller falls
+/// through to `execute`. Non-empty means the replies to write — a `Vec`
+/// because the real server confirms one frame per channel, as separate
+/// frames on the wire, and a two-channel `UNSUBSCRIBE` answers with two.
+fn execute_pubsub(hub: &Hub, me: &mut Sub, frame: &Frame) -> Vec<Frame> {
+    let command = match Command::from_frame(frame) {
+        Ok(command) => command,
+        Err(reply) => return vec![reply],
+    };
+    match command {
+        // While subscribed, PING answers a two-part array — the pong and
+        // an empty payload. Captured on redis-server 7.2.4.
+        Command::Ping if !me.channels.is_empty() => {
+            vec![Frame::Array(vec![
+                Frame::Bulk(b"pong".to_vec()),
+                Frame::Bulk(Vec::new()),
+            ])]
+        }
+        Command::Subscribe(channels) => {
+            let mut replies = Vec::with_capacity(channels.len());
+            let mut subs = hub.lock().unwrap();
+            for channel in channels {
+                if !me.channels.contains(&channel) {
+                    subs.entry(channel.clone())
+                        .or_default()
+                        .push((me.id, me.mail.clone()));
+                    me.channels.push(channel.clone());
+                }
+                // Subscribing twice to one channel is not an error: the
+                // real server re-confirms it without doubling the
+                // delivery.
+                replies.push(confirmation(
+                    "subscribe",
+                    &channel,
+                    me.channels.len(),
+                ));
+            }
+            replies
+        }
+        Command::Unsubscribe(named) => {
+            // No names: leave everything, confirmed in subscription order.
+            let leaving = if named.is_empty() {
+                me.channels.clone()
+            } else {
+                named
+            };
+            let mut replies = Vec::with_capacity(leaving.len());
+            let mut subs = hub.lock().unwrap();
+            for channel in leaving {
+                me.channels.retain(|mine| *mine != channel);
+                if let Some(list) = subs.get_mut(&channel) {
+                    list.retain(|(other, _)| *other != me.id);
+                    if list.is_empty() {
+                        subs.remove(&channel);
+                    }
+                }
+                // Naming a channel the connection was not on is confirmed
+                // too, with the count it has left.
+                replies.push(confirmation(
+                    "unsubscribe",
+                    &channel,
+                    me.channels.len(),
+                ));
+            }
+            replies
+        }
+        Command::Publish(channel, message) => {
+            let delivered = {
+                let mut subs = hub.lock().unwrap();
+                match subs.get_mut(&channel) {
+                    None => 0,
+                    Some(list) => {
+                        // Fan-out: one send per subscriber, none of them
+                        // waited for. A send fails only when the receiving
+                        // end is gone — the connection closed without
+                        // unsubscribing — and those entries are pruned on
+                        // the spot, so a departed client costs one failed
+                        // send and nothing more.
+                        list.retain(|(_, mail)| {
+                            mail.send((channel.clone(), message.clone())).is_ok()
+                        });
+                        let delivered = list.len() as i64;
+                        // The last live subscriber's failure takes the
+                        // channel out with it: an empty list would sit in
+                        // the map forever.
+                        if list.is_empty() {
+                            subs.remove(&channel);
+                        }
+                        delivered
+                    }
+                }
+            };
+            // Delivered, not subscribed: the real server counts the
+            // clients the message reached. Captured on 7.2.4.
+            vec![Frame::Integer(delivered)]
+        }
+        // Everything else, from a subscribed connection, is refused with
+        // the real server's message, naming the command as sent and
+        // lowercased. Captured on redis-server 7.2.4.
+        _ if !me.channels.is_empty() => vec![cannot_execute(frame)],
+        _ => Vec::new(),
     }
+}
+
+/// The reply to a store command sent from a subscribed connection.
+fn cannot_execute(frame: &Frame) -> Frame {
+    let name = match frame {
+        Frame::Array(parts) => match parts.first() {
+            Some(Frame::Bulk(name)) => String::from_utf8_lossy(name).to_lowercase(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    };
+    Frame::Error(format!(
+        "ERR Can't execute '{name}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / \
+         PING / QUIT / RESET are allowed in this context"
+    ))
+}
+
+/// Every hub entry that belongs to connection `id`, out. Runs when the
+/// connection ends; an entry left behind would be paid for as a failed
+/// send on every publish.
+fn detach(hub: &Hub, id: u64) {
+    hub.lock().unwrap().retain(|_, list| {
+        list.retain(|(other, _)| *other != id);
+        !list.is_empty()
+    });
+}
+
+/// The connection counter. The hub stores mailboxes tagged with an id, so
+/// a connection leaving a channel removes its own entry and nobody else's.
+static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
+
+async fn serve(stream: TcpStream, db: Db, hub: Hub) -> std::io::Result<()> {
+    let mut conn = Connection::new(stream);
+    // This connection's mailbox. `inbox` is polled by the select below;
+    // publishes land there from whichever task ran the command.
+    let (mail, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+    let mut me = Sub {
+        id: NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed),
+        mail,
+        channels: Vec::new(),
+    };
+    loop {
+        // A subscribed connection has two things to wait for: its next
+        // command, and the next message fanned out to it. `select!` takes
+        // whichever comes first, so a push never waits behind a client
+        // that has gone quiet.
+        tokio::select! {
+            frame = conn.read_frame() => {
+                match frame? {
+                    Some(frame) => {
+                        let replies = execute_pubsub(&hub, &mut me, &frame);
+                        let mut out = Vec::new();
+                        if replies.is_empty() {
+                            execute(&db, &frame).encode(&mut out);
+                        } else {
+                            for reply in replies {
+                                reply.encode(&mut out);
+                            }
+                        }
+                        conn.stream.write_all(&out).await?;
+                    }
+                    // Ok(None): the client closed the connection cleanly.
+                    None => break,
+                }
+            }
+            Some((channel, payload)) = inbox.recv() => {
+                let mut out = Vec::new();
+                message_frame(&channel, &payload).encode(&mut out);
+                conn.stream.write_all(&out).await?;
+            }
+        }
+    }
+    detach(&hub, me.id);
     Ok(())
 }
 
@@ -980,14 +1232,17 @@ async fn main() -> std::io::Result<()> {
     // The sweeper is one more owner of the store, like every connection
     // task: what moves into it is a clone of the `Arc`.
     tokio::spawn(sweeper(db.clone()));
+    // The hub has the same shape: one shared map, one clone per owner.
+    let hub = new_hub();
     loop {
         let (stream, _) = listener.accept().await?;
         // One clone per task. What moves is the reference count, not the
         // map: the store stays where it is, and this clone is dropped
         // when the connection ends.
         let db = db.clone();
+        let hub = hub.clone();
         tokio::spawn(async move {
-            if let Err(err) = serve(stream, db).await {
+            if let Err(err) = serve(stream, db, hub).await {
                 eprintln!("connection error: {err}");
             }
         });
@@ -1011,11 +1266,15 @@ mod tests {
             .await
             .expect("binds an ephemeral port");
         let addr = listener.local_addr().expect("has an address");
+        let hub = new_hub();
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.expect("accepts");
                 let db = db.clone();
-                tokio::spawn(async move { serve(stream, db).await.expect("serves") });
+                let hub = hub.clone();
+                tokio::spawn(async move {
+                    serve(stream, db, hub).await.expect("serves")
+                });
             }
         });
         addr
@@ -2076,6 +2335,257 @@ mod tests {
         assert_eq!(
             execute(&new_db(), &frame),
             Frame::Error("ERR wrong number of arguments for 'save' command".to_string())
+        );
+    }
+
+    /// A `Sub` with a live mailbox to receive on, already subscribed to
+    /// `channels` — the direct-call half of the pub/sub tests. The
+    /// receiver comes back too: dropping it is how a test simulates a
+    /// connection that hung up.
+    fn sub_with(
+        channels: &[&[u8]],
+    ) -> (
+        Hub,
+        Sub,
+        tokio::sync::mpsc::UnboundedReceiver<Push>,
+    ) {
+        let hub = new_hub();
+        let (mail, inbox) = tokio::sync::mpsc::unbounded_channel();
+        let mut me = Sub {
+            id: NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed),
+            mail,
+            channels: Vec::new(),
+        };
+        for channel in channels {
+            hub.lock()
+                .unwrap()
+                .entry(channel.to_vec())
+                .or_default()
+                .push((me.id, me.mail.clone()));
+            me.channels.push(channel.to_vec());
+        }
+        (hub, me, inbox)
+    }
+
+    #[test]
+    fn a_subscription_is_confirmed_with_the_channel_and_the_count() {
+        let (hub, mut me, _) = sub_with(&[]);
+        let frame = decode(b"*2\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(
+            execute_pubsub(&hub, &mut me, &frame),
+            vec![confirmation("subscribe", b"news", 1)]
+        );
+    }
+
+    #[test]
+    fn subscribe_with_no_arguments_is_refused() {
+        let (hub, mut me, _) = sub_with(&[]);
+        let frame = decode(b"*1\r\n$9\r\nsubscribe\r\n").expect("decodes").0;
+        assert_eq!(
+            execute_pubsub(&hub, &mut me, &frame),
+            vec![Frame::Error(
+                "ERR wrong number of arguments for 'subscribe' command".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_fans_out_to_every_subscriber() {
+        // The whole flow over real sockets: two subscribers on one
+        // channel, a publisher on a third connection.
+        let addr = spawn_server(new_db()).await;
+        let mut alice = connect(addr).await;
+        let mut bob = connect(addr).await;
+        let subscribe = b"*2\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n";
+        assert_eq!(
+            ask(&mut alice, subscribe).await,
+            confirmation("subscribe", b"news", 1)
+        );
+        assert_eq!(
+            ask(&mut bob, subscribe).await,
+            confirmation("subscribe", b"news", 1)
+        );
+        let mut carol = connect(addr).await;
+        assert_eq!(
+            ask(
+                &mut carol,
+                b"*3\r\n$7\r\npublish\r\n$4\r\nnews\r\n$5\r\nhello\r\n"
+            )
+            .await,
+            Frame::Integer(2)
+        );
+        assert_eq!(alice.read_frame().await.expect("reads"), Some(message_frame(b"news", b"hello")));
+        assert_eq!(bob.read_frame().await.expect("reads"), Some(message_frame(b"news", b"hello")));
+    }
+
+    #[tokio::test]
+    async fn publish_counts_what_it_delivered() {
+        let addr = spawn_server(new_db()).await;
+        let mut watcher = connect(addr).await;
+        ask(&mut watcher, b"*2\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n").await;
+        let mut carol = connect(addr).await;
+        let publish = b"*3\r\n$7\r\npublish\r\n$4\r\nnews\r\n$5\r\nhello\r\n";
+        assert_eq!(ask(&mut carol, publish).await, Frame::Integer(1));
+        // After the channel is left, the same publish reaches nobody.
+        ask(
+            &mut watcher,
+            b"*1\r\n$11\r\nunsubscribe\r\n$4\r\nnews\r\n",
+        )
+        .await;
+        assert_eq!(ask(&mut carol, publish).await, Frame::Integer(0));
+        // A channel nobody ever subscribed to answers zero, not an error.
+        assert_eq!(
+            ask(
+                &mut carol,
+                b"*3\r\n$7\r\npublish\r\n$5\r\nempty\r\n$1\r\nx\r\n"
+            )
+            .await,
+            Frame::Integer(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_argument_less_unsubscribe_leaves_every_channel() {
+        let addr = spawn_server(new_db()).await;
+        let mut watcher = connect(addr).await;
+        ask(&mut watcher, b"*2\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n").await;
+        ask(&mut watcher, b"*2\r\n$9\r\nsubscribe\r\n$6\r\nsports\r\n").await;
+        assert_eq!(
+            ask(&mut watcher, b"*1\r\n$11\r\nunsubscribe\r\n").await,
+            confirmation("unsubscribe", b"news", 1)
+        );
+        // The second confirmation is the next frame on the wire, not part
+        // of the first reply.
+        assert_eq!(
+            watcher.read_frame().await.expect("reads"),
+            Some(confirmation("unsubscribe", b"sports", 0))
+        );
+        // And the connection is back to normal commands.
+        assert_eq!(
+            ask(&mut watcher, b"*1\r\n$4\r\nping\r\n").await,
+            Frame::Simple("PONG".to_string())
+        );
+    }
+
+    #[test]
+    fn a_subscribed_connection_cannot_run_store_commands() {
+        let (hub, mut me, _) = sub_with(&[b"news"]);
+        let frame = decode(b"*2\r\n$3\r\nget\r\n$1\r\nx\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(
+            execute_pubsub(&hub, &mut me, &frame),
+            vec![Frame::Error(
+                "ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / \
+                 PING / QUIT / RESET are allowed in this context"
+                    .to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_store_command_is_untouched_while_not_subscribed() {
+        let (hub, mut me, _) = sub_with(&[]);
+        let frame = decode(b"*2\r\n$3\r\nget\r\n$1\r\nx\r\n")
+            .expect("decodes")
+            .0;
+        assert!(execute_pubsub(&hub, &mut me, &frame).is_empty());
+    }
+
+    #[test]
+    fn ping_while_subscribed_answers_the_two_part_pong() {
+        let (hub, mut me, _) = sub_with(&[b"news"]);
+        let frame = decode(b"*1\r\n$4\r\nping\r\n").expect("decodes").0;
+        assert_eq!(
+            execute_pubsub(&hub, &mut me, &frame),
+            vec![Frame::Array(vec![
+                Frame::Bulk(b"pong".to_vec()),
+                Frame::Bulk(Vec::new()),
+            ])]
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribing_twice_does_not_double_the_delivery() {
+        let (hub, mut me, mut inbox) = sub_with(&[]);
+        let frame = decode(b"*2\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n")
+            .expect("decodes")
+            .0;
+        execute_pubsub(&hub, &mut me, &frame);
+        // Same connection, same channel again: re-confirmed, registered once.
+        assert_eq!(
+            execute_pubsub(&hub, &mut me, &frame),
+            vec![confirmation("subscribe", b"news", 1)]
+        );
+        // One publish, one copy on the mailbox — a second registration
+        // would have queued the message twice.
+        let publish = decode(b"*3\r\n$7\r\npublish\r\n$4\r\nnews\r\n$2\r\nhi\r\n")
+            .expect("decodes")
+            .0;
+        let (_, mut carol, _) = sub_with(&[]);
+        assert_eq!(
+            execute_pubsub(&hub, &mut carol, &publish),
+            vec![Frame::Integer(1)]
+        );
+        assert_eq!(
+            inbox.try_recv().expect("the message is queued"),
+            (b"news".to_vec(), b"hi".to_vec())
+        );
+        assert!(inbox.try_recv().is_err(), "no second copy");
+    }
+
+    #[tokio::test]
+    async fn a_departed_connection_is_pruned_on_the_next_publish() {
+        let (hub, _me, inbox) = sub_with(&[b"news"]);
+        // The receiving end goes away — the connection hung up without
+        // unsubscribing — and the next publish prunes the entry and
+        // stops counting it.
+        drop(inbox);
+        let publish = decode(b"*3\r\n$7\r\npublish\r\n$4\r\nnews\r\n$1\r\nx\r\n")
+            .expect("decodes")
+            .0;
+        let (_, mut carol, _) = sub_with(&[]);
+        assert_eq!(
+            execute_pubsub(&hub, &mut carol, &publish),
+            vec![Frame::Integer(0)]
+        );
+        assert!(hub.lock().unwrap().get(b"news".as_slice()).is_none());
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_removes_only_the_channel_named() {
+        let (hub, mut me, _) = sub_with(&[b"news", b"sports"]);
+        let frame = decode(b"*2\r\n$11\r\nunsubscribe\r\n$4\r\nnews\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(
+            execute_pubsub(&hub, &mut me, &frame),
+            vec![confirmation("unsubscribe", b"news", 1)]
+        );
+        assert_eq!(me.channels, vec![b"sports".to_vec()]);
+        // The hub entry for the left channel is gone with it.
+        assert!(hub.lock().unwrap().get(b"news".as_slice()).is_none());
+        assert!(hub.lock().unwrap().get(b"sports".as_slice()).is_some());
+    }
+
+    #[tokio::test]
+    async fn publish_reaches_the_mailbox_with_channel_and_payload() {
+        let hub = new_hub();
+        let (mail, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+        hub.lock().unwrap().insert(b"news".to_vec(), vec![(1, mail)]);
+        let frame = decode(b"*3\r\n$7\r\npublish\r\n$4\r\nnews\r\n$5\r\nhello\r\n")
+            .expect("decodes")
+            .0;
+        let (_, mut me, _) = sub_with(&[]);
+        assert_eq!(
+            execute_pubsub(&hub, &mut me, &frame),
+            vec![Frame::Integer(1)]
+        );
+        assert_eq!(
+            inbox.try_recv().expect("the message is queued"),
+            (b"news".to_vec(), b"hello".to_vec())
         );
     }
 }
