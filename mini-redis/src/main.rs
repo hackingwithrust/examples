@@ -11,7 +11,7 @@ use std::collections::hash_map::Entry as Slot;
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -242,6 +242,7 @@ impl Connection {
 }
 
 /// What a key holds: a string, or a list of strings.
+#[derive(PartialEq, Debug)]
 enum Value {
     String(Vec<u8>),
     List(VecDeque<Vec<u8>>),
@@ -252,8 +253,10 @@ enum Value {
 ///
 /// The deadline is an `Instant`, not a wall-clock time. It is monotonic,
 /// so adjusting the system clock cannot move a key's expiry, and it is
-/// process-relative, so a deadline has to become something else on its
-/// way to disk — that is step 6's problem.
+/// process-relative: a snapshot cannot carry it, so it goes to disk as
+/// wall-clock milliseconds and comes back re-anchored to the new boot's
+/// clocks.
+#[derive(PartialEq, Debug)]
 struct Entry {
     value: Value,
     /// `None` is a key with no deadline: it lives until it is
@@ -323,6 +326,7 @@ enum Command {
     LRange(Vec<u8>, i64, i64),
     Expire(Vec<u8>, i64),
     Ttl(Vec<u8>),
+    Save,
 }
 
 impl Command {
@@ -410,6 +414,13 @@ impl Command {
             },
             b"TTL" => match args {
                 [key] => Ok(Command::Ttl(key.to_vec())),
+                _ => Err(wrong_args(name)),
+            },
+            // No arguments, ever: the real server takes none and dumps
+            // the whole keyspace. Captured on redis-server 7.2.4 —
+            // `SAVE` with an argument answers the wrong-arity error.
+            b"SAVE" => match args {
+                [] => Ok(Command::Save),
                 _ => Err(wrong_args(name)),
             },
             _ => Err(unknown_command(name, args)),
@@ -680,6 +691,20 @@ fn execute(db: &Db, frame: &Frame) -> Frame {
                 },
             }
         }
+        Command::Save => {
+            // Synchronous on purpose, like the real server's SAVE: the
+            // dump happens inside the command, and every other client
+            // waits for it. Captured on redis-server 7.2.4 — `SAVE`
+            // answers +OK, `BGSAVE` answers
+            // `Background saving started` and returns at once.
+            match save_snapshot(&db, SNAPSHOT_PATH) {
+                Ok(count) => {
+                    println!("saved {count} key(s) to {SNAPSHOT_PATH}");
+                    Frame::Simple("OK".to_string())
+                }
+                Err(err) => Frame::Error(format!("ERR {err}")),
+            }
+        }
     }
 }
 
@@ -732,11 +757,226 @@ async fn sweeper(db: Db) {
     }
 }
 
+/// Where the snapshot lives, relative to the working directory. The real
+/// server's default is `dump.rdb`; the clone keeps its own name so it
+/// cannot clobber a real server's snapshot when both run in the same
+/// directory.
+const SNAPSHOT_PATH: &str = "mini.rdb";
+
+/// Milliseconds since the Unix epoch, right now. This is the wall-clock
+/// side of the deadline conversion: an `Instant` cannot go to disk, but
+/// a moment on the shared timeline can.
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is past 1970")
+        .as_millis() as u64
+}
+
+fn put_u32(out: &mut Vec<u8>, n: u32) {
+    out.extend_from_slice(&n.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, n: u64) {
+    out.extend_from_slice(&n.to_le_bytes());
+}
+
+fn end_of_snapshot() -> String {
+    "unexpected end of snapshot".to_string()
+}
+
+fn get_byte(bytes: &[u8], pos: &mut usize) -> Result<u8, String> {
+    let byte = bytes
+        .get(*pos)
+        .copied()
+        .ok_or_else(end_of_snapshot)?;
+    *pos += 1;
+    Ok(byte)
+}
+
+fn get_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, String> {
+    let end = (*pos).checked_add(4).ok_or_else(end_of_snapshot)?;
+    let slice = bytes.get(*pos..end).ok_or_else(end_of_snapshot)?;
+    *pos = end;
+    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
+}
+
+fn get_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, String> {
+    let end = (*pos).checked_add(8).ok_or_else(end_of_snapshot)?;
+    let slice = bytes.get(*pos..end).ok_or_else(end_of_snapshot)?;
+    *pos = end;
+    Ok(u64::from_le_bytes(slice.try_into().unwrap()))
+}
+
+fn take_bytes<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8], String> {
+    let end = (*pos).checked_add(len).ok_or_else(end_of_snapshot)?;
+    let slice = bytes.get(*pos..end).ok_or_else(end_of_snapshot)?;
+    *pos = end;
+    Ok(slice)
+}
+
+/// The store as bytes: a five-byte header, then one length-prefixed
+/// record per key. Returns the buffer and how many keys went into it.
+///
+/// Deadlines go out as wall-clock milliseconds — the shared-timeline
+/// moment the key stops existing, not the seconds left. The remaining
+/// time is measured on the monotonic clock, where it cannot be moved by
+/// an adjusted system clock, and then pinned to the wall clock with the
+/// same `now` used for the check.
+///
+/// Keys whose deadline has passed are not written: the read path would
+/// remove them on sight, so carrying them would only defer the removal
+/// to load time.
+fn snapshot(
+    store: &HashMap<Vec<u8>, Entry>,
+    now: Instant,
+    now_ms: u64,
+) -> (Vec<u8>, usize) {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"MRDB");
+    out.push(1);
+    // The count is patched in at the end, when it is known.
+    put_u32(&mut out, 0);
+    let mut count = 0usize;
+    for (key, entry) in store {
+        // Expired keys are dead on arrival: the read path would remove
+        // them on sight, so the snapshot does not carry them. The skip
+        // also guarantees the `at - now` below cannot panic.
+        if expired(entry, now) {
+            continue;
+        }
+        put_u32(&mut out, key.len() as u32);
+        out.extend_from_slice(key);
+        match &entry.value {
+            Value::String(value) => {
+                out.push(0);
+                put_u32(&mut out, value.len() as u32);
+                out.extend_from_slice(value);
+            }
+            Value::List(list) => {
+                out.push(1);
+                put_u32(&mut out, list.len() as u32);
+                for value in list {
+                    put_u32(&mut out, value.len() as u32);
+                    out.extend_from_slice(value);
+                }
+            }
+        }
+        match entry.expires_at {
+            None => out.push(0),
+            Some(at) => {
+                out.push(1);
+                let remaining = (at - now).as_millis() as u64;
+                put_u64(&mut out, now_ms + remaining);
+            }
+        }
+        count += 1;
+    }
+    out[5..9].copy_from_slice(&(count as u32).to_le_bytes());
+    (out, count)
+}
+
+/// The store from bytes, re-anchored: each wall-clock deadline becomes
+/// an `Instant` on the new boot's monotonic clock,
+/// `now + deadline - now_ms`. A key whose deadline fell while the
+/// server was down is dropped here — the real server skips expired keys
+/// at load too, counting them in its `keys expired` log line.
+/// Captured on redis-server 7.2.4.
+fn restore(
+    bytes: &[u8],
+    now: Instant,
+    now_ms: u64,
+) -> Result<HashMap<Vec<u8>, Entry>, String> {
+    if bytes.len() < 9 || &bytes[..4] != b"MRDB" {
+        return Err("not a mini-redis snapshot".to_string());
+    }
+    if bytes[4] != 1 {
+        return Err(format!("unsupported snapshot version {}", bytes[4]));
+    }
+    let count = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+    let mut pos = 9;
+    let mut store = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let key_len = get_u32(bytes, &mut pos)? as usize;
+        let key = take_bytes(bytes, &mut pos, key_len)?.to_vec();
+        let value = match get_byte(bytes, &mut pos)? {
+            0 => {
+                let len = get_u32(bytes, &mut pos)? as usize;
+                Value::String(take_bytes(bytes, &mut pos, len)?.to_vec())
+            }
+            1 => {
+                let items = get_u32(bytes, &mut pos)? as usize;
+                let mut list = VecDeque::with_capacity(items);
+                for _ in 0..items {
+                    let len = get_u32(bytes, &mut pos)? as usize;
+                    list.push_back(take_bytes(bytes, &mut pos, len)?.to_vec());
+                }
+                Value::List(list)
+            }
+            other => return Err(format!("unknown value kind {other}")),
+        };
+        let expires_at = match get_byte(bytes, &mut pos)? {
+            0 => None,
+            1 => {
+                let at_ms = get_u64(bytes, &mut pos)?;
+                if at_ms <= now_ms {
+                    // The deadline fell while the server was down.
+                    continue;
+                }
+                Some(now + Duration::from_millis(at_ms - now_ms))
+            }
+            other => return Err(format!("unknown deadline flag {other}")),
+        };
+        store.insert(key, Entry { value, expires_at });
+    }
+    Ok(store)
+}
+
+/// `SAVE`, end to end. The entries are read under the lock and the file
+/// is written after it drops, so the critical section stays a couple of
+/// map operations long.
+fn save_snapshot(db: &Db, path: &str) -> Result<usize, String> {
+    let (bytes, count) = {
+        let store = db.lock().unwrap();
+        snapshot(&store, Instant::now(), unix_ms())
+    };
+    std::fs::write(path, &bytes).map_err(|err| err.to_string())?;
+    Ok(count)
+}
+
+/// The startup half. `Ok(None)` is no snapshot yet — the normal state
+/// of a server's first boot, not an error.
+fn load_snapshot(path: &str) -> Result<Option<HashMap<Vec<u8>, Entry>>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.to_string()),
+    };
+    restore(&bytes, Instant::now(), unix_ms()).map(Some)
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    let db = new_db();
+    // The startup half of persistence: whatever the last run saved comes
+    // back, deadlines re-anchored to this boot's clocks, and the port
+    // only opens after — the real server also loads before it accepts.
+    // A corrupt file costs a warning, not a crash. The real server
+    // refuses to start instead ("Short read or OOM loading DB.
+    // Unrecoverable error, aborting now.", captured on 7.2.4); the
+    // divergence is deliberate, because a dev server whose snapshot is
+    // lost should still come up.
+    match load_snapshot(SNAPSHOT_PATH) {
+        Ok(Some(entries)) => {
+            let count = entries.len();
+            db.lock().unwrap().extend(entries);
+            println!("loaded {count} key(s) from {SNAPSHOT_PATH}");
+        }
+        Ok(None) => {}
+        Err(err) => eprintln!("ignoring snapshot: {err}"),
+    }
     let listener = TcpListener::bind("127.0.0.1:6379").await?;
     println!("listening on 127.0.0.1:6379");
-    let db = new_db();
     // The sweeper is one more owner of the store, like every connection
     // task: what moves into it is a clone of the `Arc`.
     tokio::spawn(sweeper(db.clone()));
@@ -1638,6 +1878,204 @@ mod tests {
         assert_eq!(
             ask(&mut slow, b"ng\r\n").await,
             Frame::Simple("PONG".to_string())
+        );
+    }
+
+    /// A file outside the crate that no other test will touch.
+    fn scratch_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("mini-redis-test-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_every_value_kind() {
+        let now = Instant::now();
+        let now_ms = unix_ms();
+        let mut store = HashMap::new();
+        store.insert(
+            b"name".to_vec(),
+            Entry {
+                value: Value::String(b"mini".to_vec()),
+                expires_at: None,
+            },
+        );
+        let mut list = VecDeque::new();
+        list.push_back(b"one".to_vec());
+        list.push_back(b"two".to_vec());
+        store.insert(
+            b"queue".to_vec(),
+            Entry {
+                value: Value::List(list),
+                expires_at: None,
+            },
+        );
+        let (bytes, count) = snapshot(&store, now, now_ms);
+        assert_eq!(count, 2);
+        let back = restore(&bytes, now, now_ms).expect("restores");
+        assert_eq!(back, store);
+    }
+
+    #[test]
+    fn a_deadline_survives_the_round_trip() {
+        let now = Instant::now();
+        let now_ms = unix_ms();
+        let mut store = HashMap::new();
+        store.insert(
+            b"session".to_vec(),
+            Entry {
+                value: Value::String(b"token".to_vec()),
+                expires_at: Some(now + Duration::from_secs(100)),
+            },
+        );
+        let (bytes, _) = snapshot(&store, now, now_ms);
+        let back = restore(&bytes, now, now_ms).expect("restores");
+        assert_eq!(ttl_of(&back[&b"session".to_vec()], now), Some(100));
+    }
+
+    #[test]
+    fn downtime_shrinks_the_ttl_the_way_it_does_on_the_real_server() {
+        // Captured on redis-server 7.2.4: TTL 100, `SAVE`, three seconds
+        // of downtime, restart — TTL 97. The deadline is a moment on the
+        // shared timeline, so the downtime comes out of it.
+        let now = Instant::now();
+        let now_ms = unix_ms();
+        let mut store = HashMap::new();
+        store.insert(
+            b"session".to_vec(),
+            Entry {
+                value: Value::String(b"token".to_vec()),
+                expires_at: Some(now + Duration::from_secs(100)),
+            },
+        );
+        let (bytes, _) = snapshot(&store, now, now_ms);
+        let back = restore(&bytes, now + Duration::from_secs(40), now_ms + 40_000)
+            .expect("restores");
+        assert_eq!(
+            ttl_of(&back[&b"session".to_vec()], now + Duration::from_secs(40)),
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn a_key_expired_while_down_is_dropped_at_load() {
+        let now = Instant::now();
+        let now_ms = unix_ms();
+        let mut store = HashMap::new();
+        store.insert(
+            b"flash".to_vec(),
+            Entry {
+                value: Value::String(b"soon".to_vec()),
+                expires_at: Some(now + Duration::from_secs(1)),
+            },
+        );
+        let (bytes, _) = snapshot(&store, now, now_ms);
+        // Five seconds of downtime: the deadline is in the past by load
+        // time, and the key never comes back.
+        let back = restore(&bytes, now + Duration::from_secs(5), now_ms + 5_000)
+            .expect("restores");
+        assert!(back.is_empty());
+    }
+
+    #[test]
+    fn an_expired_key_is_not_written() {
+        let now = Instant::now();
+        let mut store = HashMap::new();
+        store.insert(
+            b"stale".to_vec(),
+            Entry {
+                value: Value::String(b"old".to_vec()),
+                expires_at: Some(now - Duration::from_secs(1)),
+            },
+        );
+        let (bytes, count) = snapshot(&store, now, unix_ms());
+        assert_eq!(count, 0);
+        let back = restore(&bytes, now, unix_ms()).expect("restores");
+        assert!(back.is_empty());
+    }
+
+    #[test]
+    fn a_truncated_snapshot_is_an_error() {
+        let now = Instant::now();
+        let mut store = HashMap::new();
+        store.insert(
+            b"k".to_vec(),
+            Entry {
+                value: Value::String(b"v".to_vec()),
+                expires_at: None,
+            },
+        );
+        let (bytes, _) = snapshot(&store, now, unix_ms());
+        let truncated = &bytes[..bytes.len() - 1];
+        assert_eq!(
+            restore(truncated, now, unix_ms()),
+            Err("unexpected end of snapshot".to_string())
+        );
+    }
+
+    #[test]
+    fn a_snapshot_with_the_wrong_magic_is_an_error() {
+        let now = Instant::now();
+        let store = HashMap::new();
+        let (mut bytes, _) = snapshot(&store, now, unix_ms());
+        bytes[..4].copy_from_slice(b"XXXX");
+        assert_eq!(
+            restore(&bytes, now, unix_ms()),
+            Err("not a mini-redis snapshot".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unsupported_version_is_an_error() {
+        let now = Instant::now();
+        let store = HashMap::new();
+        let (mut bytes, _) = snapshot(&store, now, unix_ms());
+        bytes[4] = 2;
+        assert_eq!(
+            restore(&bytes, now, unix_ms()),
+            Err("unsupported snapshot version 2".to_string())
+        );
+    }
+
+    #[test]
+    fn save_then_load_round_trips_through_a_file() {
+        let db = new_db();
+        let set = decode(b"*3\r\n$3\r\nset\r\n$4\r\nname\r\n$4\r\nmini\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(execute(&db, &set), Frame::Simple("OK".to_string()));
+        let path = scratch_path("round-trip");
+        let count = save_snapshot(&db, path.to_str().unwrap()).expect("saves");
+        assert_eq!(count, 1);
+        let back = load_snapshot(path.to_str().unwrap())
+            .expect("loads")
+            .expect("a snapshot existed");
+        assert_eq!(back, *db.lock().unwrap());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_snapshot_answers_none_when_the_file_is_missing() {
+        let path = scratch_path("missing");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(load_snapshot(path.to_str().unwrap()), Ok(None));
+    }
+
+    #[test]
+    fn save_answers_ok_and_writes_the_file() {
+        let db = new_db();
+        let save = decode(b"*1\r\n$4\r\nsave\r\n").expect("decodes").0;
+        assert_eq!(execute(&db, &save), Frame::Simple("OK".to_string()));
+        assert!(std::path::Path::new(SNAPSHOT_PATH).exists(), "the file exists");
+        std::fs::remove_file(SNAPSHOT_PATH).ok();
+    }
+
+    #[test]
+    fn save_with_an_argument_is_refused() {
+        let frame = decode(b"*2\r\n$4\r\nsave\r\n$3\r\nnow\r\n")
+            .expect("decodes")
+            .0;
+        assert_eq!(
+            execute(&new_db(), &frame),
+            Frame::Error("ERR wrong number of arguments for 'save' command".to_string())
         );
     }
 }
