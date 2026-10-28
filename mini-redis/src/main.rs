@@ -381,6 +381,9 @@ enum Command {
     Subscribe(Vec<Vec<u8>>),
     Unsubscribe(Vec<Vec<u8>>),
     Publish(Vec<u8>, Vec<u8>),
+    Multi,
+    Exec,
+    Discard,
 }
 
 impl Command {
@@ -497,6 +500,24 @@ impl Command {
                 [channel, message] => {
                     Ok(Command::Publish(channel.to_vec(), message.to_vec()))
                 }
+                _ => Err(wrong_args(name)),
+            },
+            // No arguments for any of the three. Captured on
+            // redis-server 7.2.4: `MULTI x` and `DISCARD x` answer the
+            // wrong-arity error — but `EXEC x` wraps its refusal in the
+            // transaction abort message, because the real server routes
+            // EXEC's argument check through the transaction machinery.
+            // The clone reproduces that shape.
+            b"MULTI" => match args {
+                [] => Ok(Command::Multi),
+                _ => Err(wrong_args(name)),
+            },
+            b"EXEC" => match args {
+                [] => Ok(Command::Exec),
+                _ => Err(exec_arity_abort()),
+            },
+            b"DISCARD" => match args {
+                [] => Ok(Command::Discard),
                 _ => Err(wrong_args(name)),
             },
             _ => Err(unknown_command(name, args)),
@@ -629,6 +650,13 @@ fn execute(db: &Db, frame: &Frame) -> Frame {
         // mean a routing bug upstream.
         Command::Subscribe(..) | Command::Unsubscribe(..) | Command::Publish(..) => {
             Frame::Error("ERR internal: pub/sub command reached the store".to_string())
+        }
+        // MULTI, EXEC and DISCARD are intercepted upstream — without an
+        // open transaction by `queue_or_execute`, inside one by
+        // `transaction_step`. A frame that reaches this arm would mean a
+        // routing bug in that layer.
+        Command::Multi | Command::Exec | Command::Discard => {
+            Frame::Error("ERR internal: transaction command reached the store".to_string())
         }
         Command::Ping => Frame::Simple("PONG".to_string()),
         Command::Echo(message) => Frame::Bulk(message),
@@ -891,6 +919,14 @@ fn execute_pubsub(hub: &Hub, me: &mut Sub, frame: &Frame) -> Vec<Frame> {
             // clients the message reached. Captured on 7.2.4.
             vec![Frame::Integer(delivered)]
         }
+        // EXEC from a subscribed connection is refused through the
+        // transaction machinery, like every other EXEC refusal: the
+        // real server answers an EXECABORT carrying the context error,
+        // not the plain guard message. Captured on redis-server 7.2.4.
+        Command::Exec if !me.channels.is_empty() => vec![Frame::Error(format!(
+            "EXECABORT Transaction discarded because of: {}",
+            context_error(frame)
+        ))],
         // Everything else, from a subscribed connection, is refused with
         // the real server's message, naming the command as sent and
         // lowercased. Captured on redis-server 7.2.4.
@@ -901,6 +937,13 @@ fn execute_pubsub(hub: &Hub, me: &mut Sub, frame: &Frame) -> Vec<Frame> {
 
 /// The reply to a store command sent from a subscribed connection.
 fn cannot_execute(frame: &Frame) -> Frame {
+    Frame::Error(format!("ERR {}", context_error(frame)))
+}
+
+/// The subscribe-mode error without its `ERR` prefix — the real server
+/// embeds this exact text inside an EXECABORT when EXEC is refused in
+/// subscribe mode. Captured on redis-server 7.2.4.
+fn context_error(frame: &Frame) -> String {
     let name = match frame {
         Frame::Array(parts) => match parts.first() {
             Some(Frame::Bulk(name)) => String::from_utf8_lossy(name).to_lowercase(),
@@ -908,10 +951,10 @@ fn cannot_execute(frame: &Frame) -> Frame {
         },
         _ => String::new(),
     };
-    Frame::Error(format!(
-        "ERR Can't execute '{name}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / \
+    format!(
+        "Can't execute '{name}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / \
          PING / QUIT / RESET are allowed in this context"
-    ))
+    )
 }
 
 /// Every hub entry that belongs to connection `id`, out. Runs when the
@@ -922,6 +965,120 @@ fn detach(hub: &Hub, id: u64) {
         list.retain(|(other, _)| *other != id);
         !list.is_empty()
     });
+}
+
+/// `EXEC` with an argument. The real server checks EXEC's arity inside
+/// the transaction machinery, so the refusal arrives wrapped in the
+/// abort message instead of as a plain wrong-arity error. Captured on
+/// redis-server 7.2.4.
+fn exec_arity_abort() -> Frame {
+    Frame::Error(
+        "EXECABORT Transaction discarded because of: \
+         wrong number of arguments for 'exec' command"
+            .to_string(),
+    )
+}
+
+/// The reply to `EXEC` after a queue-time error. Captured verbatim on
+/// redis-server 7.2.4 — note the full stop, which the arity variant of
+/// the message does not carry.
+fn exec_aborted() -> Frame {
+    Frame::Error(
+        "EXECABORT Transaction discarded because of previous errors."
+            .to_string(),
+    )
+}
+
+/// One connection's open transaction: the frames queued since `MULTI`,
+/// and whether any of them failed at queue time — which turns `EXEC`
+/// into an abort instead of a run. It lives in the connection task,
+/// next to the connection's subscriptions: a transaction, like a
+/// subscription, belongs to one socket.
+struct Transaction {
+    queued: Vec<Frame>,
+    dirty: bool,
+}
+
+/// One frame from a connection that is not subscribed. With no
+/// transaction open, `MULTI` opens one and `EXEC`/`DISCARD` are refused
+/// for running without one; everything else runs against the store now.
+fn queue_or_execute(
+    db: &Db,
+    hub: &Hub,
+    me: &mut Sub,
+    tx: &mut Option<Transaction>,
+    frame: Frame,
+) -> Frame {
+    if tx.is_some() {
+        return transaction_step(db, hub, me, tx, frame);
+    }
+    match Command::from_frame(&frame) {
+        Ok(Command::Multi) => {
+            *tx = Some(Transaction {
+                queued: Vec::new(),
+                dirty: false,
+            });
+            Frame::Simple("OK".to_string())
+        }
+        Ok(Command::Exec) => Frame::Error("ERR EXEC without MULTI".to_string()),
+        Ok(Command::Discard) => {
+            Frame::Error("ERR DISCARD without MULTI".to_string())
+        }
+        _ => execute(db, &frame),
+    }
+}
+
+/// A frame arriving while this connection's transaction is open.
+/// Everything except the three control commands is queued and answered
+/// `+QUEUED` — and nothing runs until `EXEC`. A frame that fails to
+/// parse is refused on the spot and marks the transaction dirty, which
+/// turns `EXEC` into an abort. All captured on redis-server 7.2.4.
+fn transaction_step(
+    db: &Db,
+    hub: &Hub,
+    me: &mut Sub,
+    tx: &mut Option<Transaction>,
+    frame: Frame,
+) -> Frame {
+    let transaction = tx.as_mut().expect("the transaction is open");
+    match Command::from_frame(&frame) {
+        Err(reply) => {
+            transaction.dirty = true;
+            reply
+        }
+        Ok(Command::Multi) => {
+            Frame::Error("ERR MULTI calls can not be nested".to_string())
+        }
+        Ok(Command::Discard) => {
+            *tx = None;
+            Frame::Simple("OK".to_string())
+        }
+        Ok(Command::Exec) => {
+            let transaction = tx.take().expect("the transaction is open");
+            if transaction.dirty {
+                return exec_aborted();
+            }
+            // Every queued frame runs through the same dispatch a fresh
+            // one would: pub/sub first, then the store. The replies come
+            // back in one array, in queue order — and a command that
+            // fails at run time is one element of that array, not an
+            // abort.
+            let mut replies = Vec::with_capacity(transaction.queued.len());
+            for frame in &transaction.queued {
+                let pushed = execute_pubsub(hub, me, frame);
+                if pushed.is_empty() {
+                    replies.push(execute(db, frame));
+                } else {
+                    replies.extend(pushed);
+                }
+            }
+            Frame::Array(replies)
+        }
+        Ok(_) => {
+            transaction.queued.push(frame);
+            Frame::Simple("QUEUED".to_string())
+        }
+    }
 }
 
 /// The connection counter. The hub stores mailboxes tagged with an id, so
@@ -938,6 +1095,8 @@ async fn serve(stream: TcpStream, db: Db, hub: Hub) -> std::io::Result<()> {
         mail,
         channels: Vec::new(),
     };
+    // This connection's transaction, once MULTI opens one.
+    let mut tx: Option<Transaction> = None;
     loop {
         // A subscribed connection has two things to wait for: its next
         // command, and the next message fanned out to it. `select!` takes
@@ -947,13 +1106,29 @@ async fn serve(stream: TcpStream, db: Db, hub: Hub) -> std::io::Result<()> {
             frame = conn.read_frame() => {
                 match frame? {
                     Some(frame) => {
-                        let replies = execute_pubsub(&hub, &mut me, &frame);
                         let mut out = Vec::new();
-                        if replies.is_empty() {
-                            execute(&db, &frame).encode(&mut out);
+                        if tx.is_some() {
+                            // While a transaction is open it owns this
+                            // connection's input — every frame, including
+                            // ones that fail to parse, passes through the
+                            // queue machinery. A queue-time error answered
+                            // out of band would never mark the transaction
+                            // dirty, and EXEC would run instead of abort.
+                            queue_or_execute(&db, &hub, &mut me, &mut tx, frame)
+                                .encode(&mut out);
                         } else {
-                            for reply in replies {
-                                reply.encode(&mut out);
+                            // Pub/sub answers first: a subscribed connection
+                            // never reaches the transaction machinery, and
+                            // the real server refuses MULTI there like every
+                            // store command. Captured on redis-server 7.2.4.
+                            let replies = execute_pubsub(&hub, &mut me, &frame);
+                            if replies.is_empty() {
+                                queue_or_execute(&db, &hub, &mut me, &mut tx, frame)
+                                    .encode(&mut out);
+                            } else {
+                                for reply in replies {
+                                    reply.encode(&mut out);
+                                }
                             }
                         }
                         conn.stream.write_all(&out).await?;
@@ -2492,6 +2667,262 @@ mod tests {
             .expect("decodes")
             .0;
         assert!(execute_pubsub(&hub, &mut me, &frame).is_empty());
+    }
+
+    // ---- transactions (step 8) ----
+
+    #[tokio::test]
+    async fn a_transaction_queues_and_execs_into_one_array() {
+        let addr = spawn_server(new_db()).await;
+        let mut conn = connect(addr).await;
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$5\r\nmulti\r\n").await,
+            Frame::Simple("OK".to_string())
+        );
+        assert_eq!(
+            ask(
+                &mut conn,
+                b"*3\r\n$3\r\nset\r\n$1\r\na\r\n$1\r\n1\r\n"
+            )
+            .await,
+            Frame::Simple("QUEUED".to_string())
+        );
+        assert_eq!(
+            ask(&mut conn, b"*2\r\n$3\r\nget\r\n$1\r\na\r\n").await,
+            Frame::Simple("QUEUED".to_string())
+        );
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$4\r\nexec\r\n").await,
+            Frame::Array(vec![
+                Frame::Simple("OK".to_string()),
+                Frame::Bulk(b"1".to_vec()),
+            ])
+        );
+        // The transaction is over: commands run again, as themselves.
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$4\r\nping\r\n").await,
+            Frame::Simple("PONG".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_commands_do_not_touch_the_store_until_exec() {
+        let addr = spawn_server(new_db()).await;
+        let mut writer = connect(addr).await;
+        let mut reader = connect(addr).await;
+        ask(&mut writer, b"*1\r\n$5\r\nmulti\r\n").await;
+        assert_eq!(
+            ask(
+                &mut writer,
+                b"*3\r\n$3\r\nset\r\n$6\r\nhidden\r\n$2\r\n42\r\n"
+            )
+            .await,
+            Frame::Simple("QUEUED".to_string())
+        );
+        // Still queued: another connection sees nothing.
+        assert_eq!(
+            ask(&mut reader, b"*2\r\n$3\r\nget\r\n$6\r\nhidden\r\n").await,
+            Frame::Null
+        );
+        ask(&mut writer, b"*1\r\n$4\r\nexec\r\n").await;
+        assert_eq!(
+            ask(&mut reader, b"*2\r\n$3\r\nget\r\n$6\r\nhidden\r\n").await,
+            Frame::Bulk(b"42".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_without_multi_is_refused() {
+        let addr = spawn_server(new_db()).await;
+        let mut conn = connect(addr).await;
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$4\r\nexec\r\n").await,
+            Frame::Error("ERR EXEC without MULTI".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_without_multi_is_refused() {
+        let addr = spawn_server(new_db()).await;
+        let mut conn = connect(addr).await;
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$7\r\ndiscard\r\n").await,
+            Frame::Error("ERR DISCARD without MULTI".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_transaction_execs_to_an_empty_array() {
+        let addr = spawn_server(new_db()).await;
+        let mut conn = connect(addr).await;
+        ask(&mut conn, b"*1\r\n$5\r\nmulti\r\n").await;
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$4\r\nexec\r\n").await,
+            Frame::Array(vec![])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nested_multi_is_refused() {
+        let addr = spawn_server(new_db()).await;
+        let mut conn = connect(addr).await;
+        ask(&mut conn, b"*1\r\n$5\r\nmulti\r\n").await;
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$5\r\nmulti\r\n").await,
+            Frame::Error("ERR MULTI calls can not be nested".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_command_at_queue_time_aborts_exec() {
+        let addr = spawn_server(new_db()).await;
+        let mut conn = connect(addr).await;
+        ask(&mut conn, b"*1\r\n$5\r\nmulti\r\n").await;
+        // Refused at queue time, not silently queued.
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$6\r\nBADCMD\r\n").await,
+            Frame::Error(
+                "ERR unknown command 'BADCMD', with args beginning with: "
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$4\r\nexec\r\n").await,
+            exec_aborted()
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_arity_at_queue_time_aborts_exec_too() {
+        let addr = spawn_server(new_db()).await;
+        let mut conn = connect(addr).await;
+        ask(&mut conn, b"*1\r\n$5\r\nmulti\r\n").await;
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$3\r\nget\r\n").await,
+            Frame::Error("ERR wrong number of arguments for 'get' command".to_string())
+        );
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$4\r\nexec\r\n").await,
+            exec_aborted()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runtime_error_inside_exec_is_one_element_not_an_abort() {
+        let addr = spawn_server(new_db()).await;
+        let mut conn = connect(addr).await;
+        ask(&mut conn, b"*1\r\n$5\r\nmulti\r\n").await;
+        ask(
+            &mut conn,
+            b"*3\r\n$3\r\nset\r\n$1\r\na\r\n$1\r\n1\r\n",
+        )
+        .await;
+        ask(
+            &mut conn,
+            b"*3\r\n$5\r\nlpush\r\n$1\r\na\r\n$1\r\nx\r\n",
+        )
+        .await;
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$4\r\nexec\r\n").await,
+            Frame::Array(vec![
+                Frame::Simple("OK".to_string()),
+                Frame::Error(
+                    "WRONGTYPE Operation against a key holding the \
+                     wrong kind of value"
+                        .to_string()
+                ),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_empties_the_queue_and_closes_the_transaction() {
+        let addr = spawn_server(new_db()).await;
+        let mut conn = connect(addr).await;
+        ask(&mut conn, b"*1\r\n$5\r\nmulti\r\n").await;
+        ask(
+            &mut conn,
+            b"*3\r\n$3\r\nset\r\n$1\r\na\r\n$1\r\n1\r\n",
+        )
+        .await;
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$7\r\ndiscard\r\n").await,
+            Frame::Simple("OK".to_string())
+        );
+        // The queue is gone and the transaction with it.
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$4\r\nexec\r\n").await,
+            Frame::Error("ERR EXEC without MULTI".to_string())
+        );
+        // And the queued SET never ran.
+        assert_eq!(
+            ask(&mut conn, b"*2\r\n$3\r\nget\r\n$1\r\na\r\n").await,
+            Frame::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_with_an_argument_is_the_wrong_arity_error() {
+        let addr = spawn_server(new_db()).await;
+        let mut conn = connect(addr).await;
+        assert_eq!(
+            ask(&mut conn, b"*2\r\n$5\r\nmulti\r\n$1\r\nx\r\n").await,
+            Frame::Error(
+                "ERR wrong number of arguments for 'multi' command"
+                    .to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_with_an_argument_answers_the_arity_abort() {
+        let addr = spawn_server(new_db()).await;
+        let mut conn = connect(addr).await;
+        assert_eq!(
+            ask(&mut conn, b"*2\r\n$4\r\nexec\r\n$1\r\nx\r\n").await,
+            exec_arity_abort()
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_is_refused_while_subscribed() {
+        let addr = spawn_server(new_db()).await;
+        let mut conn = connect(addr).await;
+        assert_eq!(
+            ask(&mut conn, b"*2\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n").await,
+            confirmation("subscribe", b"news", 1)
+        );
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$5\r\nmulti\r\n").await,
+            Frame::Error(
+                "ERR Can't execute 'multi': only (P|S)SUBSCRIBE / \
+                 (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in \
+                 this context"
+                    .to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_while_subscribed_answers_the_execabort_wrapper() {
+        let addr = spawn_server(new_db()).await;
+        let mut conn = connect(addr).await;
+        assert_eq!(
+            ask(&mut conn, b"*2\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n").await,
+            confirmation("subscribe", b"news", 1)
+        );
+        // Refused through the transaction machinery, not the plain guard:
+        // the context error arrives inside the EXECABORT. Captured on
+        // redis-server 7.2.4.
+        assert_eq!(
+            ask(&mut conn, b"*1\r\n$4\r\nexec\r\n").await,
+            Frame::Error(
+                "EXECABORT Transaction discarded because of: Can't execute \
+                 'exec': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / \
+                 QUIT / RESET are allowed in this context"
+                    .to_string()
+            )
+        );
     }
 
     #[test]
