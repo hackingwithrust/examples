@@ -1402,8 +1402,21 @@ async fn main() -> std::io::Result<()> {
         Ok(None) => {}
         Err(err) => eprintln!("ignoring snapshot: {err}"),
     }
-    let listener = TcpListener::bind("127.0.0.1:6379").await?;
-    println!("listening on 127.0.0.1:6379");
+    // The port is the one thing the real server also takes as an
+    // argument (`redis-server --port 6380`): an integration test needs
+    // a port it owns, and 6379 belongs to whoever started first. Port
+    // 0 means "any free port" — the real server refuses it, the clone
+    // takes it, because a test that probes for a free port and then
+    // hands it over has a race in the gap. The printed line carries
+    // the address that was actually bound, so a test reads its port
+    // back instead of guessing.
+    let port: u16 = std::env::args()
+        .nth(1)
+        .and_then(|arg| arg.parse().ok())
+        .unwrap_or(6379);
+    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    let port = listener.local_addr()?.port();
+    println!("listening on 127.0.0.1:{port}");
     // The sweeper is one more owner of the store, like every connection
     // task: what moves into it is a clone of the `Arc`.
     tokio::spawn(sweeper(db.clone()));
