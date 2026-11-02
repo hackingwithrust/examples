@@ -9,8 +9,10 @@
 #            it stands at that tag, which is the state a reader following the
 #            corresponding article lands on.
 #
-# A tag prefix maps to a track directory in the `tag` job's case block. When a
-# new track ships its first chapter tag, that mapping needs one new line.
+# A tag prefix maps to a track directory in the `tag` job's case block. The
+# block lists every track that is live; a prefix with no entry falls back to
+# the single directory whose name starts with it, so a brand-new track's first
+# tag still resolves (`interp-ch01` -> interpreter/, `llm-ch02` -> llm-apps/).
 #
 # The tauri track needs the Linux system libraries its dependency graph links
 # against (GTK/webkit); nothing else here does.
@@ -141,8 +143,26 @@ jobs:
             api-*)    dir=axum-sqlx-api ;;
             lsm-*)    dir=toy-database ;;
             wasm-*)   dir=react-wasm ;;
+            mini-*)   dir=mini-redis ;;
+            search-*) dir=search-engine ;;
+            tui-*)    dir=tui-ratatui ;;
+            stm32-*)  dir=embedded-stm32 ;;
             tauri-*)  dir=tauri-desktop-app/src-tauri ;;
-            *) echo "::error::no track mapping for tag $GITHUB_REF_NAME — add one to .github/workflows/verify.yml"; exit 1 ;;
+            *)
+              # No explicit entry: take the one directory whose name starts with
+              # the tag's prefix. Ambiguous or missing -> fail loudly, because a
+              # silent skip would mean a tag nobody ever built.
+              prefix="${GITHUB_REF_NAME%%-ch*}"
+              matches=()
+              while IFS= read -r d; do matches+=("$d"); done < <(
+                find . -maxdepth 1 -type d -name "${prefix}*" ! -name . -printf '%P\n'
+              )
+              if [ "${#matches[@]}" -ne 1 ]; then
+                echo "::error::tag $GITHUB_REF_NAME matches ${#matches[@]} track directories — add an explicit line to .github/workflows/verify.yml"
+                exit 1
+              fi
+              dir="${matches[0]}"
+              ;;
           esac
           echo "DIR=$dir" >> "$GITHUB_ENV"
 
@@ -164,6 +184,10 @@ jobs:
           rustup toolchain install 1.99.0 --profile minimal --no-self-update
           rustc 1.99.0 --version
 
+      - name: Install the embedded target
+        if: startsWith(env.DIR, 'embedded-stm32')
+        run: rustup target add thumbv7em-none-eabihf
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -179,6 +203,10 @@ jobs:
         working-directory: ${{ env.DIR }}
 
       - name: Test
+        # Firmware has no host-runnable tests: the crate is a no_std binary for
+        # thumbv7em, so a test harness cannot be built for the host. Building it
+        # for the board is the check that matters there.
+        if: ${{ !startsWith(env.DIR, 'embedded-stm32') }}
         env:
           SQLX_OFFLINE: ${{ startsWith(env.DIR, 'axum-sqlx-api') && 'true' || '' }}
         run: cargo test --locked --quiet
