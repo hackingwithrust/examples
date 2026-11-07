@@ -1,12 +1,11 @@
-//! birch, step 7: control flow and functions.
+//! birch, step 8: error reporting with line numbers.
 //!
-//! The tree-walking evaluator learns to jump. `execute` now returns a
-//! `Flow` instead of nothing, so a `return` can travel — past blocks
-//! and loops — to the call that asked for it; `Value::Function` makes
-//! a function a value the environment can store; the `Call` arm checks
-//! arity, pushes a scope of parameters and runs the body. `if`, `while`
-//! and blocks needed no new machinery: this step is about what
-//! `return` returns *to*.
+//! The scanner has stamped every token with a line and a column since
+//! step 2, and scan and parse errors have printed them ever since —
+//! but a runtime error was a bare message, because the tree threw the
+//! positions away: operators became bare `TokenKind`s and names became
+//! bare strings. This step keeps whole tokens in the tree instead, so
+//! every runtime error can point at the token that caused it.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -56,7 +55,7 @@ enum TokenKind {
     Eof,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct Token {
     kind: TokenKind,
     lexeme: String,
@@ -295,21 +294,26 @@ fn keyword(word: &str) -> TokenKind {
 // One variant per shape an expression can take. Every field that would
 // make the enum infinitely sized holds a `Box`; fields already behind a
 // `Vec` or an `Option` break the recursion for free. `Clone` and
-// `PartialEq` arrive with this step: a function value holds part of
-// the tree, so the tree has to be a clonable, comparable citizen.
+// `PartialEq` exist because a function value holds part of the tree,
+// so the tree has to be a clonable, comparable citizen.
 #[derive(Debug, Clone, PartialEq)]
 enum Expr {
     Number(f64),
     Str(String),
     Bool(bool),
     Nil,
-    Variable(String),
-    Unary { op: TokenKind, operand: Box<Expr> },
-    Binary { op: TokenKind, left: Box<Expr>, right: Box<Expr> },
+    // The variants that can fail at runtime keep the whole token, not
+    // a distillation of it: an operator that needs numbers knows where
+    // it sits, a name that goes missing knows its own position, a call
+    // that goes wrong knows which paren opened it. `Logical` keeps the
+    // bare kind — it can never fail, so it has nothing to point at.
+    Variable(Token),
+    Unary { op: Token, operand: Box<Expr> },
+    Binary { op: Token, left: Box<Expr>, right: Box<Expr> },
     Logical { op: TokenKind, left: Box<Expr>, right: Box<Expr> },
-    Assign { name: String, value: Box<Expr> },
-    Call { callee: Box<Expr>, args: Vec<Expr> },
-    Index { object: Box<Expr>, index: Box<Expr> },
+    Assign { name: Token, value: Box<Expr> },
+    Call { callee: Box<Expr>, args: Vec<Expr>, paren: Token },
+    Index { object: Box<Expr>, index: Box<Expr>, bracket: Token },
     List(Vec<Expr>),
 }
 
@@ -319,7 +323,7 @@ enum Expr {
 #[derive(Debug, Clone, PartialEq)]
 enum Stmt {
     Var { name: String, init: Expr },
-    Fun { name: String, params: Vec<String>, body: Vec<Stmt> },
+    Fun { name: String, params: Vec<Token>, body: Vec<Stmt> },
     Expression(Expr),
     If { condition: Expr, then_branch: Box<Stmt>, else_branch: Option<Box<Stmt>> },
     While { condition: Expr, body: Box<Stmt> },
@@ -369,7 +373,7 @@ impl Parser {
     // varDecl → "var" IDENT "=" expression ";"
     fn var_declaration(&mut self) -> Result<Stmt, ParseError> {
         self.advance(); // the `var`
-        let name = self.expect_ident("a variable name")?;
+        let name = self.expect_ident("a variable name")?.lexeme;
         self.expect(TokenKind::Assign, "`=`")?;
         let init = self.expression(0)?;
         self.expect(TokenKind::Semicolon, "`;`")?;
@@ -379,7 +383,7 @@ impl Parser {
     // funDecl → "fun" IDENT "(" parameters? ")" block
     fn fun_declaration(&mut self) -> Result<Stmt, ParseError> {
         self.advance(); // the `fun`
-        let name = self.expect_ident("a function name")?;
+        let name = self.expect_ident("a function name")?.lexeme;
         self.expect(TokenKind::LeftParen, "`(`")?;
         let mut params = Vec::new();
         if self.peek().kind != TokenKind::RightParen {
@@ -468,7 +472,9 @@ impl Parser {
             // they hug whatever is on their left, whatever the minimum
             match self.peek().kind {
                 TokenKind::LeftParen => {
-                    self.pos += 1;
+                    // the paren itself goes into the tree: when this
+                    // call fails at runtime, the error points here
+                    let paren = self.advance();
                     let mut args = Vec::new();
                     if self.peek().kind != TokenKind::RightParen {
                         loop {
@@ -479,14 +485,16 @@ impl Parser {
                         }
                     }
                     self.expect(TokenKind::RightParen, "`)`")?;
-                    lhs = Expr::Call { callee: Box::new(lhs), args };
+                    lhs = Expr::Call { callee: Box::new(lhs), args, paren };
                     continue;
                 }
                 TokenKind::LeftBracket => {
-                    self.pos += 1;
+                    // same story: the bracket is where an index error
+                    // will point
+                    let bracket = self.advance();
                     let index = self.expression(0)?;
                     self.expect(TokenKind::RightBracket, "`]`")?;
-                    lhs = Expr::Index { object: Box::new(lhs), index: Box::new(index) };
+                    lhs = Expr::Index { object: Box::new(lhs), index: Box::new(index), bracket };
                     continue;
                 }
                 _ => {}
@@ -515,10 +523,14 @@ impl Parser {
             let rhs = self.expression(right)?;
             lhs = if op.kind == TokenKind::And || op.kind == TokenKind::Or {
                 // a separate variant: `and`/`or` short-circuit, and the
-                // tree records that
+                // tree records that — as a bare kind, because neither
+                // one can ever produce a runtime error
                 Expr::Logical { op: op.kind, left: Box::new(lhs), right: Box::new(rhs) }
             } else {
-                Expr::Binary { op: op.kind, left: Box::new(lhs), right: Box::new(rhs) }
+                // the whole token, not just the kind: when this
+                // operator fails at runtime, the error needs its
+                // position
+                Expr::Binary { op, left: Box::new(lhs), right: Box::new(rhs) }
             };
         }
         Ok(lhs)
@@ -559,10 +571,10 @@ impl Parser {
             TokenKind::True => Ok(Expr::Bool(true)),
             TokenKind::False => Ok(Expr::Bool(false)),
             TokenKind::Nil => Ok(Expr::Nil),
-            TokenKind::Ident => Ok(Expr::Variable(token.lexeme)),
+            TokenKind::Ident => Ok(Expr::Variable(token)),
             TokenKind::Minus | TokenKind::Bang => {
                 let operand = self.expression(UNARY)?;
-                Ok(Expr::Unary { op: token.kind, operand: Box::new(operand) })
+                Ok(Expr::Unary { op: token, operand: Box::new(operand) })
             }
             TokenKind::LeftParen => {
                 // no Grouping variant: the tree's shape *is* the grouping,
@@ -635,9 +647,11 @@ impl Parser {
         })
     }
 
-    fn expect_ident(&mut self, what: &str) -> Result<String, ParseError> {
-        let token = self.expect(TokenKind::Ident, what)?;
-        Ok(token.lexeme)
+    // The whole token, not just the name: callers that will need a
+    // position for a later error — function parameters, for one —
+    // keep everything the scanner recorded.
+    fn expect_ident(&mut self, what: &str) -> Result<Token, ParseError> {
+        self.expect(TokenKind::Ident, what)
     }
 }
 
@@ -715,26 +729,15 @@ fn type_name(value: &Value) -> &'static str {
     }
 }
 
-// The tree stores operators as `TokenKind`, which has no `Display` —
-// and no position either, which is why runtime errors below cannot say
-// where they happened.
-fn operator_text(kind: &TokenKind) -> &'static str {
-    match kind {
-        TokenKind::Plus => "+",
-        TokenKind::Minus => "-",
-        TokenKind::Star => "*",
-        TokenKind::Slash => "/",
-        TokenKind::Percent => "%",
-        TokenKind::Less => "<",
-        TokenKind::LessEqual => "<=",
-        TokenKind::Greater => ">",
-        TokenKind::GreaterEqual => ">=",
-        TokenKind::Bang => "!",
-        _ => "?",
-    }
-}
-
+// The third error type catches up with the other two: a runtime error
+// now carries the position of the token that caused it. Scan errors
+// have had `line`/`col` since the scanning step and parse errors since
+// the parsing one; `evaluate` fills both fields in from the token the
+// failing arm kept — which is why the tree stores whole tokens where
+// an error is possible.
 struct RuntimeError {
+    line: usize,
+    col: usize,
     message: String,
 }
 
@@ -818,11 +821,17 @@ fn evaluate(expr: &Expr, env: &mut Environment) -> Result<Value, RuntimeError> {
         }
         Expr::Unary { op, operand } => {
             let value = evaluate(operand, env)?;
-            match op {
+            match op.kind {
                 TokenKind::Minus => match value {
                     Value::Number(n) => Ok(Value::Number(-n)),
                     _ => Err(RuntimeError {
-                        message: format!("`-` needs a number, got {}", type_name(&value)),
+                        line: op.line,
+                        col: op.col,
+                        message: format!(
+                            "`{}` needs a number, got {}",
+                            op.lexeme,
+                            type_name(&value)
+                        ),
                     }),
                 },
                 // `!` accepts anything: the question is only truthiness
@@ -835,7 +844,7 @@ fn evaluate(expr: &Expr, env: &mut Environment) -> Result<Value, RuntimeError> {
             // half, `Logical` below is the half that can skip
             let l = evaluate(left, env)?;
             let r = evaluate(right, env)?;
-            match op {
+            match op.kind {
                 TokenKind::Plus => match (&l, &r) {
                     // one operator, two behaviours: numbers add,
                     // strings concatenate — anything else is a runtime
@@ -843,8 +852,11 @@ fn evaluate(expr: &Expr, env: &mut Environment) -> Result<Value, RuntimeError> {
                     (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
                     (Value::Str(a), Value::Str(b)) => Ok(Value::Str(format!("{a}{b}"))),
                     _ => Err(RuntimeError {
+                        line: op.line,
+                        col: op.col,
                         message: format!(
-                            "`+` needs two numbers or two strings, got {} and {}",
+                            "`{}` needs two numbers or two strings, got {} and {}",
+                            op.lexeme,
                             type_name(&l),
                             type_name(&r)
                         ),
@@ -854,19 +866,23 @@ fn evaluate(expr: &Expr, env: &mut Environment) -> Result<Value, RuntimeError> {
                 | TokenKind::Percent => {
                     let (Value::Number(a), Value::Number(b)) = (&l, &r) else {
                         return Err(RuntimeError {
+                            line: op.line,
+                            col: op.col,
                             message: format!(
                                 "`{}` needs two numbers, got {} and {}",
-                                operator_text(op),
+                                op.lexeme,
                                 type_name(&l),
                                 type_name(&r)
                             ),
                         });
                     };
-                    let value = match op {
+                    let value = match op.kind {
                         TokenKind::Slash | TokenKind::Percent if *b == 0.0 => {
                             // f64 division would happily return `inf`
                             // or `NaN`; the language refuses instead
                             return Err(RuntimeError {
+                                line: op.line,
+                                col: op.col,
                                 message: String::from("division by zero"),
                             });
                         }
@@ -881,15 +897,17 @@ fn evaluate(expr: &Expr, env: &mut Environment) -> Result<Value, RuntimeError> {
                 | TokenKind::GreaterEqual => {
                     let (Value::Number(a), Value::Number(b)) = (&l, &r) else {
                         return Err(RuntimeError {
+                            line: op.line,
+                            col: op.col,
                             message: format!(
                                 "`{}` needs two numbers, got {} and {}",
-                                operator_text(op),
+                                op.lexeme,
                                 type_name(&l),
                                 type_name(&r)
                             ),
                         });
                     };
-                    Ok(Value::Bool(match op {
+                    Ok(Value::Bool(match op.kind {
                         TokenKind::Less => a < b,
                         TokenKind::LessEqual => a <= b,
                         TokenKind::Greater => a > b,
@@ -928,8 +946,10 @@ fn evaluate(expr: &Expr, env: &mut Environment) -> Result<Value, RuntimeError> {
         // `Assign` evaluates its right side, then asks the environment
         // to update the first scope down the chain that already has
         // the name.
-        Expr::Variable(name) => env.get(name).ok_or(RuntimeError {
-            message: format!("undefined variable `{name}`"),
+        Expr::Variable(token) => env.get(&token.lexeme).ok_or(RuntimeError {
+            line: token.line,
+            col: token.col,
+            message: format!("undefined variable `{}`", token.lexeme),
         }),
         Expr::Assign { name, value } => {
             // assignment is an expression: its value is the value
@@ -937,18 +957,21 @@ fn evaluate(expr: &Expr, env: &mut Environment) -> Result<Value, RuntimeError> {
             // with no extra machinery — the parser already made `=`
             // right-associative, and the value just falls through
             let value = evaluate(value, env)?;
-            if env.assign(name, value.clone()) {
+            if env.assign(&name.lexeme, value.clone()) {
                 Ok(value)
             } else {
                 Err(RuntimeError {
-                    message: format!("undefined variable `{name}`"),
+                    line: name.line,
+                    col: name.col,
+                    message: format!("undefined variable `{}`", name.lexeme),
                 })
             }
         }
-        Expr::Call { callee, args } => {
+        Expr::Call { callee, args, paren } => {
             // the callee evaluates first, so an unknown name reports
             // itself, then the arguments — the order a real call would
-            // use
+            // use. Both errors a call can produce point at the `(`
+            // that opened it: the token that says "this is a call"
             let callee = evaluate(callee, env)?;
             let mut values = Vec::with_capacity(args.len());
             for arg in args {
@@ -956,11 +979,15 @@ fn evaluate(expr: &Expr, env: &mut Environment) -> Result<Value, RuntimeError> {
             }
             let Value::Function(function) = callee else {
                 return Err(RuntimeError {
+                    line: paren.line,
+                    col: paren.col,
                     message: format!("{} cannot be called", type_name(&callee)),
                 });
             };
             if values.len() != function.params.len() {
                 return Err(RuntimeError {
+                    line: paren.line,
+                    col: paren.col,
                     message: format!(
                         "`{}` expects {} argument{}, got {}",
                         function.name,
@@ -972,20 +999,25 @@ fn evaluate(expr: &Expr, env: &mut Environment) -> Result<Value, RuntimeError> {
             }
             call(&function, values, env)
         }
-        Expr::Index { object, index } => {
+        Expr::Index { object, index, bracket } => {
             // indexing needs no environment: both sides evaluate to
-            // plain values, so this variant works in full today
+            // plain values, so this variant works in full today. Every
+            // error here points at the `[` that opened the index
             let object = evaluate(object, env)?;
             let index = evaluate(index, env)?;
             match (object, index) {
                 (Value::List(items), Value::Number(n)) => {
                     if n.fract() != 0.0 || n < 0.0 {
                         return Err(RuntimeError {
+                            line: bracket.line,
+                            col: bracket.col,
                             message: format!("list indices must be whole numbers, got {n}"),
                         });
                     }
                     let i = n as usize;
                     items.get(i).cloned().ok_or(RuntimeError {
+                        line: bracket.line,
+                        col: bracket.col,
                         message: format!(
                             "index {i} is out of bounds, the list has {} elements",
                             items.len()
@@ -993,12 +1025,16 @@ fn evaluate(expr: &Expr, env: &mut Environment) -> Result<Value, RuntimeError> {
                     })
                 }
                 (object, Value::Number(_)) => Err(RuntimeError {
+                    line: bracket.line,
+                    col: bracket.col,
                     message: format!(
                         "only lists can be indexed, got {}",
                         type_name(&object)
                     ),
                 }),
                 (object, index) => Err(RuntimeError {
+                    line: bracket.line,
+                    col: bracket.col,
                     message: format!(
                         "list indices must be numbers, got {} (indexing {})",
                         type_name(&index),
@@ -1095,12 +1131,17 @@ fn execute(stmt: &Stmt, env: &mut Environment) -> Result<Flow, RuntimeError> {
             // the same name could never be told apart
             let mut seen: Vec<&str> = Vec::new();
             for param in params {
-                if seen.contains(&param.as_str()) {
+                if seen.contains(&param.lexeme.as_str()) {
                     return Err(RuntimeError {
-                        message: format!("duplicate parameter `{param}` in `{name}`"),
+                        line: param.line,
+                        col: param.col,
+                        message: format!(
+                            "duplicate parameter `{}` in `{name}`",
+                            param.lexeme
+                        ),
                     });
                 }
-                seen.push(param);
+                seen.push(&param.lexeme);
             }
             // defining is storing: the declaration the parser built,
             // wrapped in `Rc` so the `Value` can hold it without
@@ -1111,7 +1152,7 @@ fn execute(stmt: &Stmt, env: &mut Environment) -> Result<Flow, RuntimeError> {
                 name.clone(),
                 Value::Function(Rc::new(FunctionValue {
                     name: name.clone(),
-                    params: params.clone(),
+                    params: params.iter().map(|t| t.lexeme.clone()).collect(),
                     body: body.clone(),
                 })),
             );
@@ -1194,13 +1235,21 @@ fact(5);",
 nothing();
 fun silent() { 1 + 1; }
 silent();",
-        // errors: wrong arity (one parameter, so the message is
-        // singular), calling a non-function, and a return with no
-        // call underneath it. Each script gets a fresh environment,
-        // so the mis-called function is defined where it is mis-called
+        // errors, each pointing at the token that caused it: wrong
+        // arity at the open paren, a non-function at its paren, a type
+        // error at the operator, a missing name at the name, an
+        // out-of-bounds index at the bracket, a duplicate parameter at
+        // the second copy — and a return with no call underneath it,
+        // the one error with nowhere to point. Each script gets a
+        // fresh environment, so the mis-called function is defined
+        // where it is mis-called
         "fun double(n) { return n * 2; }
 double(1, 2);",
         r#""nope"(1);"#,
+        r#""na" + 1;"#,
+        "missing + 1;",
+        "[10, 20][9];",
+        "fun f(a, a) { return 1; }",
         "return 1;",
     ];
 
@@ -1222,13 +1271,15 @@ double(1, 2);",
                     match execute(statement, &mut env) {
                         Ok(Flow::Normal) => {}
                         // a Flow::Return reaching the top has no call
-                        // to land in — same verdict as last step
+                        // to land in — same verdict as last step, and
+                        // the one error with nowhere to point: the
+                        // verdict is issued here, past every token
                         Ok(Flow::Return(_)) => {
                             println!("  runtime error: return outside of a function");
                             break;
                         }
                         Err(e) => {
-                            println!("  runtime error: {}", e.message);
+                            println!("  runtime error: {}:{} {}", e.line, e.col, e.message);
                             // a script stops at the first uncaught error
                             break;
                         }
