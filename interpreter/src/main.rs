@@ -1,8 +1,10 @@
-//! birch, step 3: the expression parser.
+//! birch, step 4: the tree.
 //!
-//! A Pratt parser: precedence is one table, not one function per level
-//! of the grammar. Each snippet prints back with every grouping the
-//! parser chose made explicit, so the parse decisions are visible.
+//! The parser now builds nodes instead of strings: one enum per node
+//! kind, `Box` exactly where a field would otherwise make the type
+//! infinite, and the statement half of the grammar arriving as more
+//! variants. Each snippet prints back its `{:#?}` tree, so the enum
+//! structure the parser chose is visible.
 
 #[derive(Debug, Clone, PartialEq)]
 enum TokenKind {
@@ -10,6 +12,7 @@ enum TokenKind {
     Var,
     Fun,
     If,
+    Else,
     While,
     Return,
     True,
@@ -270,6 +273,7 @@ fn keyword(word: &str) -> TokenKind {
         "var" => TokenKind::Var,
         "fun" => TokenKind::Fun,
         "if" => TokenKind::If,
+        "else" => TokenKind::Else,
         "while" => TokenKind::While,
         "return" => TokenKind::Return,
         "true" => TokenKind::True,
@@ -279,6 +283,41 @@ fn keyword(word: &str) -> TokenKind {
         "or" => TokenKind::Or,
         _ => TokenKind::Ident,
     }
+}
+
+// ------------------------------------------------------------- the tree
+
+// One variant per shape an expression can take. Every field that would
+// make the enum infinitely sized holds a `Box`; fields already behind a
+// `Vec` or an `Option` break the recursion for free.
+#[derive(Debug)]
+enum Expr {
+    Number(f64),
+    Str(String),
+    Bool(bool),
+    Nil,
+    Variable(String),
+    Unary { op: TokenKind, operand: Box<Expr> },
+    Binary { op: TokenKind, left: Box<Expr>, right: Box<Expr> },
+    Logical { op: TokenKind, left: Box<Expr>, right: Box<Expr> },
+    Assign { name: String, value: Box<Expr> },
+    Call { callee: Box<Expr>, args: Vec<Expr> },
+    Index { object: Box<Expr>, index: Box<Expr> },
+    List(Vec<Expr>),
+}
+
+// One variant per shape a statement can take. `if` and `while` hold a
+// single statement each, so the statement type recurses through `Box`
+// too; a block's `Vec<Stmt>` needs no box of its own.
+#[derive(Debug)]
+enum Stmt {
+    Var { name: String, init: Expr },
+    Fun { name: String, params: Vec<String>, body: Vec<Stmt> },
+    Expression(Expr),
+    If { condition: Expr, then_branch: Box<Stmt>, else_branch: Option<Box<Stmt>> },
+    While { condition: Expr, body: Box<Stmt> },
+    Return { value: Option<Expr> },
+    Block(Vec<Stmt>),
 }
 
 // ------------------------------------------------------------ the parser
@@ -302,23 +341,122 @@ impl Parser {
         Parser { tokens, pos: 0 }
     }
 
-    fn parse(&mut self) -> Result<String, ParseError> {
-        let (tree, _) = self.expression(0)?;
-        let trailing = self.advance();
-        if trailing.kind != TokenKind::Eof {
-            return Err(ParseError {
-                line: trailing.line,
-                col: trailing.col,
-                message: format!("unexpected `{}` after the expression", trailing.lexeme),
-            });
+    // program → declaration* EOF
+    fn program(&mut self) -> Result<Vec<Stmt>, ParseError> {
+        let mut declarations = Vec::new();
+        while self.peek().kind != TokenKind::Eof {
+            declarations.push(self.declaration()?);
         }
-        Ok(tree)
+        Ok(declarations)
     }
 
-    // Returns the expression printed back with every grouping explicit,
-    // plus whether it is a bare variable — the one thing `=` cares about.
-    fn expression(&mut self, min_prec: u8) -> Result<(String, bool), ParseError> {
-        let (mut lhs, mut is_var) = self.prefix()?;
+    // declaration → varDecl | funDecl | statement
+    fn declaration(&mut self) -> Result<Stmt, ParseError> {
+        match self.peek().kind {
+            TokenKind::Var => self.var_declaration(),
+            TokenKind::Fun => self.fun_declaration(),
+            _ => self.statement(),
+        }
+    }
+
+    // varDecl → "var" IDENT "=" expression ";"
+    fn var_declaration(&mut self) -> Result<Stmt, ParseError> {
+        self.advance(); // the `var`
+        let name = self.expect_ident("a variable name")?;
+        self.expect(TokenKind::Assign, "`=`")?;
+        let init = self.expression(0)?;
+        self.expect(TokenKind::Semicolon, "`;`")?;
+        Ok(Stmt::Var { name, init })
+    }
+
+    // funDecl → "fun" IDENT "(" parameters? ")" block
+    fn fun_declaration(&mut self) -> Result<Stmt, ParseError> {
+        self.advance(); // the `fun`
+        let name = self.expect_ident("a function name")?;
+        self.expect(TokenKind::LeftParen, "`(`")?;
+        let mut params = Vec::new();
+        if self.peek().kind != TokenKind::RightParen {
+            loop {
+                params.push(self.expect_ident("a parameter name")?);
+                if !self.match_kind(TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::RightParen, "`)`")?;
+        let body = self.block()?;
+        Ok(Stmt::Fun { name, params, body })
+    }
+
+    // statement → exprStmt | ifStmt | whileStmt | returnStmt | block
+    fn statement(&mut self) -> Result<Stmt, ParseError> {
+        match self.peek().kind {
+            TokenKind::If => self.if_statement(),
+            TokenKind::While => self.while_statement(),
+            TokenKind::Return => self.return_statement(),
+            TokenKind::LeftBrace => Ok(Stmt::Block(self.block()?)),
+            _ => {
+                let expr = self.expression(0)?;
+                self.expect(TokenKind::Semicolon, "`;`")?;
+                Ok(Stmt::Expression(expr))
+            }
+        }
+    }
+
+    // ifStmt → "if" "(" expression ")" statement ("else" statement)?
+    fn if_statement(&mut self) -> Result<Stmt, ParseError> {
+        self.advance(); // the `if`
+        self.expect(TokenKind::LeftParen, "`(`")?;
+        let condition = self.expression(0)?;
+        self.expect(TokenKind::RightParen, "`)`")?;
+        let then_branch = Box::new(self.statement()?);
+        let else_branch = if self.match_kind(TokenKind::Else) {
+            Some(Box::new(self.statement()?))
+        } else {
+            None
+        };
+        Ok(Stmt::If { condition, then_branch, else_branch })
+    }
+
+    // whileStmt → "while" "(" expression ")" statement
+    fn while_statement(&mut self) -> Result<Stmt, ParseError> {
+        self.advance(); // the `while`
+        self.expect(TokenKind::LeftParen, "`(`")?;
+        let condition = self.expression(0)?;
+        self.expect(TokenKind::RightParen, "`)`")?;
+        let body = Box::new(self.statement()?);
+        Ok(Stmt::While { condition, body })
+    }
+
+    // returnStmt → "return" expression? ";"
+    fn return_statement(&mut self) -> Result<Stmt, ParseError> {
+        self.advance(); // the `return`
+        let value = if self.peek().kind == TokenKind::Semicolon {
+            None
+        } else {
+            Some(self.expression(0)?)
+        };
+        self.expect(TokenKind::Semicolon, "`;`")?;
+        Ok(Stmt::Return { value })
+    }
+
+    // block → "{" declaration* "}"
+    fn block(&mut self) -> Result<Vec<Stmt>, ParseError> {
+        self.expect(TokenKind::LeftBrace, "`{`")?;
+        let mut body = Vec::new();
+        while self.peek().kind != TokenKind::RightBrace
+            && self.peek().kind != TokenKind::Eof
+        {
+            body.push(self.declaration()?);
+        }
+        self.expect(TokenKind::RightBrace, "`}`")?;
+        Ok(body)
+    }
+
+    // The Pratt loop from the last step, now building nodes instead of
+    // strings. Nothing else about the algorithm changed.
+    fn expression(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
+        let mut lhs = self.prefix()?;
         loop {
             // calls and indexes bind tighter than anything in the table:
             // they hug whatever is on their left, whatever the minimum
@@ -328,23 +466,21 @@ impl Parser {
                     let mut args = Vec::new();
                     if self.peek().kind != TokenKind::RightParen {
                         loop {
-                            args.push(self.expression(0)?.0);
+                            args.push(self.expression(0)?);
                             if !self.match_kind(TokenKind::Comma) {
                                 break;
                             }
                         }
                     }
                     self.expect(TokenKind::RightParen, "`)`")?;
-                    lhs = format!("({lhs}({}))", args.join(", "));
-                    is_var = false;
+                    lhs = Expr::Call { callee: Box::new(lhs), args };
                     continue;
                 }
                 TokenKind::LeftBracket => {
                     self.pos += 1;
-                    let index = self.expression(0)?.0;
+                    let index = self.expression(0)?;
                     self.expect(TokenKind::RightBracket, "`]`")?;
-                    lhs = format!("({lhs}[{index}])");
-                    is_var = false;
+                    lhs = Expr::Index { object: Box::new(lhs), index: Box::new(index) };
                     continue;
                 }
                 _ => {}
@@ -356,18 +492,30 @@ impl Parser {
                 break;
             }
             let op = self.advance();
-            if op.kind == TokenKind::Assign && !is_var {
-                return Err(ParseError {
-                    line: op.line,
-                    col: op.col,
-                    message: String::from("invalid assignment target"),
-                });
+            if op.kind == TokenKind::Assign {
+                // the check that needed a bool threaded through every
+                // level last step is now a question about the node itself
+                let Expr::Variable(name) = lhs else {
+                    return Err(ParseError {
+                        line: op.line,
+                        col: op.col,
+                        message: String::from("invalid assignment target"),
+                    });
+                };
+                let value = self.expression(right)?;
+                lhs = Expr::Assign { name, value: Box::new(value) };
+                continue;
             }
-            let rhs = self.expression(right)?.0;
-            lhs = format!("({lhs} {} {rhs})", op.lexeme);
-            is_var = false;
+            let rhs = self.expression(right)?;
+            lhs = if op.kind == TokenKind::And || op.kind == TokenKind::Or {
+                // a separate variant: `and`/`or` will short-circuit when
+                // the evaluator arrives, and the tree records that
+                Expr::Logical { op: op.kind, left: Box::new(lhs), right: Box::new(rhs) }
+            } else {
+                Expr::Binary { op: op.kind, left: Box::new(lhs), right: Box::new(rhs) }
+            };
         }
-        Ok((lhs, is_var))
+        Ok(lhs)
     }
 
     // Infix binding powers, lowest row first. A pair is (left, right):
@@ -389,33 +537,47 @@ impl Parser {
         })
     }
 
-    fn prefix(&mut self) -> Result<(String, bool), ParseError> {
+    fn prefix(&mut self) -> Result<Expr, ParseError> {
         let token = self.advance();
         match token.kind {
-            TokenKind::Ident => Ok((token.lexeme, true)),
-            TokenKind::Number | TokenKind::Str | TokenKind::True | TokenKind::False
-            | TokenKind::Nil => Ok((token.lexeme, false)),
+            TokenKind::Number => {
+                // the scanner only ever hands over digit strings, so
+                // this parse cannot fail
+                let value: f64 = token.lexeme.parse().unwrap();
+                Ok(Expr::Number(value))
+            }
+            TokenKind::Str => {
+                // strip the two quote characters the scanner kept
+                Ok(Expr::Str(token.lexeme[1..token.lexeme.len() - 1].to_string()))
+            }
+            TokenKind::True => Ok(Expr::Bool(true)),
+            TokenKind::False => Ok(Expr::Bool(false)),
+            TokenKind::Nil => Ok(Expr::Nil),
+            TokenKind::Ident => Ok(Expr::Variable(token.lexeme)),
             TokenKind::Minus | TokenKind::Bang => {
-                let operand = self.expression(UNARY)?.0;
-                Ok((format!("({} {operand})", token.lexeme), false))
+                let operand = self.expression(UNARY)?;
+                Ok(Expr::Unary { op: token.kind, operand: Box::new(operand) })
             }
             TokenKind::LeftParen => {
-                let inner = self.expression(0)?.0;
+                // no Grouping variant: the tree's shape *is* the grouping,
+                // the parentheses have done their job once the inner
+                // expression is built
+                let inner = self.expression(0)?;
                 self.expect(TokenKind::RightParen, "`)`")?;
-                Ok((inner, false))
+                Ok(inner)
             }
             TokenKind::LeftBracket => {
                 let mut items = Vec::new();
                 if self.peek().kind != TokenKind::RightBracket {
                     loop {
-                        items.push(self.expression(0)?.0);
+                        items.push(self.expression(0)?);
                         if !self.match_kind(TokenKind::Comma) {
                             break;
                         }
                     }
                 }
                 self.expect(TokenKind::RightBracket, "`]`")?;
-                Ok((format!("([{}])", items.join(", ")), false))
+                Ok(Expr::List(items))
             }
             _ => Err(ParseError {
                 line: token.line,
@@ -450,10 +612,10 @@ impl Parser {
         }
     }
 
-    fn expect(&mut self, kind: TokenKind, what: &str) -> Result<(), ParseError> {
+    fn expect(&mut self, kind: TokenKind, what: &str) -> Result<Token, ParseError> {
         let token = self.advance();
         if token.kind == kind {
-            return Ok(());
+            return Ok(token);
         }
         let message = if token.kind == TokenKind::Eof {
             format!("expected {what}, found the end of input")
@@ -466,23 +628,29 @@ impl Parser {
             message,
         })
     }
+
+    fn expect_ident(&mut self, what: &str) -> Result<String, ParseError> {
+        let token = self.expect(TokenKind::Ident, what)?;
+        Ok(token.lexeme)
+    }
 }
 
 fn main() {
-    let snippets = [
-        "1 + 2 * 3",
-        "(1 + 2) * 3",
-        "10 - 4 - 3",
-        "-n * 2",
-        "!done and count < 10",
-        "n = n + 1",
-        "names[i + 1]",
-        "makeCounter(10)()",
-        "1 +",
-        "1 = 2",
+    let sources = [
+        r#"var count = 0;
+while (count < 3) {
+  count = count + 1;
+}
+if (count == 3 and !done) {
+  var label = "hot";
+}
+fun twice(n) { return n * 2; }
+var xs = [twice(count), twice(count * 10)];
+var first = xs[0];"#,
+        "var = 5;",
     ];
 
-    for source in snippets {
+    for source in sources {
         println!("{source}");
         let (tokens, errors) = Scanner::new(source).scan_tokens();
         if !errors.is_empty() {
@@ -491,8 +659,8 @@ fn main() {
             }
             continue;
         }
-        match Parser::new(tokens).parse() {
-            Ok(tree) => println!("  = {tree}"),
+        match Parser::new(tokens).program() {
+            Ok(tree) => println!("{tree:#?}"),
             Err(e) => println!("  parse error: {}:{} {}", e.line, e.col, e.message),
         }
     }
