@@ -1,13 +1,12 @@
-//! Step 7: an HTTP API for questions.
-//!
-//! Same model, chunker, store, index and prompt as steps 3-6, now behind
-//! a server. Startup embeds the corpus and builds the index once; then
-//! `POST /ask` takes a question, retrieves and fits a context window the
-//! way step 6 did, and streams the answer back over Server-Sent Events:
-//! the retrieved passages first, then the answer model's tokens as they
-//! arrive, then a final event with the counts. Generation runs on ollama
-//! (step 2's runtime), which streams newline-delimited JSON that this
-//! program relays as SSE.
+//! Steps 3-7 are the pipeline: embed, chunk, store, index, prompt,
+//! serve. Step 8 asks whether retrieval actually works. `llm-apps
+//! eval` runs a small labelled set - questions paired with the
+//! document that holds their answer - through the same search the
+//! server uses, and prints recall@1, recall@3 and MRR next to a
+//! brute-force ranking of the same rows. A second pass re-chunks and
+//! re-ranks in memory under three window sizes, so the chunking trade
+//! from step 4 gets measured instead of asserted. With no argument the
+//! program is still the step 7 server: POST /ask, streaming over SSE.
 
 use anyhow::Result;
 use axum::{
@@ -219,14 +218,28 @@ fn kmeans(vectors: &[Vec<f32>], k: usize, iters: usize) -> (Vec<Vec<f32>>, Vec<u
     (centroids, assign)
 }
 
+/// The labelled set: a question, and the index of the DOCS entry that
+/// holds its answer. Kept small on purpose - a set whose labels can be
+/// checked by hand is worth more than a benchmark nobody re-reads.
+const QUESTIONS: [(&str, usize); 6] = [
+    ("How much memory does the model use at peak?", 0),
+    ("What window size worked for short technical prose?", 1),
+    ("How does the attention mask treat padding?", 2),
+    ("Why does embedding a whole document hurt?", 0),
+    ("How big is the word-piece vocabulary?", 2),
+    ("What happens to recall when windows are too small?", 1),
+];
+
 /// One search result: its cosine score against the question, the
-/// chunk's full text, and the decoded vector - kept alongside the text
-/// because the dedupe pass needs it.
+/// chunk's full text, the decoded vector - kept alongside the text
+/// because the dedupe pass needs it - and the row's chunk id, which
+/// the evaluation maps back to the document it came from.
 #[derive(Clone)]
 struct Hit {
     score: f32,
     text: String,
     vector: Vec<f32>,
+    id: i64,
 }
 
 /// The token count under the model's own tokenizer.
@@ -273,6 +286,7 @@ fn search_index(
     let mut rows = stmt.query(params_from_iter(chosen.iter()))?;
     let mut scored: Vec<Hit> = Vec::new();
     while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
         let vector = from_blob(&row.get::<_, Vec<u8>>(1)?);
         let text: String = row.get(2)?;
         let score = cosine(&vector, q);
@@ -280,6 +294,7 @@ fn search_index(
             score,
             text,
             vector,
+            id,
         });
     }
     let scanned = scored.len();
@@ -338,6 +353,158 @@ fn build_prompt(passages: &[String], question: &str) -> String {
     prompt.push_str("Question: ");
     prompt.push_str(question);
     prompt
+}
+
+/// Which DOCS entry a chunk row came from. Real chunks carry ids
+/// `0..real` in chunking order; the near-copies of chunk `i` carry ids
+/// `real + i * COPIES + j`, same layout step 6 inserted them with.
+fn doc_of_id(id: i64, real: usize, chunks: &[(usize, String)]) -> usize {
+    if (id as usize) < real {
+        chunks[id as usize].0
+    } else {
+        chunks[(id as usize - real) / COPIES].0
+    }
+}
+
+/// Rank of the first hit that comes from the labelled document,
+/// 1-based; None when the ranking never reaches it.
+fn rank_of_label(
+    ranked: &[(f32, i64)],
+    label: usize,
+    real: usize,
+    chunks: &[(usize, String)],
+) -> Option<usize> {
+    ranked
+        .iter()
+        .position(|&(_, id)| doc_of_id(id, real, chunks) == label)
+        .map(|r| r + 1)
+}
+
+/// `-` reads better than `>15` in a table column that is three
+/// characters wide.
+fn fmt_rank(rank: Option<usize>) -> String {
+    match rank {
+        Some(r) => r.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+/// The evaluation itself. Each labelled question is embedded once, then
+/// ranked two ways: through `search_index`, the exact path a `/ask`
+/// request takes, and by brute force over every row in the store. When
+/// the two disagree, the index - not the corpus - is what missed.
+fn eval(
+    conn: &Connection,
+    model: &BertModel,
+    device: &Device,
+    tokenizer: &Tokenizer,
+    chunks: &[(usize, String)],
+    ids: &[i64],
+    all: &[Vec<f32>],
+) -> Result<()> {
+    let real = chunks.len();
+    let questions: Vec<String> = QUESTIONS.iter().map(|(q, _)| q.to_string()).collect();
+    let qv = embed(model, device, tokenizer, &questions)?;
+
+    println!(
+        "{:<52} {:>3} {:>7} {:>6}",
+        "question", "doc", "indexed", "brute"
+    );
+    let (mut top1, mut top3, mut mrr) = (0usize, 0usize, 0.0f64);
+    for (qi, &(question, label)) in QUESTIONS.iter().enumerate() {
+        let (_, _, hits) = search_index(conn, &qv[qi], PROBE, CANDIDATES)?;
+        let indexed = hits.iter().map(|h| (h.score, h.id)).collect::<Vec<_>>();
+        let brute: Vec<(f32, i64)> = all
+            .iter()
+            .zip(ids)
+            .map(|(v, &id)| (cosine(v, &qv[qi]), id))
+            .collect();
+        let mut brute = brute;
+        brute.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+        let irank = rank_of_label(&indexed, label, real, chunks);
+        let brink = rank_of_label(&brute, label, real, chunks);
+        if irank == Some(1) {
+            top1 += 1;
+        }
+        if matches!(irank, Some(r) if r <= 3) {
+            top3 += 1;
+        }
+        if let Some(r) = irank {
+            mrr += 1.0 / r as f64;
+        }
+        println!(
+            "{:<52} {:>3} {:>7} {:>6}",
+            format!("{question:.50}"),
+            label,
+            fmt_rank(irank),
+            fmt_rank(brink)
+        );
+    }
+    let n = QUESTIONS.len();
+    println!(
+        "recall@1 {top1}/{n}, recall@3 {top3}/{n}, MRR {:.2} over the indexed search",
+        mrr / n as f64
+    );
+
+    // The chunking trade, measured. Re-chunk and re-embed for each
+    // window size and rank in memory - no store, no index - so the
+    // number isolates the window and stride from everything step 5
+    // added on top.
+    println!("\nthe chunking trade, brute force over the real chunks:");
+    for (window, stride) in [(30usize, 24usize), (15, 10), (60, 54)] {
+        let (h3, n, mrr, ranks) = eval_window(model, device, tokenizer, window, stride)?;
+        let ranks = ranks.iter().map(|r| fmt_rank(*r)).collect::<Vec<_>>().join(",");
+        println!("  window {window:>2} stride {stride:>2}: recall@3 {h3}/{n}, MRR {mrr:.2}, ranks {ranks}");
+    }
+    Ok(())
+}
+
+/// One window size, end to end: chunk, embed, rank the labelled
+/// questions against the real chunks in memory. Returns hits in the
+/// top 3, the question count, mean reciprocal rank, and each
+/// question's rank - the summary hides which question moved, and
+/// which one moved is the interesting part.
+fn eval_window(
+    model: &BertModel,
+    device: &Device,
+    tokenizer: &Tokenizer,
+    window: usize,
+    stride: usize,
+) -> Result<(usize, usize, f64, Vec<Option<usize>>)> {
+    let mut chunks: Vec<(usize, String)> = Vec::new();
+    for (d, doc) in DOCS.iter().enumerate() {
+        for c in chunk(doc, window, stride) {
+            chunks.push((d, c));
+        }
+    }
+    let texts: Vec<String> = chunks.iter().map(|(_, c)| c.clone()).collect();
+    let vectors = embed(model, device, tokenizer, &texts)?;
+    let questions: Vec<String> = QUESTIONS.iter().map(|(q, _)| q.to_string()).collect();
+    let qv = embed(model, device, tokenizer, &questions)?;
+
+    let (mut hits3, mut mrr) = (0usize, 0.0f64);
+    let mut ranks: Vec<Option<usize>> = Vec::new();
+    for (qi, &(_, label)) in QUESTIONS.iter().enumerate() {
+        let mut ranked: Vec<(f32, usize)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (cosine(v, &qv[qi]), i))
+            .collect();
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let rank = ranked
+            .iter()
+            .position(|&(_, i)| chunks[i].0 == label)
+            .map(|r| r + 1);
+        if let Some(r) = rank {
+            if r <= 3 {
+                hits3 += 1;
+            }
+            mrr += 1.0 / r as f64;
+        }
+        ranks.push(rank);
+    }
+    Ok((hits3, QUESTIONS.len(), mrr / QUESTIONS.len() as f64, ranks))
 }
 
 /// State shared by every request: the store and its index (steps 3-5),
@@ -634,6 +801,15 @@ async fn main() -> Result<()> {
     }
     sizes.sort();
     println!("index built: {K} clusters, sizes {sizes:?}");
+
+    // `eval` measures the store exactly as the server is about to use
+    // it - same index, same probe count - then exits. No ollama, no
+    // port: quality is a property of retrieval, not of the answer
+    // model downstream.
+    if std::env::args().nth(1).as_deref() == Some("eval") {
+        eval(&conn, &model, &device, &tokenizer, &chunks, &ids, &all)?;
+        return Ok(());
+    }
 
     let port: u16 = match std::env::args().nth(1) {
         Some(p) => p.parse()?,
