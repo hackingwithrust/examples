@@ -1,10 +1,12 @@
-//! birch, step 5: the evaluator.
+//! birch, step 6: variables and scopes.
 //!
-//! A tree-walking evaluator: `evaluate` turns an `Expr` into a `Value`,
-//! `execute` walks statements. Rust's exhaustive matches force a decision
-//! for every node kind, so the parts that need state which does not exist
-//! yet — variables, functions — fail with honest runtime errors instead
-//! of being silently skipped.
+//! A tree-walking evaluator with an environment: `evaluate` turns an
+//! `Expr` into a `Value`, `execute` walks statements, and both carry a
+//! `&mut Environment` — a stack of scopes that gives the language
+//! somewhere to put things. `var`, assignment, name lookup and block
+//! scoping all work now; functions are one step away.
+
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
 enum TokenKind {
@@ -714,13 +716,62 @@ struct RuntimeError {
     message: String,
 }
 
+// ------------------------------------------------------- the environment
+
+// The interpreter's memory. One scope is one map of names to values, and
+// the stack of scopes *is* the chain the classic interpreter picture
+// draws: a name is looked up in the innermost scope first, then the one
+// below it, and so on down to the global scope at the bottom.
+struct Environment {
+    scopes: Vec<HashMap<String, Value>>,
+}
+
+impl Environment {
+    fn new() -> Self {
+        Environment {
+            scopes: vec![HashMap::new()],
+        }
+    }
+
+    // `var`: a name appears in the innermost scope, shadowing anything
+    // of the same name further out
+    fn define(&mut self, name: String, value: Value) {
+        self.scopes.last_mut().unwrap().insert(name, value);
+    }
+
+    // reading walks the chain from the top down and returns the first
+    // match; a missing name is the caller's error to report
+    fn get(&self, name: &str) -> Option<Value> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(value) = scope.get(name) {
+                return Some(value.clone());
+            }
+        }
+        None
+    }
+
+    // assignment also walks the chain, but it can only *update* a scope
+    // that already has the name — `count = 1` inside a block writes to
+    // the outer binding, or fails if no scope down the chain has it
+    fn assign(&mut self, name: &str, value: Value) -> bool {
+        for scope in self.scopes.iter_mut().rev() {
+            if scope.contains_key(name) {
+                scope.insert(name.to_string(), value);
+                return true;
+            }
+        }
+        false
+    }
+}
+
 // --------------------------------------------------------- the evaluator
 
 // One function per half of the grammar, each one a `match` over the
 // enum the parser builds. The shape of the code is the shape of the
 // tree: children are evaluated first (post-order), then the operator
-// acts on the values that came back.
-fn evaluate(expr: &Expr) -> Result<Value, RuntimeError> {
+// acts on the values that came back. Both functions now carry the
+// environment with them, so any node that mentions a name can reach it.
+fn evaluate(expr: &Expr, env: &mut Environment) -> Result<Value, RuntimeError> {
     match expr {
         Expr::Number(n) => Ok(Value::Number(*n)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
@@ -729,12 +780,12 @@ fn evaluate(expr: &Expr) -> Result<Value, RuntimeError> {
         Expr::List(items) => {
             let mut values = Vec::with_capacity(items.len());
             for item in items {
-                values.push(evaluate(item)?);
+                values.push(evaluate(item, env)?);
             }
             Ok(Value::List(values))
         }
         Expr::Unary { op, operand } => {
-            let value = evaluate(operand)?;
+            let value = evaluate(operand, env)?;
             match op {
                 TokenKind::Minus => match value {
                     Value::Number(n) => Ok(Value::Number(-n)),
@@ -750,8 +801,8 @@ fn evaluate(expr: &Expr) -> Result<Value, RuntimeError> {
         Expr::Binary { op, left, right } => {
             // both operands are evaluated first: `Binary` is the eager
             // half, `Logical` below is the half that can skip
-            let l = evaluate(left)?;
-            let r = evaluate(right)?;
+            let l = evaluate(left, env)?;
+            let r = evaluate(right, env)?;
             match op {
                 TokenKind::Plus => match (&l, &r) {
                     // one operator, two behaviours: numbers add,
@@ -824,7 +875,7 @@ fn evaluate(expr: &Expr) -> Result<Value, RuntimeError> {
             }
         }
         Expr::Logical { op, left, right } => {
-            let value = evaluate(left)?;
+            let value = evaluate(left, env)?;
             let decided = match op {
                 // `and`: a falsey left has already decided the result
                 TokenKind::And => !value.is_truthy(),
@@ -838,33 +889,38 @@ fn evaluate(expr: &Expr) -> Result<Value, RuntimeError> {
             if decided {
                 Ok(value)
             } else {
-                evaluate(right)
+                evaluate(right, env)
             }
         }
-        // The four variants below need state the interpreter does not
-        // have yet. An exhaustive match forces an answer for every one
-        // of them now — the compiler will not let an evaluator "forget"
-        // a node kind — so each fails with the error a reader would
-        // actually hit, and the environment step replaces exactly
-        // these arms.
-        Expr::Variable(name) => Err(RuntimeError {
+        // Two name-reading arms, both real now. `Variable` asks the
+        // environment; `Assign` evaluates its right side, then asks the
+        // environment to update the first scope down the chain that
+        // already has the name. `Call` is the one variant still
+        // blocked — nothing in the language is callable yet.
+        Expr::Variable(name) => env.get(name).ok_or(RuntimeError {
             message: format!("undefined variable `{name}`"),
         }),
         Expr::Assign { name, value } => {
-            // the right side still evaluates, in the order a real
-            // assignment would use; only the store is missing
-            evaluate(value)?;
-            Err(RuntimeError {
-                message: format!("undefined variable `{name}`"),
-            })
+            // assignment is an expression: its value is the value
+            // assigned, which is what makes `a = b = 2` parse and work
+            // with no extra machinery — the parser already made `=`
+            // right-associative, and the value just falls through
+            let value = evaluate(value, env)?;
+            if env.assign(name, value.clone()) {
+                Ok(value)
+            } else {
+                Err(RuntimeError {
+                    message: format!("undefined variable `{name}`"),
+                })
+            }
         }
         Expr::Call { callee, args } => {
             // the callee evaluates first, so an unknown name reports
             // itself, then the arguments — the order a real call would
             // use; only the call itself is missing
-            let callee = evaluate(callee)?;
+            let callee = evaluate(callee, env)?;
             for arg in args {
-                evaluate(arg)?;
+                evaluate(arg, env)?;
             }
             Err(RuntimeError {
                 message: format!("a {} cannot be called", type_name(&callee)),
@@ -873,8 +929,8 @@ fn evaluate(expr: &Expr) -> Result<Value, RuntimeError> {
         Expr::Index { object, index } => {
             // indexing needs no environment: both sides evaluate to
             // plain values, so this variant works in full today
-            let object = evaluate(object)?;
-            let index = evaluate(index)?;
+            let object = evaluate(object, env)?;
+            let index = evaluate(index, env)?;
             match (object, index) {
                 (Value::List(items), Value::Number(n)) => {
                     if n.fract() != 0.0 || n < 0.0 {
@@ -908,51 +964,47 @@ fn evaluate(expr: &Expr) -> Result<Value, RuntimeError> {
     }
 }
 
-fn execute(stmt: &Stmt) -> Result<(), RuntimeError> {
+fn execute(stmt: &Stmt, env: &mut Environment) -> Result<(), RuntimeError> {
     match stmt {
         // an expression statement evaluates and prints its value — the
         // cheapest way to watch the interpreter work until the REPL
         // step gives the language a real read-eval-print loop
         Stmt::Expression(expr) => {
-            let value = evaluate(expr)?;
+            let value = evaluate(expr, env)?;
             println!("{value}");
             Ok(())
         }
         // `if`, `while` and blocks need no state: their conditions and
         // bodies are plain subtrees, so they work in full today
         Stmt::If { condition, then_branch, else_branch } => {
-            if evaluate(condition)?.is_truthy() {
-                execute(then_branch)
+            if evaluate(condition, env)?.is_truthy() {
+                execute(then_branch, env)
             } else if let Some(else_branch) = else_branch {
-                execute(else_branch)
+                execute(else_branch, env)
             } else {
                 Ok(())
             }
         }
         Stmt::While { condition, body } => {
-            while evaluate(condition)?.is_truthy() {
-                execute(body)?;
+            while evaluate(condition, env)?.is_truthy() {
+                execute(body, env)?;
             }
             Ok(())
         }
-        Stmt::Block(statements) => {
-            for statement in statements {
-                execute(statement)?;
-            }
-            Ok(())
-        }
-        // The three statements that remain need somewhere to put
-        // things: `var` evaluates its initializer and then has nowhere
-        // to store it, `fun` has nowhere to store the function, and
-        // `return` has no call to return from. All three arrive with
-        // the environment in the next step.
+        // a block is the one statement that changes the environment:
+        // its body runs in a freshly pushed scope, which dies with it
+        Stmt::Block(statements) => execute_scoped(statements, env),
+        // `var` works now. The two statements that remain need more
+        // than storage: `fun` has nowhere to store the function, and
+        // `return` has no call to return from. Both arrive with the
+        // call machinery in the next step.
         Stmt::Var { name, init } => {
-            // the initializer still evaluates, in declaration order;
-            // only the store is missing
-            evaluate(init)?;
-            Err(RuntimeError {
-                message: format!("cannot declare `{name}`: there is no environment yet"),
-            })
+            // the initializer evaluates first, in the scope the name
+            // is about to live in — so `var x = x;` reads the outer
+            // `x`, the way most dynamic languages do
+            let value = evaluate(init, env)?;
+            env.define(name.clone(), value);
+            Ok(())
         }
         Stmt::Fun { name, params, body } => {
             // one check that needs no storage: two parameters with the
@@ -971,14 +1023,14 @@ fn execute(stmt: &Stmt) -> Result<(), RuntimeError> {
             // with `..`, keeps the tree fully read
             let _ = body;
             Err(RuntimeError {
-                message: format!("cannot define `{name}`: there is no environment yet"),
+                message: format!("cannot define `{name}`: functions are not implemented yet"),
             })
         }
         Stmt::Return { value } => {
             // the returned expression still evaluates; only the
             // "where does it go" half is missing
             if let Some(value) = value {
-                evaluate(value)?;
+                evaluate(value, env)?;
             }
             Err(RuntimeError {
                 message: String::from("return outside of a function"),
@@ -987,23 +1039,63 @@ fn execute(stmt: &Stmt) -> Result<(), RuntimeError> {
     }
 }
 
+// A block is a scope: push a fresh map, run the body, pop it — even when
+// a statement in the middle fails, so the caller's environment comes
+// back exactly the way it went in.
+fn execute_scoped(statements: &[Stmt], env: &mut Environment) -> Result<(), RuntimeError> {
+    env.scopes.push(HashMap::new());
+    let result = statements.iter().try_for_each(|s| execute(s, env));
+    env.scopes.pop();
+    result
+}
+
 fn main() {
     let sources = [
-        // a program: five statements, five values printed in order
+        // the program from last step, still running — the evaluator
+        // grew a parameter, not a behaviour change
         r#"1 + 2 * 3;
 "na" + "na";
 !(1 == 2);
 [10, 20, 30][1];
 if (2 > 1) "big"; else "small";"#,
-        // runtime errors: what went wrong, though not yet where
-        r#""count: " + 3;"#,
-        "1 / 0;",
-        // short-circuiting: the right side never runs
-        "false and (1 / 0);",
-        r#"nil or "fallback";"#,
-        // the not-implemented-yet half of the grammar
-        "x;",
-        "var count = 0;",
+        // variables: define, then reassign. The assignment statement
+        // prints a value because assignment *is* an expression — its
+        // value is the value assigned
+        r#"var greeting = "hello";
+greeting = greeting + ", world";"#,
+        // a loop now has something to change: the total lives in the
+        // outer scope, the body updates it with plain `=`
+        "var total = 0;
+var i = 1;
+while (i <= 5) {
+  total = total + i;
+  i = i + 1;
+}
+total;",
+        // a block is a scope: its own `var` shadows, and dies with it
+        r#"var x = "outer";
+{
+  var x = "inner";
+  x;
+}
+x;"#,
+        // assignment without `var` reaches outward: both writes land
+        // on the one binding the block can see but not replace
+        "var count = 0;
+{
+  count = count + 1;
+  count = count + 1;
+}",
+        // redeclaring in the same scope overwrites
+        "var a = 1;
+var a = 2;
+a;",
+        // errors: a name nobody defined, and an assignment whose
+        // target exists in no scope down the chain
+        "missing;",
+        r#"{ undone = 3; }"#,
+        // the not-implemented half, one step away now
+        "fun add(a, b) { return a + b; }",
         "return 1;",
     ];
 
@@ -1018,8 +1110,11 @@ if (2 > 1) "big"; else "small";"#,
         }
         match Parser::new(tokens).program() {
             Ok(statements) => {
+                // one environment per script; a runtime error aborts
+                // the whole snippet, so nothing leaks between them
+                let mut env = Environment::new();
                 for statement in &statements {
-                    if let Err(e) = execute(statement) {
+                    if let Err(e) = execute(statement, &mut env) {
                         println!("  runtime error: {}", e.message);
                         // a script stops at the first uncaught error
                         break;
