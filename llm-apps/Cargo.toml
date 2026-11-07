@@ -1,0 +1,10 @@
+[package]
+name = "llm-apps"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The runtime the whole track runs on. `default-features = false` keeps the
+# CPU path only - no Metal, no CUDA - which is everything this track needs
+# and the shortest dependency tree candle has.
+candle-core = { version = "0.11.0", default-features = false }
