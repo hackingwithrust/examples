@@ -1,13 +1,15 @@
-//! birch, step 8: error reporting with line numbers.
+//! birch, step 9: a REPL for the interpreter.
 //!
-//! The scanner has stamped every token with a line and a column since
-//! step 2, and scan and parse errors have printed them ever since —
-//! but a runtime error was a bare message, because the tree threw the
-//! positions away: operators became bare `TokenKind`s and names became
-//! bare strings. This step keeps whole tokens in the tree instead, so
-//! every runtime error can point at the token that caused it.
+//! Until now every run was a batch: a script handed to a driver that
+//! scanned, parsed and executed it top to bottom. This step splits the
+//! driver in two — `birch program.birch` still runs a file, and with no
+//! argument the same pipeline runs inside a read-eval-print loop: one
+//! environment across the whole session, a prompt flushed by hand, and
+//! a parser that can tell `wrong` from `not finished yet`, so a
+//! declaration too long for one line can simply be continued.
 
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -337,6 +339,11 @@ struct ParseError {
     line: usize,
     col: usize,
     message: String,
+    // true when the culprit token is the end of input: nothing was
+    // wrong, the input just stopped. The REPL reads this one bit as
+    // `not finished yet` and asks for another line; a file run never
+    // asks, because a file cannot grow.
+    incomplete: bool,
 }
 
 struct Parser {
@@ -514,6 +521,9 @@ impl Parser {
                         line: op.line,
                         col: op.col,
                         message: String::from("invalid assignment target"),
+                        // the `=` itself was found; the target is
+                        // what is wrong, and no more input fixes it
+                        incomplete: false,
                     });
                 };
                 let value = self.expression(right)?;
@@ -605,6 +615,7 @@ impl Parser {
                 } else {
                     format!("expected an expression, found `{}`", token.lexeme)
                 },
+                incomplete: token.kind == TokenKind::Eof,
             }),
         }
     }
@@ -644,6 +655,7 @@ impl Parser {
             line: token.line,
             col: token.col,
             message,
+            incomplete: token.kind == TokenKind::Eof,
         })
     }
 
@@ -1088,8 +1100,8 @@ fn call(
 fn execute(stmt: &Stmt, env: &mut Environment) -> Result<Flow, RuntimeError> {
     match stmt {
         // an expression statement evaluates and prints its value — the
-        // cheapest way to watch the interpreter work until the REPL
-        // step gives the language a real read-eval-print loop
+        // `print` in read-eval-print, and the only output a bare
+        // expression ever gives
         Stmt::Expression(expr) => {
             let value = evaluate(expr, env)?;
             println!("{value}");
@@ -1193,100 +1205,108 @@ fn execute_scoped(statements: &[Stmt], env: &mut Environment) -> Result<Flow, Ru
     result
 }
 
-fn main() {
-    let sources = [
-        // the program from last step, still running — nothing above
-        // the evaluator moved
-        r#"1 + 2 * 3;
-"na" + "na";
-!(1 == 2);
-[10, 20, 30][1];
-if (2 > 1) "big"; else "small";"#,
-        // `else if` is not syntax at all: the else branch is a
-        // statement and `if` is a statement, so chains compose free
-        r#"var score = 83;
-if (score >= 90) "A";
-else if (score >= 80) "B";
-else "C";"#,
-        // the loop from last step, still running
-        "var total = 0;
-var i = 1;
-while (i <= 5) {
-  total = total + i;
-  i = i + 1;
-}
-total;",
-        // a first function: define, then call. The body hands its
-        // value to `return`, so only the caller's line prints
-        "fun add(a, b) { return a + b; }
-add(2, 3);",
-        // recursion is just a name lookup: by the time the body runs,
-        // the function's own name sits in the caller's scopes
-        "fun fact(n) {
-  if (n < 2) { return 1; }
-  return n * fact(n - 1);
-}
-fact(5);",
-        // two ways to produce nil: `return;` with no value, and a
-        // body that falls off the end. The bare expression inside
-        // `silent` also shows the printing rule — an expression
-        // statement prints, so the body says 2 and the call says nil
-        "fun nothing() { return; }
-nothing();
-fun silent() { 1 + 1; }
-silent();",
-        // errors, each pointing at the token that caused it: wrong
-        // arity at the open paren, a non-function at its paren, a type
-        // error at the operator, a missing name at the name, an
-        // out-of-bounds index at the bracket, a duplicate parameter at
-        // the second copy — and a return with no call underneath it,
-        // the one error with nowhere to point. Each script gets a
-        // fresh environment, so the mis-called function is defined
-        // where it is mis-called
-        "fun double(n) { return n * 2; }
-double(1, 2);",
-        r#""nope"(1);"#,
-        r#""na" + 1;"#,
-        "missing + 1;",
-        "[10, 20][9];",
-        "fun f(a, a) { return 1; }",
-        "return 1;",
-    ];
+// ------------------------------------------------------------- the driver
 
-    for source in sources {
-        println!("{source}");
-        let (tokens, errors) = Scanner::new(source).scan_tokens();
+// The statements a successful parse produced, run to completion in the
+// given environment. The first uncaught error prints and ends the
+// batch — and everything defined before it stays defined, which is the
+// behaviour both callers want.
+fn run_statements(statements: &[Stmt], env: &mut Environment) {
+    for statement in statements {
+        match execute(statement, env) {
+            Ok(Flow::Normal) => {}
+            // a Flow::Return reaching the top has no call to land in —
+            // same verdict as last step, and the one error with
+            // nowhere to point: the verdict is issued here, past
+            // every token
+            Ok(Flow::Return(_)) => {
+                println!("  runtime error: return outside of a function");
+                return;
+            }
+            Err(e) => {
+                println!("  runtime error: {}:{} {}", e.line, e.col, e.message);
+                return;
+            }
+        }
+    }
+}
+
+// One source, start to finish: scan, parse, run, with every error
+// printed at the line:col address it has carried since step 2. This
+// is the file half of the driver: `birch program.birch` reads the
+// file and hands it here, one environment per file.
+fn run(source: &str, env: &mut Environment) {
+    let (tokens, errors) = Scanner::new(source).scan_tokens();
+    if !errors.is_empty() {
+        for e in &errors {
+            println!("  scan error: {}:{} {}", e.line, e.col, e.message);
+        }
+        return;
+    }
+    match Parser::new(tokens).program() {
+        Ok(statements) => run_statements(&statements, env),
+        Err(e) => println!("  parse error: {}:{} {}", e.line, e.col, e.message),
+    }
+}
+
+// The read-eval-print loop. One environment lives across the whole
+// session — `var x = 1;` on one line is still visible ten lines later,
+// the one thing a batch runner cannot offer. The buffer collects
+// lines until the parser stops asking for more: input that ends in
+// the middle of a declaration is not wrong, it is unfinished.
+fn repl() {
+    println!("birch — Ctrl-D to exit");
+    let mut env = Environment::new();
+    let mut pending = String::new();
+    loop {
+        if pending.is_empty() {
+            print!(">>> ");
+        } else {
+            print!("... ");
+        }
+        // stdout is line-buffered: a prompt with no newline on it
+        // sits in the buffer until something flushes it. Without this
+        // line the user stares at a silent terminal.
+        io::stdout().flush().unwrap();
+        let mut line = String::new();
+        // read_line reports 0 at end of input — Ctrl-D at a terminal,
+        // a closed pipe anywhere else. That is the way out.
+        if io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+            println!();
+            return;
+        }
+        pending.push_str(&line);
+        let (tokens, errors) = Scanner::new(&pending).scan_tokens();
         if !errors.is_empty() {
             for e in &errors {
                 println!("  scan error: {}:{} {}", e.line, e.col, e.message);
             }
+            pending.clear();
             continue;
         }
         match Parser::new(tokens).program() {
             Ok(statements) => {
-                // one environment per script; a runtime error aborts
-                // the whole snippet, so nothing leaks between them
-                let mut env = Environment::new();
-                for statement in &statements {
-                    match execute(statement, &mut env) {
-                        Ok(Flow::Normal) => {}
-                        // a Flow::Return reaching the top has no call
-                        // to land in — same verdict as last step, and
-                        // the one error with nowhere to point: the
-                        // verdict is issued here, past every token
-                        Ok(Flow::Return(_)) => {
-                            println!("  runtime error: return outside of a function");
-                            break;
-                        }
-                        Err(e) => {
-                            println!("  runtime error: {}:{} {}", e.line, e.col, e.message);
-                            // a script stops at the first uncaught error
-                            break;
-                        }
-                    }
-                }
+                pending.clear();
+                run_statements(&statements, &mut env);
             }
-            Err(e) => println!("  parse error: {}:{} {}", e.line, e.col, e.message),
+            // the parse ran off the end of a half-typed declaration:
+            // keep the buffer, print nothing, ask for the next line
+            Err(e) if e.incomplete => {}
+            Err(e) => {
+                println!("  parse error: {}:{} {}", e.line, e.col, e.message);
+                pending.clear();
+            }
         }
+    }
+}
+
+fn main() {
+    // `birch program.birch` runs a file; no argument, the loop
+    match std::env::args().nth(1) {
+        Some(path) => match std::fs::read_to_string(&path) {
+            Ok(source) => run(&source, &mut Environment::new()),
+            Err(e) => println!("cannot read {path}: {e}"),
+        },
+        None => repl(),
     }
 }
