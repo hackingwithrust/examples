@@ -1,26 +1,49 @@
-//! Step 6: retrieving and prompting.
+//! Step 7: an HTTP API for questions.
 //!
-//! Same model, chunker, store and index as steps 3-5. This step turns
-//! ranked search results into a context window: the query retrieves
-//! wider than it needs, near-duplicate chunks are collapsed, the rest
-//! is fitted to a token budget counted with the tokenizer, and the
-//! passages that survive are assembled into the prompt the next step's
-//! model will answer from.
+//! Same model, chunker, store, index and prompt as steps 3-6, now behind
+//! a server. Startup embeds the corpus and builds the index once; then
+//! `POST /ask` takes a question, retrieves and fits a context window the
+//! way step 6 did, and streams the answer back over Server-Sent Events:
+//! the retrieved passages first, then the answer model's tokens as they
+//! arrive, then a final event with the counts. Generation runs on ollama
+//! (step 2's runtime), which streams newline-delimited JSON that this
+//! program relays as SSE.
 
 use anyhow::Result;
+use axum::{
+    extract::State,
+    response::sse::{Event, KeepAlive, KeepAliveStream, Sse},
+    routing::post,
+    Json, Router,
+};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
+use futures_util::StreamExt;
 use hf_hub::api::sync::Api;
 use rusqlite::{params, params_from_iter, Connection};
+use serde::Deserialize;
+use serde_json::json;
+use serde_json::Value;
+use std::convert::Infallible;
+use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
+use tokio_stream::wrappers::ReceiverStream;
 
 const MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
-const QUESTION: &str = "How much memory does inference use at peak?";
+
+/// The answer model: step 2's ollama runtime, streaming. This program
+/// never loads its weights - generation is an HTTP call away.
+const ANSWER_MODEL: &str = "qwen2.5:0.5b";
+const OLLAMA_URL: &str = "http://127.0.0.1:11434/api/generate";
+
+/// Hard cap on the answer's length, in tokens, passed to ollama. A
+/// question-answering endpoint that never stops writing is a bug.
+const MAX_ANSWER_TOKENS: u32 = 120;
+const DEFAULT_PORT: u16 = 8091;
 
 /// Three documents, three topics: the runtime's memory footprint, the
-/// chunking trade, and the tokenizer. One paragraph could not show a
-/// prompt filling up; three give retrieval something to choose between.
+/// chunking trade, and the tokenizer. Same corpus as step 6.
 const DOCS: [&str; 3] = [
     "Running a sentence encoder on your own machine is mostly an exercise in memory budgeting. The runtime in this project is candle, which loads the safetensors weights through memory mapping, so nothing is copied until a layer actually runs. Startup cost is dominated entirely by paging the model in on the first forward pass. Its peak memory footprint is about 340 megabytes. That is with three sentences in the batch; a long document pushes the number up. Tokenization itself is cheap, microseconds per sentence, and it happens before anything reaches the model. Embedding a whole document at once is the mistake this step fixes: the vector averages every topic together and retrieval degrades quietly.",
     "Chunking is where retrieval quality is decided. Windows of thirty words with a six-word overlap worked well for short technical prose: small enough that one vector describes one idea, overlapped just enough that a sentence split across a boundary still lands whole in at least one chunk. Bigger windows average more topics into each vector and recall suffers quietly. Smaller windows fragment the answer across chunks and the prompt fills with fragments. No window size is right for every corpus; the overlap and the stride are a trade to measure, not a default to trust.",
@@ -29,7 +52,7 @@ const DOCS: [&str; 3] = [
 
 /// How wide the net is cast, how close two chunks must be before the
 /// second counts as a duplicate of the first, and how many tokens the
-/// context window may hold.
+/// context window may hold. Same dials as step 6.
 const CANDIDATES: usize = 15;
 const DUP_THRESHOLD: f32 = 0.98;
 const CONTEXT_TOKENS: usize = 100;
@@ -37,9 +60,7 @@ const CONTEXT_TOKENS: usize = 100;
 /// Index size (clusters) and how many of them a query visits.
 const K: usize = 8;
 const PROBE: usize = 2;
-/// Synthetic near-copies per real chunk: standing in for the boilerplate
-/// and repeated near-duplicates a real corpus accumulates, and giving
-/// the dedupe pass something to collapse.
+/// Synthetic near-copies per real chunk, as in step 6.
 const COPIES: usize = 3;
 
 /// Cut `doc` into word windows of `window` words, advancing `stride`
@@ -134,16 +155,6 @@ fn from_blob(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// The first 10 words of a chunk, for the printed table.
-fn preview(s: &str) -> String {
-    let words: Vec<&str> = s.split_whitespace().take(10).collect();
-    let mut out = words.join(" ");
-    if s.split_whitespace().count() > 10 {
-        out.push_str(" ...");
-    }
-    out
-}
-
 /// Deterministic pseudo-noise, so every run of this program prints the
 /// same numbers. Amplitude 0.01 keeps each copy within a hair of its
 /// original - a stand-in for the near-neighbours a real corpus produces.
@@ -210,7 +221,7 @@ fn kmeans(vectors: &[Vec<f32>], k: usize, iters: usize) -> (Vec<Vec<f32>>, Vec<u
 
 /// One search result: its cosine score against the question, the
 /// chunk's full text, and the decoded vector - kept alongside the text
-/// because the dedupe pass below needs it.
+/// because the dedupe pass needs it.
 #[derive(Clone)]
 struct Hit {
     score: f32,
@@ -218,9 +229,7 @@ struct Hit {
     vector: Vec<f32>,
 }
 
-/// The token count under the model's own tokenizer. A different model
-/// has a different vocabulary and would count differently - but
-/// counting beats estimating, and the budget is a dial either way.
+/// The token count under the model's own tokenizer.
 fn token_count(tokenizer: &Tokenizer, text: &str) -> usize {
     tokenizer
         .encode(text, false)
@@ -280,19 +289,6 @@ fn search_index(
     Ok((visited, scanned, scored))
 }
 
-/// Print a ranked candidate list with each chunk's token count.
-fn print_candidates(cands: &[Hit], tokenizer: &Tokenizer) {
-    for (rank, h) in cands.iter().enumerate() {
-        println!(
-            "  {:2}. [{:.4}] {:>3}t  {}",
-            rank + 1,
-            h.score,
-            token_count(tokenizer, &h.text),
-            preview(&h.text)
-        );
-    }
-}
-
 /// True when `v` is within `threshold` cosine of anything already
 /// kept. The threshold is deliberately generous: it exists to catch
 /// near-copies, not related chunks.
@@ -301,10 +297,7 @@ fn is_duplicate(v: &[f32], kept: &[Vec<f32>], threshold: f32) -> bool {
 }
 
 /// Walk the ranked candidates, keep the first of every distinct chunk,
-/// and stop at the first passage that no longer fits the budget. The
-/// rest are all counted over-budget: chunks are near-equal size, so
-/// nothing behind an oversized one fits either. Returns the kept
-/// passages and the drop counts.
+/// and stop at the first passage that no longer fits the budget.
 fn select(
     candidates: &[Hit],
     tokenizer: &Tokenizer,
@@ -332,8 +325,8 @@ fn select(
     (kept, dupes, over)
 }
 
-/// The prompt the next step's model will answer from: an instruction,
-/// the numbered passages, and the question last.
+/// The prompt the answer model will respond to: an instruction, the
+/// numbered passages, and the question last.
 fn build_prompt(passages: &[String], question: &str) -> String {
     let mut prompt = String::from(
         "Answer the question using only the passages below. \
@@ -347,27 +340,207 @@ fn build_prompt(passages: &[String], question: &str) -> String {
     prompt
 }
 
-fn main() -> Result<()> {
+/// State shared by every request: the store and its index (steps 3-5),
+/// plus what it takes to embed a question on the way in. The SQLite
+/// connection is behind a mutex because `Connection` is not `Sync`.
+struct App {
+    conn: Mutex<Connection>,
+    model: BertModel,
+    device: Device,
+    tokenizer: Tokenizer,
+}
+
+/// The request body.
+#[derive(Deserialize)]
+struct Ask {
+    question: String,
+}
+
+async fn ask(
+    State(app): State<Arc<App>>,
+    Json(req): Json<Ask>,
+) -> Sse<KeepAliveStream<ReceiverStream<Result<Event, Infallible>>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(32);
+    tokio::spawn(relay(app, req.question, tx));
+    Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
+}
+
+/// The request pipeline, off the request task entirely. Retrieval runs
+/// on the blocking pool - it is CPU work against a mutex-guarded
+/// connection - and ollama's token stream is relayed from the async
+/// side. The client sees the passages first, then the tokens.
+async fn relay(
+    app: Arc<App>,
+    question: String,
+    tx: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+) {
+    let embedder = app.clone();
+    let work = tokio::task::spawn_blocking(move || -> Result<(Vec<Hit>, usize, String)> {
+        let conn = embedder.conn.lock().unwrap();
+        let q = embed(
+            &embedder.model,
+            &embedder.device,
+            &embedder.tokenizer,
+            &[question.clone()],
+        )?
+        .remove(0);
+        let (_, _, hits) = search_index(&conn, &q, PROBE, CANDIDATES)?;
+        let (kept, _, _) = select(&hits, &embedder.tokenizer, DUP_THRESHOLD, CONTEXT_TOKENS);
+        let prompt = build_prompt(
+            &kept.iter().map(|h| h.text.clone()).collect::<Vec<_>>(),
+            &question,
+        );
+        let tokens = token_count(&embedder.tokenizer, &prompt);
+        Ok((kept, tokens, prompt))
+    });
+
+    let (kept, prompt_tokens, prompt) = match work.await {
+        Ok(Ok(x)) => x,
+        Ok(Err(e)) => {
+            send_error(&tx, format!("{e}")).await;
+            return;
+        }
+        Err(e) => {
+            send_error(&tx, format!("{e}")).await;
+            return;
+        }
+    };
+
+    // The retrieved chunks are named first, one event each, so a client
+    // can show its sources while the answer is still being written.
+    if !send_passages(&kept, &app.tokenizer, &tx).await {
+        return; // client went away
+    }
+
+    let body = json!({
+        "model": ANSWER_MODEL,
+        "prompt": prompt,
+        "stream": true,
+        // Greedy decoding: a factual question over retrieved passages
+        // has one best answer, and sampling at the default temperature
+        // makes two identical requests disagree.
+        "options": { "num_predict": MAX_ANSWER_TOKENS, "temperature": 0.0 },
+    });
+    let response = match reqwest::Client::new().post(OLLAMA_URL).json(&body).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            send_error(&tx, format!("ollama returned {}", r.status())).await;
+            return;
+        }
+        Err(e) => {
+            send_error(&tx, format!("ollama unreachable: {e}")).await;
+            return;
+        }
+    };
+
+    // Ollama streams newline-delimited JSON; relay_lines turns each
+    // complete line into an SSE event.
+    let stream = response.bytes_stream();
+    relay_lines(stream, &tx, prompt_tokens).await;
+}
+
+/// The retrieved chunks are named first, one event each, so a client
+/// can show its sources while the answer is still being written.
+/// Returns false when the client has gone away.
+async fn send_passages(
+    kept: &[Hit],
+    tokenizer: &Tokenizer,
+    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+) -> bool {
+    for (i, h) in kept.iter().enumerate() {
+        let passage = json!({
+            "rank": i + 1,
+            "score": h.score,
+            "tokens": token_count(tokenizer, &h.text),
+            "text": h.text,
+        });
+        if tx
+            .send(Ok(Event::default().event("passage").data(passage.to_string())))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Consume ollama's newline-delimited JSON stream and relay each
+/// complete line as an SSE event. Each line carries one token in its
+/// "response" field; the line with "done": true carries the final
+/// counts and ends the answer.
+async fn relay_lines(
+    mut stream: impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
+    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    prompt_tokens: usize,
+) {
+    let mut buf = String::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => buf.push_str(&String::from_utf8_lossy(&bytes)),
+            Err(e) => {
+                send_error(tx, format!("{e}")).await;
+                return;
+            }
+        }
+        while let Some(pos) = buf.find('\n') {
+            let line: String = buf.drain(..=pos).collect();
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let v: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Some(token) = v.get("response").and_then(|r| r.as_str()) {
+                if !token.is_empty() {
+                    let ev = Event::default().event("token").data(token);
+                    if tx.send(Ok(ev)).await.is_err() {
+                        return; // client went away
+                    }
+                }
+            }
+            if v.get("done").and_then(|d| d.as_bool()) == Some(true) {
+                let summary = json!({
+                    "prompt_tokens": prompt_tokens,
+                    "answer_tokens": v.get("eval_count"),
+                });
+                let _ = tx
+                    .send(Ok(Event::default().event("done").data(summary.to_string())))
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
+async fn send_error(tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>, msg: String) {
+    let msg = msg.replace('\n', " ");
+    let _ = tx
+        .send(Ok(Event::default().event("error").data(msg)))
+        .await;
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let device = Device::Cpu;
     let started = std::time::Instant::now();
 
     let api = Api::new()?;
     let repo = api.model(MODEL_ID.to_string());
     let config: Config = serde_json::from_str(&std::fs::read_to_string(repo.get("config.json")?)?)?;
-    let tokenizer = Tokenizer::from_file(repo.get("tokenizer.json")?)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    // The published tokenizer.json ships with fixed padding to 128 -
-    // sentence-transformers tunes it for the model, not for counting.
-    // Every text would otherwise count as 128 tokens.
-    let mut tokenizer = tokenizer;
+    let mut tokenizer =
+        Tokenizer::from_file(repo.get("tokenizer.json")?).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // The published tokenizer.json ships with fixed padding to 128;
+    // counting needs it off, as step 6 found.
     tokenizer.with_padding(None);
     let weights = repo.get("model.safetensors")?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DTYPE, &device)? };
     let model = BertModel::load(vb, &config)?;
     println!("model loaded in {:.1?} on {device:?}", started.elapsed());
 
-    // Same chunker as steps 4 and 5: 30-word windows, 6-word overlap,
-    // now applied to each document in turn.
+    // Same chunker as steps 4-6: 30-word windows, 6-word overlap.
     let mut chunks: Vec<(usize, String)> = Vec::new();
     for (d, doc) in DOCS.iter().enumerate() {
         for c in chunk(doc, 30, 24) {
@@ -376,8 +549,8 @@ fn main() -> Result<()> {
     }
 
     // The store lives in the temp directory; delete any copy from an
-    // earlier run so the numbers below start from an empty database.
-    let db_path = std::env::temp_dir().join("llm-step6-vectors.db");
+    // earlier run so startup always begins from an empty database.
+    let db_path = std::env::temp_dir().join("llm-step7-vectors.db");
     let _ = std::fs::remove_file(&db_path);
     let conn = Connection::open(&db_path)?;
     conn.execute_batch(
@@ -391,15 +564,11 @@ fn main() -> Result<()> {
              centroid_id INTEGER NOT NULL REFERENCES centroids(id));",
     )?;
 
-    let mut texts: Vec<String> = chunks.iter().map(|(_, c)| c.clone()).collect();
-    texts.push(QUESTION.to_string());
+    let texts: Vec<String> = chunks.iter().map(|(_, c)| c.clone()).collect();
     let vectors = embed(&model, &device, &tokenizer, &texts)?;
-    let question = vectors.last().unwrap().clone();
 
-    // Full text goes into the store this step: the prompt is built from
-    // rows, and a preview cannot answer a question.
     let real = chunks.len();
-    for (i, v) in vectors[..real].iter().enumerate() {
+    for (i, v) in vectors.iter().enumerate() {
         conn.execute(
             "INSERT INTO chunks (id, text) VALUES (?1, ?2)",
             params![i as i64, &chunks[i].1],
@@ -409,11 +578,8 @@ fn main() -> Result<()> {
             params![i as i64, to_blob(v)],
         )?;
     }
-
-    // Near-copies of every chunk: same text, wobbled vector. They stand
-    // in for the boilerplate and repeated near-duplicates a real corpus
-    // accumulates.
-    for (i, v) in vectors[..real].iter().enumerate() {
+    // Near-copies of every chunk, as in step 6.
+    for (i, v) in vectors.iter().enumerate() {
         for j in 0..COPIES {
             let id = (real + i * COPIES + j) as i64;
             let noisy: Vec<f32> = v
@@ -437,8 +603,7 @@ fn main() -> Result<()> {
         DOCS.len()
     );
 
-    // The index from step 5, built the same way: read every vector back
-    // as a blob, cluster, write the cluster map back.
+    // The index from step 5, built the same way.
     let mut stmt = conn.prepare("SELECT chunk_id, embedding FROM vectors")?;
     let mut rows = stmt.query([])?;
     let mut ids: Vec<i64> = Vec::new();
@@ -447,6 +612,9 @@ fn main() -> Result<()> {
         ids.push(row.get(0)?);
         all.push(from_blob(&row.get::<_, Vec<u8>>(1)?));
     }
+    // Both must drop before `conn` is moved into the shared state.
+    drop(rows);
+    drop(stmt);
     let (centroids, assign) = kmeans(&all, K, 20);
     for (ci, c) in centroids.iter().enumerate() {
         conn.execute(
@@ -467,50 +635,20 @@ fn main() -> Result<()> {
     sizes.sort();
     println!("index built: {K} clusters, sizes {sizes:?}");
 
-    // Retrieve wider than the prompt needs: the dedupe pass and the
-    // budget both need room to work.
-    let (visited, scanned, hits) = search_index(&conn, &question, PROBE, CANDIDATES)?;
-    let visited = visited
-        .iter()
-        .map(|(id, s)| format!("{id} ({s:.4})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    println!(
-        "indexed search: cluster {visited} nearest to the question, scanned {scanned} of {total} rows"
-    );
-
-    println!("\n{CANDIDATES} candidates, best score first:");
-    print_candidates(&hits, &tokenizer);
-
-    let (kept, dupes, over) = select(&hits, &tokenizer, DUP_THRESHOLD, CONTEXT_TOKENS);
-    let kept_tokens: usize = kept
-        .iter()
-        .map(|h| token_count(&tokenizer, &h.text))
-        .sum();
-    println!(
-        "\nkept {} passages, {} of {CONTEXT_TOKENS} budget tokens; dropped {dupes} duplicates, {over} over budget",
-        kept.len(),
-        kept_tokens
-    );
-    for (i, h) in kept.iter().enumerate() {
-        println!(
-            "  [{}] [{:.4}] {}t  {}",
-            i + 1,
-            h.score,
-            token_count(&tokenizer, &h.text),
-            preview(&h.text)
-        );
-    }
-
-    let prompt = build_prompt(
-        &kept.iter().map(|h| h.text.clone()).collect::<Vec<_>>(),
-        QUESTION,
-    );
-    let bar = "-".repeat(56);
-    println!(
-        "\nprompt, {} tokens:\n{bar}\n{prompt}\n{bar}",
-        token_count(&tokenizer, &prompt)
-    );
-
+    let port: u16 = match std::env::args().nth(1) {
+        Some(p) => p.parse()?,
+        None => DEFAULT_PORT,
+    };
+    let addr = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let app = Arc::new(App {
+        conn: Mutex::new(conn),
+        model,
+        device,
+        tokenizer,
+    });
+    let router = Router::new().route("/ask", post(ask)).with_state(app);
+    println!("ready: POST http://{addr}/ask with {{\"question\": \"...\"}}");
+    axum::serve(listener, router).await?;
     Ok(())
 }

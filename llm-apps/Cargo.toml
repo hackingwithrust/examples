@@ -15,3 +15,13 @@ hf-hub = "0.3.2"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde_json = "1.0.154"
 tokenizers = "0.23.2"
+# Step 7: the server, and the client that talks to the answer model.
+# reqwest drops its TLS stack - everything this step talks to lives on
+# 127.0.0.1, and the TLS crates are the heaviest part of its tree.
+axum = "0.8"
+bytes = "1"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
