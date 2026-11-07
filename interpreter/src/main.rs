@@ -1,10 +1,10 @@
-//! birch, step 4: the tree.
+//! birch, step 5: the evaluator.
 //!
-//! The parser now builds nodes instead of strings: one enum per node
-//! kind, `Box` exactly where a field would otherwise make the type
-//! infinite, and the statement half of the grammar arriving as more
-//! variants. Each snippet prints back its `{:#?}` tree, so the enum
-//! structure the parser chose is visible.
+//! A tree-walking evaluator: `evaluate` turns an `Expr` into a `Value`,
+//! `execute` walks statements. Rust's exhaustive matches force a decision
+//! for every node kind, so the parts that need state which does not exist
+//! yet — variables, functions — fail with honest runtime errors instead
+//! of being silently skipped.
 
 #[derive(Debug, Clone, PartialEq)]
 enum TokenKind {
@@ -453,8 +453,7 @@ impl Parser {
         Ok(body)
     }
 
-    // The Pratt loop from the last step, now building nodes instead of
-    // strings. Nothing else about the algorithm changed.
+    // The Pratt loop from two steps ago, building nodes.
     fn expression(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.prefix()?;
         loop {
@@ -494,7 +493,7 @@ impl Parser {
             let op = self.advance();
             if op.kind == TokenKind::Assign {
                 // the check that needed a bool threaded through every
-                // level last step is now a question about the node itself
+                // level two steps ago is now a question about the node
                 let Expr::Variable(name) = lhs else {
                     return Err(ParseError {
                         line: op.line,
@@ -508,8 +507,8 @@ impl Parser {
             }
             let rhs = self.expression(right)?;
             lhs = if op.kind == TokenKind::And || op.kind == TokenKind::Or {
-                // a separate variant: `and`/`or` will short-circuit when
-                // the evaluator arrives, and the tree records that
+                // a separate variant: `and`/`or` short-circuit, and the
+                // tree records that
                 Expr::Logical { op: op.kind, left: Box::new(lhs), right: Box::new(rhs) }
             } else {
                 Expr::Binary { op: op.kind, left: Box::new(lhs), right: Box::new(rhs) }
@@ -635,19 +634,377 @@ impl Parser {
     }
 }
 
+// ------------------------------------------------------------ the values
+
+// What an expression evaluates *to*. The tree describes computation; a
+// value is the thing computation produces. One enum again, and this one
+// has no recursion at all: values are flat.
+#[derive(Debug, Clone, PartialEq)]
+enum Value {
+    Number(f64),
+    Str(String),
+    Bool(bool),
+    Nil,
+    List(Vec<Value>),
+}
+
+impl Value {
+    // everything is true except `nil` and `false` themselves — the
+    // rule Python and Lua use, and the shortest one to explain
+    fn is_truthy(&self) -> bool {
+        !matches!(self, Value::Nil | Value::Bool(false))
+    }
+}
+
+// `Debug` would print `Number(7.0)`; the language's own printer should
+// print `7`. This impl is what makes values look like *birch* values.
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Number(n) => write!(f, "{n}"),
+            Value::Str(s) => write!(f, "{s}"),
+            Value::Bool(b) => write!(f, "{b}"),
+            Value::Nil => write!(f, "nil"),
+            Value::List(items) => {
+                write!(f, "[")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                write!(f, "]")
+            }
+        }
+    }
+}
+
+// The word for a value in error messages: "got a string and a number"
+// beats "got Str and Number".
+fn type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Number(_) => "a number",
+        Value::Str(_) => "a string",
+        Value::Bool(_) => "a bool",
+        Value::Nil => "nil",
+        Value::List(_) => "a list",
+    }
+}
+
+// The tree stores operators as `TokenKind`, which has no `Display` —
+// and no position either, which is why runtime errors below cannot say
+// where they happened.
+fn operator_text(kind: &TokenKind) -> &'static str {
+    match kind {
+        TokenKind::Plus => "+",
+        TokenKind::Minus => "-",
+        TokenKind::Star => "*",
+        TokenKind::Slash => "/",
+        TokenKind::Percent => "%",
+        TokenKind::Less => "<",
+        TokenKind::LessEqual => "<=",
+        TokenKind::Greater => ">",
+        TokenKind::GreaterEqual => ">=",
+        TokenKind::Bang => "!",
+        _ => "?",
+    }
+}
+
+struct RuntimeError {
+    message: String,
+}
+
+// --------------------------------------------------------- the evaluator
+
+// One function per half of the grammar, each one a `match` over the
+// enum the parser builds. The shape of the code is the shape of the
+// tree: children are evaluated first (post-order), then the operator
+// acts on the values that came back.
+fn evaluate(expr: &Expr) -> Result<Value, RuntimeError> {
+    match expr {
+        Expr::Number(n) => Ok(Value::Number(*n)),
+        Expr::Str(s) => Ok(Value::Str(s.clone())),
+        Expr::Bool(b) => Ok(Value::Bool(*b)),
+        Expr::Nil => Ok(Value::Nil),
+        Expr::List(items) => {
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                values.push(evaluate(item)?);
+            }
+            Ok(Value::List(values))
+        }
+        Expr::Unary { op, operand } => {
+            let value = evaluate(operand)?;
+            match op {
+                TokenKind::Minus => match value {
+                    Value::Number(n) => Ok(Value::Number(-n)),
+                    _ => Err(RuntimeError {
+                        message: format!("`-` needs a number, got {}", type_name(&value)),
+                    }),
+                },
+                // `!` accepts anything: the question is only truthiness
+                TokenKind::Bang => Ok(Value::Bool(!value.is_truthy())),
+                _ => unreachable!("the parser only builds Unary from `-` and `!`"),
+            }
+        }
+        Expr::Binary { op, left, right } => {
+            // both operands are evaluated first: `Binary` is the eager
+            // half, `Logical` below is the half that can skip
+            let l = evaluate(left)?;
+            let r = evaluate(right)?;
+            match op {
+                TokenKind::Plus => match (&l, &r) {
+                    // one operator, two behaviours: numbers add,
+                    // strings concatenate — anything else is a runtime
+                    // error, not a silent coercion
+                    (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
+                    (Value::Str(a), Value::Str(b)) => Ok(Value::Str(format!("{a}{b}"))),
+                    _ => Err(RuntimeError {
+                        message: format!(
+                            "`+` needs two numbers or two strings, got {} and {}",
+                            type_name(&l),
+                            type_name(&r)
+                        ),
+                    }),
+                },
+                TokenKind::Minus | TokenKind::Star | TokenKind::Slash
+                | TokenKind::Percent => {
+                    let (Value::Number(a), Value::Number(b)) = (&l, &r) else {
+                        return Err(RuntimeError {
+                            message: format!(
+                                "`{}` needs two numbers, got {} and {}",
+                                operator_text(op),
+                                type_name(&l),
+                                type_name(&r)
+                            ),
+                        });
+                    };
+                    let value = match op {
+                        TokenKind::Slash | TokenKind::Percent if *b == 0.0 => {
+                            // f64 division would happily return `inf`
+                            // or `NaN`; the language refuses instead
+                            return Err(RuntimeError {
+                                message: String::from("division by zero"),
+                            });
+                        }
+                        TokenKind::Minus => a - b,
+                        TokenKind::Star => a * b,
+                        TokenKind::Slash => a / b,
+                        _ => a % b,
+                    };
+                    Ok(Value::Number(value))
+                }
+                TokenKind::Less | TokenKind::LessEqual | TokenKind::Greater
+                | TokenKind::GreaterEqual => {
+                    let (Value::Number(a), Value::Number(b)) = (&l, &r) else {
+                        return Err(RuntimeError {
+                            message: format!(
+                                "`{}` needs two numbers, got {} and {}",
+                                operator_text(op),
+                                type_name(&l),
+                                type_name(&r)
+                            ),
+                        });
+                    };
+                    Ok(Value::Bool(match op {
+                        TokenKind::Less => a < b,
+                        TokenKind::LessEqual => a <= b,
+                        TokenKind::Greater => a > b,
+                        _ => a >= b,
+                    }))
+                }
+                // derived `PartialEq` gives the right answer across
+                // variants for free: `1 == "1"` is simply false, no
+                // coercion, no error
+                TokenKind::EqualEqual => Ok(Value::Bool(l == r)),
+                TokenKind::BangEqual => Ok(Value::Bool(l != r)),
+                _ => unreachable!(
+                    "the parser only builds Binary from the operators above"
+                ),
+            }
+        }
+        Expr::Logical { op, left, right } => {
+            let value = evaluate(left)?;
+            let decided = match op {
+                // `and`: a falsey left has already decided the result
+                TokenKind::And => !value.is_truthy(),
+                // `or`: a truthy left has already decided the result
+                TokenKind::Or => value.is_truthy(),
+                _ => unreachable!("the parser only builds Logical from `and` and `or`"),
+            };
+            // the result is the deciding operand's *value*, so
+            // `nil or "fallback"` is "fallback" — and when the left
+            // decides, the right is never evaluated at all
+            if decided {
+                Ok(value)
+            } else {
+                evaluate(right)
+            }
+        }
+        // The four variants below need state the interpreter does not
+        // have yet. An exhaustive match forces an answer for every one
+        // of them now — the compiler will not let an evaluator "forget"
+        // a node kind — so each fails with the error a reader would
+        // actually hit, and the environment step replaces exactly
+        // these arms.
+        Expr::Variable(name) => Err(RuntimeError {
+            message: format!("undefined variable `{name}`"),
+        }),
+        Expr::Assign { name, value } => {
+            // the right side still evaluates, in the order a real
+            // assignment would use; only the store is missing
+            evaluate(value)?;
+            Err(RuntimeError {
+                message: format!("undefined variable `{name}`"),
+            })
+        }
+        Expr::Call { callee, args } => {
+            // the callee evaluates first, so an unknown name reports
+            // itself, then the arguments — the order a real call would
+            // use; only the call itself is missing
+            let callee = evaluate(callee)?;
+            for arg in args {
+                evaluate(arg)?;
+            }
+            Err(RuntimeError {
+                message: format!("a {} cannot be called", type_name(&callee)),
+            })
+        }
+        Expr::Index { object, index } => {
+            // indexing needs no environment: both sides evaluate to
+            // plain values, so this variant works in full today
+            let object = evaluate(object)?;
+            let index = evaluate(index)?;
+            match (object, index) {
+                (Value::List(items), Value::Number(n)) => {
+                    if n.fract() != 0.0 || n < 0.0 {
+                        return Err(RuntimeError {
+                            message: format!("list indices must be whole numbers, got {n}"),
+                        });
+                    }
+                    let i = n as usize;
+                    items.get(i).cloned().ok_or(RuntimeError {
+                        message: format!(
+                            "index {i} is out of bounds, the list has {} elements",
+                            items.len()
+                        ),
+                    })
+                }
+                (object, Value::Number(_)) => Err(RuntimeError {
+                    message: format!(
+                        "only lists can be indexed, got {}",
+                        type_name(&object)
+                    ),
+                }),
+                (object, index) => Err(RuntimeError {
+                    message: format!(
+                        "list indices must be numbers, got {} (indexing {})",
+                        type_name(&index),
+                        type_name(&object)
+                    ),
+                }),
+            }
+        }
+    }
+}
+
+fn execute(stmt: &Stmt) -> Result<(), RuntimeError> {
+    match stmt {
+        // an expression statement evaluates and prints its value — the
+        // cheapest way to watch the interpreter work until the REPL
+        // step gives the language a real read-eval-print loop
+        Stmt::Expression(expr) => {
+            let value = evaluate(expr)?;
+            println!("{value}");
+            Ok(())
+        }
+        // `if`, `while` and blocks need no state: their conditions and
+        // bodies are plain subtrees, so they work in full today
+        Stmt::If { condition, then_branch, else_branch } => {
+            if evaluate(condition)?.is_truthy() {
+                execute(then_branch)
+            } else if let Some(else_branch) = else_branch {
+                execute(else_branch)
+            } else {
+                Ok(())
+            }
+        }
+        Stmt::While { condition, body } => {
+            while evaluate(condition)?.is_truthy() {
+                execute(body)?;
+            }
+            Ok(())
+        }
+        Stmt::Block(statements) => {
+            for statement in statements {
+                execute(statement)?;
+            }
+            Ok(())
+        }
+        // The three statements that remain need somewhere to put
+        // things: `var` evaluates its initializer and then has nowhere
+        // to store it, `fun` has nowhere to store the function, and
+        // `return` has no call to return from. All three arrive with
+        // the environment in the next step.
+        Stmt::Var { name, init } => {
+            // the initializer still evaluates, in declaration order;
+            // only the store is missing
+            evaluate(init)?;
+            Err(RuntimeError {
+                message: format!("cannot declare `{name}`: there is no environment yet"),
+            })
+        }
+        Stmt::Fun { name, params, body } => {
+            // one check that needs no storage: two parameters with the
+            // same name could never be told apart
+            let mut seen: Vec<&str> = Vec::new();
+            for param in params {
+                if seen.contains(&param.as_str()) {
+                    return Err(RuntimeError {
+                        message: format!("duplicate parameter `{param}` in `{name}`"),
+                    });
+                }
+                seen.push(param);
+            }
+            // the body cannot run yet — a `return` in it has no call
+            // to return from — but naming it, instead of skipping it
+            // with `..`, keeps the tree fully read
+            let _ = body;
+            Err(RuntimeError {
+                message: format!("cannot define `{name}`: there is no environment yet"),
+            })
+        }
+        Stmt::Return { value } => {
+            // the returned expression still evaluates; only the
+            // "where does it go" half is missing
+            if let Some(value) = value {
+                evaluate(value)?;
+            }
+            Err(RuntimeError {
+                message: String::from("return outside of a function"),
+            })
+        }
+    }
+}
+
 fn main() {
     let sources = [
-        r#"var count = 0;
-while (count < 3) {
-  count = count + 1;
-}
-if (count == 3 and !done) {
-  var label = "hot";
-}
-fun twice(n) { return n * 2; }
-var xs = [twice(count), twice(count * 10)];
-var first = xs[0];"#,
-        "var = 5;",
+        // a program: five statements, five values printed in order
+        r#"1 + 2 * 3;
+"na" + "na";
+!(1 == 2);
+[10, 20, 30][1];
+if (2 > 1) "big"; else "small";"#,
+        // runtime errors: what went wrong, though not yet where
+        r#""count: " + 3;"#,
+        "1 / 0;",
+        // short-circuiting: the right side never runs
+        "false and (1 / 0);",
+        r#"nil or "fallback";"#,
+        // the not-implemented-yet half of the grammar
+        "x;",
+        "var count = 0;",
+        "return 1;",
     ];
 
     for source in sources {
@@ -660,7 +1017,15 @@ var first = xs[0];"#,
             continue;
         }
         match Parser::new(tokens).program() {
-            Ok(tree) => println!("{tree:#?}"),
+            Ok(statements) => {
+                for statement in &statements {
+                    if let Err(e) = execute(statement) {
+                        println!("  runtime error: {}", e.message);
+                        // a script stops at the first uncaught error
+                        break;
+                    }
+                }
+            }
             Err(e) => println!("  parse error: {}:{} {}", e.line, e.col, e.message),
         }
     }
