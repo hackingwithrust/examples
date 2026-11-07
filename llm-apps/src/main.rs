@@ -1,11 +1,11 @@
-//! Step 5: a vector store in SQLite.
+//! Step 6: retrieving and prompting.
 //!
-//! Same model, chunker and embed pipeline as steps 3 and 4. The chunk
-//! vectors become BLOBs in a SQLite database; a question is answered by
-//! scanning every row - brute force - and then by an index: k-means
-//! clusters the stored vectors, and the query only visits the clusters
-//! nearest to it. On this step's 405-row store the index reads under a
-//! third of the rows and returns the same top hits.
+//! Same model, chunker, store and index as steps 3-5. This step turns
+//! ranked search results into a context window: the query retrieves
+//! wider than it needs, near-duplicate chunks are collapsed, the rest
+//! is fitted to a token budget counted with the tokenizer, and the
+//! passages that survive are assembled into the prompt the next step's
+//! model will answer from.
 
 use anyhow::Result;
 use candle_core::{Device, Tensor};
@@ -16,14 +16,31 @@ use rusqlite::{params, params_from_iter, Connection};
 use tokenizers::Tokenizer;
 
 const MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
-const DOC: &str = "Running a sentence encoder on your own machine is mostly an exercise in memory budgeting. The runtime in this project is candle, which loads the safetensors weights through memory mapping, so nothing is copied until a layer actually runs. Startup cost is dominated entirely by paging the model in on the first forward pass. Its peak memory footprint is about 340 megabytes. That is with three sentences in the batch; a long document pushes the number up. Tokenization itself is cheap, microseconds per sentence, and it happens before anything reaches the model. Embedding a whole document at once is the mistake this step fixes: the vector averages every topic together and retrieval degrades quietly.";
 const QUESTION: &str = "How much memory does inference use at peak?";
+
+/// Three documents, three topics: the runtime's memory footprint, the
+/// chunking trade, and the tokenizer. One paragraph could not show a
+/// prompt filling up; three give retrieval something to choose between.
+const DOCS: [&str; 3] = [
+    "Running a sentence encoder on your own machine is mostly an exercise in memory budgeting. The runtime in this project is candle, which loads the safetensors weights through memory mapping, so nothing is copied until a layer actually runs. Startup cost is dominated entirely by paging the model in on the first forward pass. Its peak memory footprint is about 340 megabytes. That is with three sentences in the batch; a long document pushes the number up. Tokenization itself is cheap, microseconds per sentence, and it happens before anything reaches the model. Embedding a whole document at once is the mistake this step fixes: the vector averages every topic together and retrieval degrades quietly.",
+    "Chunking is where retrieval quality is decided. Windows of thirty words with a six-word overlap worked well for short technical prose: small enough that one vector describes one idea, overlapped just enough that a sentence split across a boundary still lands whole in at least one chunk. Bigger windows average more topics into each vector and recall suffers quietly. Smaller windows fragment the answer across chunks and the prompt fills with fragments. No window size is right for every corpus; the overlap and the stride are a trade to measure, not a default to trust.",
+    "Tokenization happens before anything reaches the model, and it is the cheap part of the pipeline: microseconds per sentence on CPU. The tokenizer splits text into word pieces drawn from a fixed vocabulary of about thirty thousand entries, and the count it reports is the number of positions the model actually sees. A batch of sentences is padded to its longest member, and the attention mask marks the padding so the pooled embedding ignores it. That count is also the only honest way to budget a context window, which is what this step uses it for.",
+];
+
+/// How wide the net is cast, how close two chunks must be before the
+/// second counts as a duplicate of the first, and how many tokens the
+/// context window may hold.
+const CANDIDATES: usize = 15;
+const DUP_THRESHOLD: f32 = 0.98;
+const CONTEXT_TOKENS: usize = 100;
 
 /// Index size (clusters) and how many of them a query visits.
 const K: usize = 8;
 const PROBE: usize = 2;
-/// Synthetic near-copies per real chunk, to give the store a realistic size.
-const COPIES: usize = 80;
+/// Synthetic near-copies per real chunk: standing in for the boilerplate
+/// and repeated near-duplicates a real corpus accumulates, and giving
+/// the dedupe pass something to collapse.
+const COPIES: usize = 3;
 
 /// Cut `doc` into word windows of `window` words, advancing `stride`
 /// words each time. Same chunker as step 4.
@@ -191,31 +208,29 @@ fn kmeans(vectors: &[Vec<f32>], k: usize, iters: usize) -> (Vec<Vec<f32>>, Vec<u
     (centroids, assign)
 }
 
-type Hit = (i64, f32, String);
-
-/// Brute force: read every row, decode the blob, cosine in Rust.
-fn search_brute(conn: &Connection, q: &[f32], top: usize) -> Result<(usize, Vec<Hit>)> {
-    let mut stmt = conn.prepare(
-        "SELECT v.chunk_id, v.embedding, c.text
-         FROM vectors v JOIN chunks c ON c.id = v.chunk_id",
-    )?;
-    let mut rows = stmt.query([])?;
-    let mut scored: Vec<Hit> = Vec::new();
-    while let Some(row) = rows.next()? {
-        let id: i64 = row.get(0)?;
-        let blob: Vec<u8> = row.get(1)?;
-        let text: String = row.get(2)?;
-        scored.push((id, cosine(&from_blob(&blob), q), text));
-    }
-    let scanned = scored.len();
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-    scored.truncate(top);
-    Ok((scanned, scored))
+/// One search result: its cosine score against the question, the
+/// chunk's full text, and the decoded vector - kept alongside the text
+/// because the dedupe pass below needs it.
+#[derive(Clone)]
+struct Hit {
+    score: f32,
+    text: String,
+    vector: Vec<f32>,
 }
 
-/// Indexed search: rank the centroids, then read only the rows assigned
-/// to the `probe` nearest clusters. Returns the clusters visited, the
-/// rows read, and the hits.
+/// The token count under the model's own tokenizer. A different model
+/// has a different vocabulary and would count differently - but
+/// counting beats estimating, and the budget is a dial either way.
+fn token_count(tokenizer: &Tokenizer, text: &str) -> usize {
+    tokenizer
+        .encode(text, false)
+        .map(|e| e.get_ids().len())
+        .unwrap_or(0)
+}
+
+/// Indexed search, as step 5 built it: rank the centroids, then read
+/// only the rows assigned to the `probe` nearest clusters. Returns the
+/// clusters visited, the rows read, and up to `top` hits.
 fn search_index(
     conn: &Connection,
     q: &[f32],
@@ -249,22 +264,87 @@ fn search_index(
     let mut rows = stmt.query(params_from_iter(chosen.iter()))?;
     let mut scored: Vec<Hit> = Vec::new();
     while let Some(row) = rows.next()? {
-        let id: i64 = row.get(0)?;
-        let blob: Vec<u8> = row.get(1)?;
+        let vector = from_blob(&row.get::<_, Vec<u8>>(1)?);
         let text: String = row.get(2)?;
-        scored.push((id, cosine(&from_blob(&blob), q), text));
+        let score = cosine(&vector, q);
+        scored.push(Hit {
+            score,
+            text,
+            vector,
+        });
     }
     let scanned = scored.len();
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    scored.sort_by(|a, b| b.score.total_cmp(&a.score));
     scored.truncate(top);
     let visited: Vec<(i64, f32)> = clusters[..probe].to_vec();
     Ok((visited, scanned, scored))
 }
 
-fn print_hits(hits: &[Hit]) {
-    for (rank, (_, score, text)) in hits.iter().enumerate() {
-        println!("  {}. [{score:.4}] {text}", rank + 1);
+/// Print a ranked candidate list with each chunk's token count.
+fn print_candidates(cands: &[Hit], tokenizer: &Tokenizer) {
+    for (rank, h) in cands.iter().enumerate() {
+        println!(
+            "  {:2}. [{:.4}] {:>3}t  {}",
+            rank + 1,
+            h.score,
+            token_count(tokenizer, &h.text),
+            preview(&h.text)
+        );
     }
+}
+
+/// True when `v` is within `threshold` cosine of anything already
+/// kept. The threshold is deliberately generous: it exists to catch
+/// near-copies, not related chunks.
+fn is_duplicate(v: &[f32], kept: &[Vec<f32>], threshold: f32) -> bool {
+    kept.iter().any(|k| cosine(v, k) > threshold)
+}
+
+/// Walk the ranked candidates, keep the first of every distinct chunk,
+/// and stop at the first passage that no longer fits the budget. The
+/// rest are all counted over-budget: chunks are near-equal size, so
+/// nothing behind an oversized one fits either. Returns the kept
+/// passages and the drop counts.
+fn select(
+    candidates: &[Hit],
+    tokenizer: &Tokenizer,
+    threshold: f32,
+    budget: usize,
+) -> (Vec<Hit>, usize, usize) {
+    let mut kept: Vec<Hit> = Vec::new();
+    let mut vectors: Vec<Vec<f32>> = Vec::new();
+    let mut used = 0usize;
+    let (mut dupes, mut over) = (0usize, 0usize);
+    for cand in candidates {
+        if is_duplicate(&cand.vector, &vectors, threshold) {
+            dupes += 1;
+            continue;
+        }
+        let tokens = token_count(tokenizer, &cand.text);
+        if used + tokens > budget {
+            over = candidates.len() - kept.len() - dupes;
+            break;
+        }
+        used += tokens;
+        vectors.push(cand.vector.clone());
+        kept.push(cand.clone());
+    }
+    (kept, dupes, over)
+}
+
+/// The prompt the next step's model will answer from: an instruction,
+/// the numbered passages, and the question last.
+fn build_prompt(passages: &[String], question: &str) -> String {
+    let mut prompt = String::from(
+        "Answer the question using only the passages below. \
+         If the passages do not contain the answer, say so.\n\n",
+    );
+    for (i, passage) in passages.iter().enumerate() {
+        prompt.push_str(&format!("[{}] {}\n\n", i + 1, passage));
+    }
+    prompt.push_str("Question: ");
+    prompt.push_str(question);
+    prompt
 }
 
 fn main() -> Result<()> {
@@ -276,18 +356,28 @@ fn main() -> Result<()> {
     let config: Config = serde_json::from_str(&std::fs::read_to_string(repo.get("config.json")?)?)?;
     let tokenizer = Tokenizer::from_file(repo.get("tokenizer.json")?)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // The published tokenizer.json ships with fixed padding to 128 -
+    // sentence-transformers tunes it for the model, not for counting.
+    // Every text would otherwise count as 128 tokens.
+    let mut tokenizer = tokenizer;
+    tokenizer.with_padding(None);
     let weights = repo.get("model.safetensors")?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DTYPE, &device)? };
     let model = BertModel::load(vb, &config)?;
     println!("model loaded in {:.1?} on {device:?}", started.elapsed());
 
-    // Same chunker, document and question as step 4: 30-word windows,
-    // 6-word overlap.
-    let chunks = chunk(DOC, 30, 24);
+    // Same chunker as steps 4 and 5: 30-word windows, 6-word overlap,
+    // now applied to each document in turn.
+    let mut chunks: Vec<(usize, String)> = Vec::new();
+    for (d, doc) in DOCS.iter().enumerate() {
+        for c in chunk(doc, 30, 24) {
+            chunks.push((d, c));
+        }
+    }
 
     // The store lives in the temp directory; delete any copy from an
     // earlier run so the numbers below start from an empty database.
-    let db_path = std::env::temp_dir().join("llm-step5-vectors.db");
+    let db_path = std::env::temp_dir().join("llm-step6-vectors.db");
     let _ = std::fs::remove_file(&db_path);
     let conn = Connection::open(&db_path)?;
     conn.execute_batch(
@@ -301,40 +391,39 @@ fn main() -> Result<()> {
              centroid_id INTEGER NOT NULL REFERENCES centroids(id));",
     )?;
 
-    let mut texts = chunks.clone();
+    let mut texts: Vec<String> = chunks.iter().map(|(_, c)| c.clone()).collect();
     texts.push(QUESTION.to_string());
     let vectors = embed(&model, &device, &tokenizer, &texts)?;
     let question = vectors.last().unwrap().clone();
 
-    for (i, v) in vectors[..vectors.len() - 1].iter().enumerate() {
+    // Full text goes into the store this step: the prompt is built from
+    // rows, and a preview cannot answer a question.
+    let real = chunks.len();
+    for (i, v) in vectors[..real].iter().enumerate() {
         conn.execute(
             "INSERT INTO chunks (id, text) VALUES (?1, ?2)",
-            params![i as i64, format!("chunk {i}: {}", preview(&chunks[i]))],
+            params![i as i64, &chunks[i].1],
         )?;
         conn.execute(
             "INSERT INTO vectors (chunk_id, embedding) VALUES (?1, ?2)",
             params![i as i64, to_blob(v)],
         )?;
     }
-    println!("stored {} chunk vectors in the database", vectors.len() - 1);
 
-    let (scanned, hits) = search_brute(&conn, &question, 3)?;
-    println!("\nbrute force over {scanned} rows:");
-    print_hits(&hits);
-
-    // Scale the store up: 80 near-copies of each real chunk, 400 rows,
-    // standing in for the neighbours a real corpus produces.
-    for i in 0..5usize {
+    // Near-copies of every chunk: same text, wobbled vector. They stand
+    // in for the boilerplate and repeated near-duplicates a real corpus
+    // accumulates.
+    for (i, v) in vectors[..real].iter().enumerate() {
         for j in 0..COPIES {
-            let id = (5 + i * COPIES + j) as i64;
-            let noisy: Vec<f32> = vectors[i]
+            let id = (real + i * COPIES + j) as i64;
+            let noisy: Vec<f32> = v
                 .iter()
                 .enumerate()
                 .map(|(d, x)| x + jitter(id as usize, d))
                 .collect();
             conn.execute(
                 "INSERT INTO chunks (id, text) VALUES (?1, ?2)",
-                params![id, format!("chunk {i} copy #{j}")],
+                params![id, &chunks[i].1],
             )?;
             conn.execute(
                 "INSERT INTO vectors (chunk_id, embedding) VALUES (?1, ?2)",
@@ -343,12 +432,13 @@ fn main() -> Result<()> {
         }
     }
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0))?;
-    let (scanned, brute_hits) = search_brute(&conn, &question, 3)?;
-    println!("\nscaled to {total} rows; brute force over {scanned} rows:");
-    print_hits(&brute_hits);
+    println!(
+        "stored {real} chunk vectors from {} documents, {COPIES} near-copies each ({total} rows)",
+        DOCS.len()
+    );
 
-    // The index is built from what the store holds: every vector is read
-    // back as a blob, clustered, and the cluster map is written back.
+    // The index from step 5, built the same way: read every vector back
+    // as a blob, cluster, write the cluster map back.
     let mut stmt = conn.prepare("SELECT chunk_id, embedding FROM vectors")?;
     let mut rows = stmt.query([])?;
     let mut ids: Vec<i64> = Vec::new();
@@ -375,24 +465,52 @@ fn main() -> Result<()> {
         sizes[ci] += 1;
     }
     sizes.sort();
-    println!("\nindex built: {K} clusters, sizes {sizes:?}");
+    println!("index built: {K} clusters, sizes {sizes:?}");
 
-    let (visited, scanned, hits) = search_index(&conn, &question, PROBE, 3)?;
-    let pct = 100.0 * scanned as f64 / total as f64;
+    // Retrieve wider than the prompt needs: the dedupe pass and the
+    // budget both need room to work.
+    let (visited, scanned, hits) = search_index(&conn, &question, PROBE, CANDIDATES)?;
     let visited = visited
         .iter()
         .map(|(id, s)| format!("{id} ({s:.4})"))
         .collect::<Vec<_>>()
         .join(", ");
     println!(
-        "\nindexed search: cluster {visited} nearest to the question, scanned {scanned} of {total} rows ({pct:.0}%)"
+        "indexed search: cluster {visited} nearest to the question, scanned {scanned} of {total} rows"
     );
-    print_hits(&hits);
-    let overlap = hits
+
+    println!("\n{CANDIDATES} candidates, best score first:");
+    print_candidates(&hits, &tokenizer);
+
+    let (kept, dupes, over) = select(&hits, &tokenizer, DUP_THRESHOLD, CONTEXT_TOKENS);
+    let kept_tokens: usize = kept
         .iter()
-        .filter(|(id, _, _)| brute_hits.iter().any(|(bid, _, _)| bid == id))
-        .count();
-    println!("top-3 overlap with brute force: {overlap} of 3");
+        .map(|h| token_count(&tokenizer, &h.text))
+        .sum();
+    println!(
+        "\nkept {} passages, {} of {CONTEXT_TOKENS} budget tokens; dropped {dupes} duplicates, {over} over budget",
+        kept.len(),
+        kept_tokens
+    );
+    for (i, h) in kept.iter().enumerate() {
+        println!(
+            "  [{}] [{:.4}] {}t  {}",
+            i + 1,
+            h.score,
+            token_count(&tokenizer, &h.text),
+            preview(&h.text)
+        );
+    }
+
+    let prompt = build_prompt(
+        &kept.iter().map(|h| h.text.clone()).collect::<Vec<_>>(),
+        QUESTION,
+    );
+    let bar = "-".repeat(56);
+    println!(
+        "\nprompt, {} tokens:\n{bar}\n{prompt}\n{bar}",
+        token_count(&tokenizer, &prompt)
+    );
 
     Ok(())
 }
