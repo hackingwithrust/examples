@@ -1,12 +1,15 @@
-//! birch, step 6: variables and scopes.
+//! birch, step 7: control flow and functions.
 //!
-//! A tree-walking evaluator with an environment: `evaluate` turns an
-//! `Expr` into a `Value`, `execute` walks statements, and both carry a
-//! `&mut Environment` — a stack of scopes that gives the language
-//! somewhere to put things. `var`, assignment, name lookup and block
-//! scoping all work now; functions are one step away.
+//! The tree-walking evaluator learns to jump. `execute` now returns a
+//! `Flow` instead of nothing, so a `return` can travel — past blocks
+//! and loops — to the call that asked for it; `Value::Function` makes
+//! a function a value the environment can store; the `Call` arm checks
+//! arity, pushes a scope of parameters and runs the body. `if`, `while`
+//! and blocks needed no new machinery: this step is about what
+//! `return` returns *to*.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq)]
 enum TokenKind {
@@ -291,8 +294,10 @@ fn keyword(word: &str) -> TokenKind {
 
 // One variant per shape an expression can take. Every field that would
 // make the enum infinitely sized holds a `Box`; fields already behind a
-// `Vec` or an `Option` break the recursion for free.
-#[derive(Debug)]
+// `Vec` or an `Option` break the recursion for free. `Clone` and
+// `PartialEq` arrive with this step: a function value holds part of
+// the tree, so the tree has to be a clonable, comparable citizen.
+#[derive(Debug, Clone, PartialEq)]
 enum Expr {
     Number(f64),
     Str(String),
@@ -311,7 +316,7 @@ enum Expr {
 // One variant per shape a statement can take. `if` and `while` hold a
 // single statement each, so the statement type recurses through `Box`
 // too; a block's `Vec<Stmt>` needs no box of its own.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 enum Stmt {
     Var { name: String, init: Expr },
     Fun { name: String, params: Vec<String>, body: Vec<Stmt> },
@@ -638,6 +643,18 @@ impl Parser {
 
 // ------------------------------------------------------------ the values
 
+// A function value: the declaration the parser built, held as runtime
+// data. The tree's `Stmt::Fun` describes a definition site; this is
+// the thing a name gets bound to and a call runs. `Rc` keeps it cheap
+// inside a `Value`, which must stay clonable; the derived `Debug` and
+// `PartialEq` are what `Value`'s own derives ask for.
+#[derive(Debug, Clone, PartialEq)]
+struct FunctionValue {
+    name: String,
+    params: Vec<String>,
+    body: Vec<Stmt>,
+}
+
 // What an expression evaluates *to*. The tree describes computation; a
 // value is the thing computation produces. One enum again, and this one
 // has no recursion at all: values are flat.
@@ -648,6 +665,7 @@ enum Value {
     Bool(bool),
     Nil,
     List(Vec<Value>),
+    Function(Rc<FunctionValue>),
 }
 
 impl Value {
@@ -667,6 +685,9 @@ impl std::fmt::Display for Value {
             Value::Str(s) => write!(f, "{s}"),
             Value::Bool(b) => write!(f, "{b}"),
             Value::Nil => write!(f, "nil"),
+            // a function has no printed form, only a name to be
+            // recognised by — the choice Python made with `<fun ...>`
+            Value::Function(function) => write!(f, "<fun {}>", function.name),
             Value::List(items) => {
                 write!(f, "[")?;
                 for (i, item) in items.iter().enumerate() {
@@ -690,6 +711,7 @@ fn type_name(value: &Value) -> &'static str {
         Value::Bool(_) => "a bool",
         Value::Nil => "nil",
         Value::List(_) => "a list",
+        Value::Function(_) => "a function",
     }
 }
 
@@ -714,6 +736,16 @@ fn operator_text(kind: &TokenKind) -> &'static str {
 
 struct RuntimeError {
     message: String,
+}
+
+// How a statement finishes. Most statements run to the end and say so;
+// a `return` has to travel — out of the body it sits in, past every
+// enclosing block and loop, to the one place that knows what to do
+// with it: the call running the function. Travelling as the `Ok` half
+// of the result keeps the `Err` half for actual errors.
+enum Flow {
+    Normal,
+    Return(Value),
 }
 
 // ------------------------------------------------------- the environment
@@ -892,11 +924,10 @@ fn evaluate(expr: &Expr, env: &mut Environment) -> Result<Value, RuntimeError> {
                 evaluate(right, env)
             }
         }
-        // Two name-reading arms, both real now. `Variable` asks the
-        // environment; `Assign` evaluates its right side, then asks the
-        // environment to update the first scope down the chain that
-        // already has the name. `Call` is the one variant still
-        // blocked — nothing in the language is callable yet.
+        // The name-reading arms. `Variable` asks the environment;
+        // `Assign` evaluates its right side, then asks the environment
+        // to update the first scope down the chain that already has
+        // the name.
         Expr::Variable(name) => env.get(name).ok_or(RuntimeError {
             message: format!("undefined variable `{name}`"),
         }),
@@ -917,14 +948,29 @@ fn evaluate(expr: &Expr, env: &mut Environment) -> Result<Value, RuntimeError> {
         Expr::Call { callee, args } => {
             // the callee evaluates first, so an unknown name reports
             // itself, then the arguments — the order a real call would
-            // use; only the call itself is missing
+            // use
             let callee = evaluate(callee, env)?;
+            let mut values = Vec::with_capacity(args.len());
             for arg in args {
-                evaluate(arg, env)?;
+                values.push(evaluate(arg, env)?);
             }
-            Err(RuntimeError {
-                message: format!("a {} cannot be called", type_name(&callee)),
-            })
+            let Value::Function(function) = callee else {
+                return Err(RuntimeError {
+                    message: format!("{} cannot be called", type_name(&callee)),
+                });
+            };
+            if values.len() != function.params.len() {
+                return Err(RuntimeError {
+                    message: format!(
+                        "`{}` expects {} argument{}, got {}",
+                        function.name,
+                        function.params.len(),
+                        if function.params.len() == 1 { "" } else { "s" },
+                        values.len()
+                    ),
+                });
+            }
+            call(&function, values, env)
         }
         Expr::Index { object, index } => {
             // indexing needs no environment: both sides evaluate to
@@ -964,7 +1010,46 @@ fn evaluate(expr: &Expr, env: &mut Environment) -> Result<Value, RuntimeError> {
     }
 }
 
-fn execute(stmt: &Stmt, env: &mut Environment) -> Result<(), RuntimeError> {
+// The machinery behind the `Call` arm: push a scope of parameters onto
+// the *caller's* environment, run the body, and unwrap whatever comes
+// back. A body that falls off the end returns `nil`; a `return`
+// statement surfaces here as `Flow::Return` and finally becomes the
+// value it was always headed for.
+//
+// Note where the parameters live: a scope on the caller's stack, not a
+// saved copy of the scopes that existed when `fun` ran. birch
+// functions are not closures — a body sees the caller's variables,
+// which is wrong in the general case. The fix is environments that
+// outlive the block that made them, and that is a heap of shared
+// maps, not this stack.
+fn call(
+    function: &FunctionValue,
+    args: Vec<Value>,
+    env: &mut Environment,
+) -> Result<Value, RuntimeError> {
+    env.scopes.push(HashMap::new());
+    for (param, value) in function.params.iter().zip(args) {
+        env.scopes.last_mut().unwrap().insert(param.clone(), value);
+    }
+    let mut result = Ok(Flow::Normal);
+    for stmt in &function.body {
+        match execute(stmt, env) {
+            Ok(Flow::Normal) => {}
+            other => {
+                result = other;
+                break;
+            }
+        }
+    }
+    env.scopes.pop();
+    match result {
+        Ok(Flow::Normal) => Ok(Value::Nil),
+        Ok(Flow::Return(value)) => Ok(value),
+        Err(e) => Err(e),
+    }
+}
+
+fn execute(stmt: &Stmt, env: &mut Environment) -> Result<Flow, RuntimeError> {
     match stmt {
         // an expression statement evaluates and prints its value — the
         // cheapest way to watch the interpreter work until the REPL
@@ -972,7 +1057,7 @@ fn execute(stmt: &Stmt, env: &mut Environment) -> Result<(), RuntimeError> {
         Stmt::Expression(expr) => {
             let value = evaluate(expr, env)?;
             println!("{value}");
-            Ok(())
+            Ok(Flow::Normal)
         }
         // `if`, `while` and blocks need no state: their conditions and
         // bodies are plain subtrees, so they work in full today
@@ -982,33 +1067,32 @@ fn execute(stmt: &Stmt, env: &mut Environment) -> Result<(), RuntimeError> {
             } else if let Some(else_branch) = else_branch {
                 execute(else_branch, env)
             } else {
-                Ok(())
+                Ok(Flow::Normal)
             }
         }
         Stmt::While { condition, body } => {
             while evaluate(condition, env)?.is_truthy() {
                 execute(body, env)?;
             }
-            Ok(())
+            Ok(Flow::Normal)
         }
         // a block is the one statement that changes the environment:
         // its body runs in a freshly pushed scope, which dies with it
         Stmt::Block(statements) => execute_scoped(statements, env),
-        // `var` works now. The two statements that remain need more
-        // than storage: `fun` has nowhere to store the function, and
-        // `return` has no call to return from. Both arrive with the
-        // call machinery in the next step.
+        // `var` and `fun` both define: the first stores a computed
+        // value, the second stores the declaration itself, wrapped as
+        // a callable value
         Stmt::Var { name, init } => {
             // the initializer evaluates first, in the scope the name
             // is about to live in — so `var x = x;` reads the outer
             // `x`, the way most dynamic languages do
             let value = evaluate(init, env)?;
             env.define(name.clone(), value);
-            Ok(())
+            Ok(Flow::Normal)
         }
         Stmt::Fun { name, params, body } => {
-            // one check that needs no storage: two parameters with the
-            // same name could never be told apart
+            // one check that needs no machinery: two parameters with
+            // the same name could never be told apart
             let mut seen: Vec<&str> = Vec::new();
             for param in params {
                 if seen.contains(&param.as_str()) {
@@ -1018,53 +1102,72 @@ fn execute(stmt: &Stmt, env: &mut Environment) -> Result<(), RuntimeError> {
                 }
                 seen.push(param);
             }
-            // the body cannot run yet — a `return` in it has no call
-            // to return from — but naming it, instead of skipping it
-            // with `..`, keeps the tree fully read
-            let _ = body;
-            Err(RuntimeError {
-                message: format!("cannot define `{name}`: functions are not implemented yet"),
-            })
+            // defining is storing: the declaration the parser built,
+            // wrapped in `Rc` so the `Value` can hold it without
+            // moving the body on every clone. Recursion needs nothing
+            // extra — the body only runs at call time, by which point
+            // the name is findable in the caller's scopes
+            env.define(
+                name.clone(),
+                Value::Function(Rc::new(FunctionValue {
+                    name: name.clone(),
+                    params: params.clone(),
+                    body: body.clone(),
+                })),
+            );
+            Ok(Flow::Normal)
         }
         Stmt::Return { value } => {
-            // the returned expression still evaluates; only the
-            // "where does it go" half is missing
-            if let Some(value) = value {
-                evaluate(value, env)?;
-            }
-            Err(RuntimeError {
-                message: String::from("return outside of a function"),
-            })
+            // the value is evaluated here, then handed upward as the
+            // Ok half of the result: `return` is not an error, it is
+            // an early way to finish. Nothing catches it until `call`,
+            // which is why a top-level `return` still ends the script
+            // with an error — the driver in `main` is where one lands
+            let value = match value {
+                Some(expr) => evaluate(expr, env)?,
+                None => Value::Nil,
+            };
+            Ok(Flow::Return(value))
         }
     }
 }
 
 // A block is a scope: push a fresh map, run the body, pop it — even when
 // a statement in the middle fails, so the caller's environment comes
-// back exactly the way it went in.
-fn execute_scoped(statements: &[Stmt], env: &mut Environment) -> Result<(), RuntimeError> {
+// back exactly the way it went in. A `Flow::Return` walks straight
+// through untouched: a block pops a scope, it does not catch a return.
+fn execute_scoped(statements: &[Stmt], env: &mut Environment) -> Result<Flow, RuntimeError> {
     env.scopes.push(HashMap::new());
-    let result = statements.iter().try_for_each(|s| execute(s, env));
+    let mut result = Ok(Flow::Normal);
+    for statement in statements {
+        match execute(statement, env) {
+            Ok(Flow::Normal) => {}
+            other => {
+                result = other;
+                break;
+            }
+        }
+    }
     env.scopes.pop();
     result
 }
 
 fn main() {
     let sources = [
-        // the program from last step, still running — the evaluator
-        // grew a parameter, not a behaviour change
+        // the program from last step, still running — nothing above
+        // the evaluator moved
         r#"1 + 2 * 3;
 "na" + "na";
 !(1 == 2);
 [10, 20, 30][1];
 if (2 > 1) "big"; else "small";"#,
-        // variables: define, then reassign. The assignment statement
-        // prints a value because assignment *is* an expression — its
-        // value is the value assigned
-        r#"var greeting = "hello";
-greeting = greeting + ", world";"#,
-        // a loop now has something to change: the total lives in the
-        // outer scope, the body updates it with plain `=`
+        // `else if` is not syntax at all: the else branch is a
+        // statement and `if` is a statement, so chains compose free
+        r#"var score = 83;
+if (score >= 90) "A";
+else if (score >= 80) "B";
+else "C";"#,
+        // the loop from last step, still running
         "var total = 0;
 var i = 1;
 while (i <= 5) {
@@ -1072,30 +1175,32 @@ while (i <= 5) {
   i = i + 1;
 }
 total;",
-        // a block is a scope: its own `var` shadows, and dies with it
-        r#"var x = "outer";
-{
-  var x = "inner";
-  x;
+        // a first function: define, then call. The body hands its
+        // value to `return`, so only the caller's line prints
+        "fun add(a, b) { return a + b; }
+add(2, 3);",
+        // recursion is just a name lookup: by the time the body runs,
+        // the function's own name sits in the caller's scopes
+        "fun fact(n) {
+  if (n < 2) { return 1; }
+  return n * fact(n - 1);
 }
-x;"#,
-        // assignment without `var` reaches outward: both writes land
-        // on the one binding the block can see but not replace
-        "var count = 0;
-{
-  count = count + 1;
-  count = count + 1;
-}",
-        // redeclaring in the same scope overwrites
-        "var a = 1;
-var a = 2;
-a;",
-        // errors: a name nobody defined, and an assignment whose
-        // target exists in no scope down the chain
-        "missing;",
-        r#"{ undone = 3; }"#,
-        // the not-implemented half, one step away now
-        "fun add(a, b) { return a + b; }",
+fact(5);",
+        // two ways to produce nil: `return;` with no value, and a
+        // body that falls off the end. The bare expression inside
+        // `silent` also shows the printing rule — an expression
+        // statement prints, so the body says 2 and the call says nil
+        "fun nothing() { return; }
+nothing();
+fun silent() { 1 + 1; }
+silent();",
+        // errors: wrong arity (one parameter, so the message is
+        // singular), calling a non-function, and a return with no
+        // call underneath it. Each script gets a fresh environment,
+        // so the mis-called function is defined where it is mis-called
+        "fun double(n) { return n * 2; }
+double(1, 2);",
+        r#""nope"(1);"#,
         "return 1;",
     ];
 
@@ -1114,10 +1219,19 @@ a;",
                 // the whole snippet, so nothing leaks between them
                 let mut env = Environment::new();
                 for statement in &statements {
-                    if let Err(e) = execute(statement, &mut env) {
-                        println!("  runtime error: {}", e.message);
-                        // a script stops at the first uncaught error
-                        break;
+                    match execute(statement, &mut env) {
+                        Ok(Flow::Normal) => {}
+                        // a Flow::Return reaching the top has no call
+                        // to land in — same verdict as last step
+                        Ok(Flow::Return(_)) => {
+                            println!("  runtime error: return outside of a function");
+                            break;
+                        }
+                        Err(e) => {
+                            println!("  runtime error: {}", e.message);
+                            // a script stops at the first uncaught error
+                            break;
+                        }
                     }
                 }
             }
