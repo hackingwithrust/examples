@@ -14,8 +14,9 @@
 # the single directory whose name starts with it, so a brand-new track's first
 # tag still resolves (`interp-ch01` -> interpreter/, `llm-ch02` -> llm-apps/).
 #
-# The tauri track needs the Linux system libraries its dependency graph links
-# against (GTK/webkit); nothing else here does.
+# Two tracks need Linux system libraries their dependency graphs link against:
+# the tauri track (GTK/webkit) and gitdesk (the X11/xkbcommon headers egui's
+# windowing layer compiles against). Nothing else here does.
 
 name: Verify
 
@@ -148,6 +149,11 @@ jobs:
             tui-*)    dir=tui-ratatui ;;
             stm32-*)  dir=embedded-stm32 ;;
             tauri-*)  dir=tauri-desktop-app/src-tauri ;;
+            # The tag prefix and the directory deliberately differ: tags are
+            # named after the product (gitdesk), directories after the kind of
+            # thing they hold. Without this line the fallback below looks for a
+            # directory starting with "gitdesk", finds none, and fails the tag.
+            gitdesk-*) dir=git-client ;;
             *)
               # No explicit entry: take the one directory whose name starts with
               # the tag's prefix. Ambiguous or missing -> fail loudly, because a
@@ -178,6 +184,19 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libglib2.0-dev libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+
+      # eframe's own README lists the xcb/xkbcommon headers, and rfd's GTK
+      # file picker (the "open a repository" dialog) needs GTK. A reader on
+      # Linux who cannot build the app is exactly what this job exists to
+      # prevent, so the packages go in before the build rather than being
+      # discovered by a bug report.
+      - name: Install the system libraries egui links against
+        if: startsWith(env.DIR, 'git-client')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libgtk-3-dev libssl-dev
 
       - name: Install Rust 1.99.0
         run: |
