@@ -43,6 +43,7 @@ jobs:
           - track: cli-tool
           - track: toy-database
           - track: react-wasm
+          - track: git-client
           - track: tauri-desktop-app/src-tauri
             gtk: true
     name: ${{ matrix.track }}
