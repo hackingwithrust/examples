@@ -1,0 +1,8 @@
+[package]
+name = "gitdesk-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+gix = "0.90.0"
