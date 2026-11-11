@@ -3,6 +3,9 @@
 //! track.
 //!
 //! The crate fills in one track step at a time. Step 2 opens a repository
-//! and reads its four stores; everything that does that lives in
-//! `examples/demo.rs` until the functions it demonstrates graduate into
-//! the library.
+//! and reads its four stores; step 6 graduates the line diff — Myers'
+//! edit script and the unified hunks it prints as — into `diff`, the
+//! first logic to live here. Everything else still lives in
+//! `examples/` until a second feature needs it.
+
+pub mod diff;
